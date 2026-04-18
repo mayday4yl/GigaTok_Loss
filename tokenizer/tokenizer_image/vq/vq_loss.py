@@ -132,6 +132,20 @@ def adopt_weight(weight, global_step, threshold=0, value=0.):
         weight = value
     return weight
 
+def high_rank_attention_loss(attn_weights, eps=1e-6):
+    sigma = torch.linalg.svdvals(attn_weights.float())
+    p = sigma / (sigma.sum(dim=-1, keepdim=True) + eps)
+    num_sigma = sigma.shape[-1]
+    per_matrix_loss = (p - 1.0 / num_sigma).pow(2).mean(dim=-1)
+    hr_loss = per_matrix_loss.mean()
+
+    if num_sigma > 1:
+        spectrum_uniformity = 1.0 - (per_matrix_loss.detach() * num_sigma * num_sigma / (num_sigma - 1)).mean()
+    else:
+        spectrum_uniformity = torch.ones((), device=attn_weights.device, dtype=hr_loss.dtype)
+
+    return hr_loss, spectrum_uniformity
+
 # LeCam Regularziation loss
 # from https://github.com/google/lecam-gan/
 def lecam_reg(dis_real, dis_fake, ema):
@@ -327,7 +341,8 @@ class VQLoss(nn.Module):
 
     def forward(self, inter_loss_set, inputs, all_reconstructions, optimizer_idx, global_step, exp_dir, last_layer=None, 
                 logger=None, log_every=100, ckpt_every=500, num_en_q_level=None, causal_type=None,
-                check_nan_loss=True, inner_feat=None, sem_enc_feat=None
+                check_nan_loss=True, inner_feat=None, sem_enc_feat=None,
+                hr_attn_weights=None, hr_loss_weight=0.0, selected_layer=None, hr_eps=1e-6
                 ):
         assert len(inter_loss_set) == 2
         assert isinstance(all_reconstructions, list)
@@ -451,10 +466,18 @@ class VQLoss(nn.Module):
             
             codebook_loss_sum = sum(codebook_loss[:-1]) # the last one is codebook usage
 
+            hr_loss = None
+            hr_spectrum_uniformity = None
+            if hr_attn_weights is not None:
+                hr_loss, hr_spectrum_uniformity = high_rank_attention_loss(hr_attn_weights, eps=hr_eps)
+            elif hr_loss_weight != 0:
+                raise ValueError("hr_loss_weight is non-zero but hr_attn_weights is None.")
+
+            hr_loss_term = hr_loss_weight * hr_loss if hr_loss is not None else 0.0
             loss = self.rec_weight * (rec_loss + direct_rec_loss) + \
                 self.perceptual_weight * (p_loss + direct_p_loss) + \
                 disc_adaptive_weight * disc_weight * (generator_adv_loss + direct_generator_adv_loss) + \
-                codebook_loss_sum + feature_rec_loss + self.proj_weight * proj_loss
+                codebook_loss_sum + feature_rec_loss + self.proj_weight * proj_loss + hr_loss_term
 
             if check_nan_loss:
                 if torch.isnan(loss).any():
@@ -474,6 +497,11 @@ class VQLoss(nn.Module):
                                 f"vq_loss: {codebook_loss[0]:.4f}, commit_loss: {codebook_loss[1]:.4f}, entropy_loss: {codebook_loss[2]:.4f}, "
                                 f"feature_rec_loss: {feature_rec_loss:.4f}, codebook_usage: {codebook_loss[-1]:.4f}, generator_adv_loss: {generator_adv_loss:.4f}, direct_generator_adv_loss: {direct_generator_adv_loss:.4f}, "
                                 f"disc_adaptive_weight: {disc_adaptive_weight:.4f}, disc_weight: {disc_weight:.4f}\n")
+                    if hr_loss is not None:
+                        error_info += (
+                            f"hr_loss: {hr_loss:.4e}, hr_loss_weight: {hr_loss_weight:.4e}, "
+                            f"selected_layer: {selected_layer}, hr_spectrum_uniformity: {hr_spectrum_uniformity:.4f}\n"
+                        )
                     get_ip_cmd = """hostname -I | awk '{split($0, a, " "); print a[1]}'"""
                     ip_addr = os.popen(get_ip_cmd).read().strip()
                     error_info += f"ip: {ip_addr}\n"
@@ -489,13 +517,16 @@ class VQLoss(nn.Module):
                 direct_p_loss = self.perceptual_weight * direct_p_loss
                 generator_adv_loss = disc_adaptive_weight * disc_weight * generator_adv_loss
                 direct_generator_adv_loss = disc_adaptive_weight * disc_weight * direct_generator_adv_loss
-                logger.info(f"(Generator) rec_loss: {rec_loss:.4f}, direct_rec_loss: {direct_rec_loss:.4f}, perceptual_loss: {p_loss:.4f}, direct_p_loss: {direct_p_loss:.4f}, "
-                            f"vq_loss: {codebook_loss[0]:.4f}, commit_loss: {codebook_loss[1]:.4f}, entropy_loss: {codebook_loss[2]:.4f}, "
-                            f"feature_rec_loss: {feature_rec_loss:.4f}, codebook_usage: {codebook_loss[-1]:.4f}, generator_adv_loss: {generator_adv_loss:.4f}, direct_generator_adv_loss: {direct_generator_adv_loss:.4f}, "
-                            f"disc_adaptive_weight: {disc_adaptive_weight:.4f}, disc_weight: {disc_weight:.4f}, "
-                            f"proj_loss: {proj_loss:.4f}, "
-                            f"ar_prior_loss: {0 if len(codebook_loss) <= 4 else codebook_loss[3]:.2e}"
-                            )
+                log_msg = (f"(Generator) rec_loss: {rec_loss:.4f}, direct_rec_loss: {direct_rec_loss:.4f}, perceptual_loss: {p_loss:.4f}, direct_p_loss: {direct_p_loss:.4f}, "
+                           f"vq_loss: {codebook_loss[0]:.4f}, commit_loss: {codebook_loss[1]:.4f}, entropy_loss: {codebook_loss[2]:.4f}, "
+                           f"feature_rec_loss: {feature_rec_loss:.4f}, codebook_usage: {codebook_loss[-1]:.4f}, generator_adv_loss: {generator_adv_loss:.4f}, direct_generator_adv_loss: {direct_generator_adv_loss:.4f}, "
+                           f"disc_adaptive_weight: {disc_adaptive_weight:.4f}, disc_weight: {disc_weight:.4f}, "
+                           f"proj_loss: {proj_loss:.4f}, "
+                           f"ar_prior_loss: {0 if len(codebook_loss) <= 4 else codebook_loss[3]:.2e}")
+                if hr_loss is not None:
+                    log_msg += (f", hr_loss: {hr_loss:.4e}, weighted_hr_loss: {hr_loss_term:.4e}, "
+                                f"selected_layer: {selected_layer}, hr_spectrum_uniformity: {hr_spectrum_uniformity:.4f}")
+                logger.info(log_msg)
 
                 # update to wandb
                 update_info = {
@@ -514,6 +545,13 @@ class VQLoss(nn.Module):
                     "(Generator)proj_loss": proj_loss,
                     "(Generator)ar_prior_loss": 0 if len(codebook_loss) <= 4 else codebook_loss[3]
                 }
+                if hr_loss is not None:
+                    update_info.update({
+                        "(Generator)hr_loss": hr_loss.detach(),
+                        "(Generator)weighted_hr_loss": hr_loss_term.detach(),
+                        "(Generator)hr_selected_layer": selected_layer,
+                        "(Generator)hr_spectrum_uniformity": hr_spectrum_uniformity.detach(),
+                    })
 
                 # if proj_loss > 0:
                 #     update_info["(Generator)proj_loss"] = proj_loss

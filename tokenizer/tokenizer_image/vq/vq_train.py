@@ -120,6 +120,12 @@ def main(args):
     min_level = config["model"]["causal_settings"]["min_level"]
     dynamic_level_range = config["model"]["causal_settings"].get("dynamic_level_range", None)
     power_sample_T = config["model"]["causal_settings"].get("power_sample_T", None)
+    hr_on = config["trainer"].get("hr_on", False)
+    hr_loss_weight = float(config["trainer"].get("hr_loss_weight", 0.0))
+    hr_random_one_layer = config["trainer"].get("hr_random_one_layer", True)
+    freeze_encoder = config["trainer"].get("freeze_encoder", False)
+    freeze_quantizer = config["trainer"].get("freeze_quantizer", False)
+    freeze_codebook = config["trainer"].get("freeze_codebook", False)
 
 
     if args.sub_exp_dir is not None:
@@ -485,6 +491,22 @@ def main(args):
         start_epoch = 0
         if args.ema:
             update_ema(ema, vq_model, decay=0)  # Ensure EMA is initialized with synced weights
+
+    if freeze_encoder or freeze_quantizer or freeze_codebook:
+        if not pretrain_loaded_flag:
+            raise ValueError("decoder-only finetune requires a pretrained checkpoint or an existing resume checkpoint.")
+        vq_model.apply_stage1_finetune_freeze(
+            freeze_encoder=freeze_encoder,
+            freeze_quantizer=freeze_quantizer,
+            freeze_codebook=freeze_codebook,
+        )
+        trainable_params = sum(p.numel() for p in vq_model.parameters() if p.requires_grad)
+        frozen_params = sum(p.numel() for p in vq_model.parameters() if not p.requires_grad)
+        logger.info(
+            f"Stage-1 finetune freeze: freeze_encoder={freeze_encoder}, "
+            f"freeze_quantizer={freeze_quantizer}, freeze_codebook={freeze_codebook}, "
+            f"trainable_params={trainable_params:,}, frozen_params={frozen_params:,}"
+        )
     
 
 
@@ -511,6 +533,7 @@ def main(args):
     else:
         assert causal_type is None
     
+    decoder_num_layers = vq_model.s1to2decoder.num_layers
     if args.compile:
         logger.info("compiling the model... (may take several minutes)")
         vq_model = torch.compile(vq_model) # requires PyTorch 2.0        
@@ -633,6 +656,15 @@ def main(args):
             else:
                 num_en_q_level = None
 
+            if hr_on:
+                if hr_random_one_layer:
+                    layer_rng = random.Random(train_steps + 1 + args.global_seed)
+                    selected_decoder_layer = layer_rng.randrange(decoder_num_layers)
+                else:
+                    selected_decoder_layer = 0
+            else:
+                selected_decoder_layer = None
+
             # generator training
             optimizer.zero_grad()
             # ptdtype = {'none': torch.float32, 'bf16': torch.bfloat16, 'fp16': torch.float16}[args.mixed_precision]
@@ -675,28 +707,40 @@ def main(args):
 
             with torch.cuda.amp.autocast(dtype=ptdtype):  
                 if config["trainer"].get("distill_loss", False) is True:
-                    recons_imgs, inter_loss_set, inner_feat = vq_model(
-                                                            imgs, 
-                                                            causal_type=causal_type, 
-                                                            num_en_q_level=num_en_q_level, 
-                                                            rec_loss=train_steps+1 < config["loss"]["params"]["aux_loss_end"],
-                                                            ret_inner_feat=True,
-                                                            random_mix_reg=config["trainer"].get("random_mix_reg", False),
-                                                            replace_ratio=config["trainer"].get("replace_ratio", None),
-                                                            global_step=train_steps+1,
-                                                            max_steps=total_steps,
-                                                            )
+                    vq_outputs = vq_model(
+                        imgs,
+                        causal_type=causal_type,
+                        num_en_q_level=num_en_q_level,
+                        rec_loss=train_steps+1 < config["loss"]["params"]["aux_loss_end"],
+                        ret_inner_feat=True,
+                        random_mix_reg=config["trainer"].get("random_mix_reg", False),
+                        replace_ratio=config["trainer"].get("replace_ratio", None),
+                        global_step=train_steps+1,
+                        max_steps=total_steps,
+                        selected_decoder_layer=selected_decoder_layer,
+                    )
+                    if hr_on:
+                        recons_imgs, inter_loss_set, inner_feat, hr_attn_weights = vq_outputs
+                    else:
+                        recons_imgs, inter_loss_set, inner_feat = vq_outputs
+                        hr_attn_weights = None
                 else:
-                    recons_imgs, inter_loss_set = vq_model(
-                                                    imgs, 
-                                                    causal_type=causal_type, 
-                                                    num_en_q_level=num_en_q_level, 
-                                                    rec_loss=train_steps+1 < config["loss"]["params"]["aux_loss_end"],
-                                                    random_mix_reg=config["trainer"].get("random_mix_reg", False),
-                                                    replace_ratio=config["trainer"].get("replace_ratio", None),
-                                                    global_step=train_steps+1,
-                                                    max_steps=total_steps,
-                                                    )
+                    vq_outputs = vq_model(
+                        imgs,
+                        causal_type=causal_type,
+                        num_en_q_level=num_en_q_level,
+                        rec_loss=train_steps+1 < config["loss"]["params"]["aux_loss_end"],
+                        random_mix_reg=config["trainer"].get("random_mix_reg", False),
+                        replace_ratio=config["trainer"].get("replace_ratio", None),
+                        global_step=train_steps+1,
+                        max_steps=total_steps,
+                        selected_decoder_layer=selected_decoder_layer,
+                    )
+                    if hr_on:
+                        recons_imgs, inter_loss_set, hr_attn_weights = vq_outputs
+                    else:
+                        recons_imgs, inter_loss_set = vq_outputs
+                        hr_attn_weights = None
                     inner_feat = None
                 loss_gen = vq_loss(inter_loss_set, imgs, recons_imgs, exp_dir=exp_dir, optimizer_idx=0, global_step=train_steps+1, 
                                    last_layer=None,
@@ -704,6 +748,9 @@ def main(args):
                                    causal_type=causal_type, num_en_q_level=num_en_q_level,
                                    inner_feat=inner_feat,
                                    sem_enc_feat=z,
+                                   hr_attn_weights=hr_attn_weights,
+                                   hr_loss_weight=hr_loss_weight if hr_on else 0.0,
+                                   selected_layer=selected_decoder_layer,
                                    )
             
             if train_steps + 1 >= int(config["loss"]["params"].get("gen_start", 0)):

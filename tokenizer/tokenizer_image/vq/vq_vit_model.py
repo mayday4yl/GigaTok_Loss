@@ -332,6 +332,20 @@ class VQVitModelPlus(nn.Module):
 
         set_requires_grad(True, self.decoder)
         self.freeze_but_2d_decoder_flag = True
+
+    def apply_stage1_finetune_freeze(
+            self,
+            freeze_encoder=False,
+            freeze_quantizer=False,
+            freeze_codebook=False):
+        if freeze_encoder:
+            set_requires_grad(False, self.encoder, self.s2to1encoder, self.quant_conv)
+
+        if freeze_quantizer:
+            set_requires_grad(False, self.quantize)
+
+        if freeze_codebook and hasattr(self.quantize, "embedding"):
+            self.quantize.embedding.weight.requires_grad = False
     
     def _init_weights(self, module):
         """ Initialize the weights.
@@ -412,11 +426,18 @@ class VQVitModelPlus(nn.Module):
             self, quant, 
             ret_inner_feat=False, # the feature passed through a MLP for alignment loss
             return_feat=False,    # the feature for linear probe
+            selected_decoder_layer=None,
             ):
         quant = self.post_quant_conv(quant)
         if ret_inner_feat:
-            rec_spatial, inner_feat = self.s1to2decoder(quant, ret_inner_feat=True)
+            if selected_decoder_layer is not None:
+                rec_spatial, inner_feat, decoder_cross_attn = self.s1to2decoder(
+                    quant, ret_inner_feat=True, selected_decoder_layer=selected_decoder_layer)
+            else:
+                rec_spatial, inner_feat = self.s1to2decoder(quant, ret_inner_feat=True)
             pixel_dec = self.decoder(rec_spatial)
+            if selected_decoder_layer is not None:
+                return pixel_dec, rec_spatial, inner_feat, decoder_cross_attn
             return pixel_dec, rec_spatial, inner_feat
         elif return_feat:
             # specifically for linear probe
@@ -424,8 +445,14 @@ class VQVitModelPlus(nn.Module):
             # pixel_dec = self.decoder(rec_spatial)
             return None, None, inner_feat
         else:
-            rec_spatial = self.s1to2decoder(quant)
+            if selected_decoder_layer is not None:
+                rec_spatial, decoder_cross_attn = self.s1to2decoder(
+                    quant, selected_decoder_layer=selected_decoder_layer)
+            else:
+                rec_spatial = self.s1to2decoder(quant)
             pixel_dec = self.decoder(rec_spatial)
+            if selected_decoder_layer is not None:
+                return pixel_dec, rec_spatial, decoder_cross_attn
             return pixel_dec, rec_spatial
 
     def decode_code(self, code_b, shape=None, channel_first=True):
@@ -444,6 +471,7 @@ class VQVitModelPlus(nn.Module):
             replace_ratio=None,
             global_step=None,
             max_steps=None,
+            selected_decoder_layer=None,
             ):
         quant, diff, spatial = self.encode(
                                     input, 
@@ -459,11 +487,26 @@ class VQVitModelPlus(nn.Module):
             if self.config.encoder_2d_distill:
                 inner_feat = rearrange(spatial, 'b c h w -> b (h w) c')
                 inner_feat = self.distill_mlp(inner_feat)
-                dec, rec_spatial = self.decode(quant)
+                if selected_decoder_layer is not None:
+                    dec, rec_spatial, decoder_cross_attn = self.decode(
+                        quant, selected_decoder_layer=selected_decoder_layer)
+                else:
+                    dec, rec_spatial = self.decode(quant)
+                    decoder_cross_attn = None
             else:
-                dec, rec_spatial, inner_feat = self.decode(quant, ret_inner_feat=True)
+                if selected_decoder_layer is not None:
+                    dec, rec_spatial, inner_feat, decoder_cross_attn = self.decode(
+                        quant, ret_inner_feat=True, selected_decoder_layer=selected_decoder_layer)
+                else:
+                    dec, rec_spatial, inner_feat = self.decode(quant, ret_inner_feat=True)
+                    decoder_cross_attn = None
         else:
-            dec, rec_spatial = self.decode(quant)
+            if selected_decoder_layer is not None:
+                dec, rec_spatial, decoder_cross_attn = self.decode(
+                    quant, selected_decoder_layer=selected_decoder_layer)
+            else:
+                dec, rec_spatial = self.decode(quant)
+                decoder_cross_attn = None
 
         if self.training:
             if rec_loss:
@@ -481,9 +524,15 @@ class VQVitModelPlus(nn.Module):
                 dir_dec = None
             
             if ret_inner_feat:
+                if selected_decoder_layer is not None:
+                    return [dec, dir_dec], [diff, fea_rec_loss], inner_feat, decoder_cross_attn
                 return [dec, dir_dec], [diff, fea_rec_loss], inner_feat
+            if selected_decoder_layer is not None:
+                return [dec, dir_dec], [diff, fea_rec_loss], decoder_cross_attn
             return [dec, dir_dec], [diff, fea_rec_loss]
 
+        if selected_decoder_layer is not None:
+            return dec, diff, decoder_cross_attn
         return dec, diff
 
 
@@ -1361,7 +1410,5 @@ def compute_cosinesim_loss(feat1, feat2, dim):
     cos_sim = F.cosine_similarity(feat1, feat2, dim=dim)
     loss = 1 - cos_sim
     return torch.mean(loss)  
-
-
 
 

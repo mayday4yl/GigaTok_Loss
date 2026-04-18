@@ -641,7 +641,8 @@ class TransformerDecoderLayer(nn.Module):
                      tgt_key_padding_mask: Optional[Tensor] = None,
                      memory_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
-                     query_pos: Optional[Tensor] = None):
+                     query_pos: Optional[Tensor] = None,
+                     return_cross_attn_weights: bool = False):
         
         if self.query_rope:
             tgt2 = self.self_attn(
@@ -659,20 +660,27 @@ class TransformerDecoderLayer(nn.Module):
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
 
+        cross_attn_weights = None
         if self.use_qk_norm or self.use_flash_attn:
+            if return_cross_attn_weights:
+                raise NotImplementedError("HR loss currently supports nn.MultiheadAttention cross-attention only.")
             tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos, rope=self.query_rope),
                                     key=self.with_pos_embed(memory, pos),
                                     value=memory, attn_mask=memory_mask)
         else:
-            tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos, rope=self.query_rope),
+            tgt2, cross_attn_weights = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos, rope=self.query_rope),
                                     key=self.with_pos_embed(memory, pos),
                                     value=memory, attn_mask=memory_mask,
-                                    key_padding_mask=memory_key_padding_mask)[0]
+                                    key_padding_mask=memory_key_padding_mask,
+                                    need_weights=return_cross_attn_weights,
+                                    average_attn_weights=False)
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
+        if return_cross_attn_weights:
+            return tgt, cross_attn_weights
         return tgt
 
     def forward_pre(self, tgt, memory,
@@ -681,7 +689,8 @@ class TransformerDecoderLayer(nn.Module):
                     tgt_key_padding_mask: Optional[Tensor] = None,
                     memory_key_padding_mask: Optional[Tensor] = None,
                     pos: Optional[Tensor] = None,
-                    query_pos: Optional[Tensor] = None):
+                    query_pos: Optional[Tensor] = None,
+                    return_cross_attn_weights: bool = False):
         tgt2 = self.norm1(tgt)
         if self.query_rope:
             tgt2 = self.self_attn(
@@ -717,20 +726,27 @@ class TransformerDecoderLayer(nn.Module):
             print(tgt)
         tgt = tgt + self.dropout1(tgt2)
         tgt2 = self.norm2(tgt)
+        cross_attn_weights = None
         if self.use_qk_norm or self.use_flash_attn:
+            if return_cross_attn_weights:
+                raise NotImplementedError("HR loss currently supports nn.MultiheadAttention cross-attention only.")
             tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos, rope=self.query_rope),
                                     key=self.with_pos_embed(memory, pos),
                                     value=memory, attn_mask=memory_mask)
         else:
-            tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos, rope=self.query_rope),
+            tgt2, cross_attn_weights = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos, rope=self.query_rope),
                                     key=self.with_pos_embed(memory, pos),
                                     value=memory, attn_mask=memory_mask,
-                                    key_padding_mask=memory_key_padding_mask)[0]
+                                    key_padding_mask=memory_key_padding_mask,
+                                    need_weights=return_cross_attn_weights,
+                                    average_attn_weights=False)
  
         tgt = tgt + self.dropout2(tgt2)
         tgt2 = self.norm3(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
         tgt = tgt + self.dropout3(tgt2)
+        if return_cross_attn_weights:
+            return tgt, cross_attn_weights
         return tgt
 
     def forward(self, tgt, memory,
@@ -739,12 +755,15 @@ class TransformerDecoderLayer(nn.Module):
                 tgt_key_padding_mask: Optional[Tensor] = None,
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
+                query_pos: Optional[Tensor] = None,
+                return_cross_attn_weights: bool = False):
         if self.normalize_before:
             return self.forward_pre(tgt, memory, tgt_mask, memory_mask,
-                                    tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+                                    tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos,
+                                    return_cross_attn_weights=return_cross_attn_weights)
         return self.forward_post(tgt, memory, tgt_mask, memory_mask,
-                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
+                                 tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos,
+                                 return_cross_attn_weights=return_cross_attn_weights)
 
 
 class TransformerLayer(nn.Module):
@@ -1549,7 +1568,10 @@ class ViTDecoder(nn.Module):
             z_quantized, 
             ret_inner_feat=False,   # return inner feature(through mlp) for distillation
             return_feat=False,      # return feature for linear probe
+            selected_decoder_layer=None,
             ):
+        assert selected_decoder_layer is None or not return_feat, \
+            "selected_decoder_layer is not supported with return_feat=True"
         N, C, H, W = z_quantized.shape
         # assert H == 1 and W == self.num_latent_tokens, f"{H}, {W}, {self.num_latent_tokens}"
         selected_latent_tokens = W
@@ -1597,8 +1619,15 @@ class ViTDecoder(nn.Module):
         query_pos = self.positional_embedding.repeat(1, bs, 1).to(x.dtype) # shape = [*, grid ** 2 + 1, width]
         pos_embed = self.latent_token_positional_embedding[:selected_latent_tokens].repeat(1, bs, 1).to(x.dtype)
 
+        selected_cross_attn_weights = None
         for i in range(self.num_layers):
-            latent_tokens = self.transformer[i](latent_tokens, x, pos=pos_embed, query_pos=query_pos)
+            return_cross_attn_weights = selected_decoder_layer == i
+            if return_cross_attn_weights:
+                latent_tokens, selected_cross_attn_weights = self.transformer[i](
+                    latent_tokens, x, pos=pos_embed, query_pos=query_pos,
+                    return_cross_attn_weights=True)
+            else:
+                latent_tokens = self.transformer[i](latent_tokens, x, pos=pos_embed, query_pos=query_pos)
             if self.out_inner_feat and ret_inner_feat and (i + 1) == self.out_inner_depth:
                 inner_feat = self.distill_mlp(latent_tokens)
 
@@ -1622,8 +1651,12 @@ class ViTDecoder(nn.Module):
         if self.out_inner_feat and (ret_inner_feat or return_feat):
             # L N D -> N L D
             inner_feat = inner_feat.permute(1, 0, 2)
+            if selected_decoder_layer is not None:
+                return latent_tokens, inner_feat, selected_cross_attn_weights
             return latent_tokens, inner_feat
         else:
+            if selected_decoder_layer is not None:
+                return latent_tokens, selected_cross_attn_weights
             return latent_tokens
 
 
