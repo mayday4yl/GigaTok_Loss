@@ -125,3 +125,19 @@
 - HR loss 是本阶段新引入项，初期不应过强干扰原有 tokenizer finetune loss。
 - 较小权重有助于保证训练稳定，先观察 `hr_loss`、重建质量和 GAN/感知 loss 的相互影响。
 - 后续可在短训稳定后逐步调大 `hr_loss_weight`。
+
+# 2026-04-19 云服务器 stage-1 smoke test 方案
+
+## 本轮改动
+- 新增 `scripts/dev/run_stage1_smoke.sh`，用于单卡 stage-1 smoke test。
+- 新增 `docs/server_stage1_setup.md`，记录服务器环境变量、checkpoint 格式、运行命令、预期日志字段和常见失败点。
+- 不修改模型逻辑，不接入 TextAtlas5M，不跑全量训练。
+
+## smoke test 分层
+- `SMOKE_MODE=import`：不需要 checkpoint 或数据，只验证 HR 配置可读、`high_rank_attention_loss` 可 import 并能对 dummy attention 计算 `hr_loss` 和谱均匀性。
+- `SMOKE_MODE=random_forward`：需要 tokenizer checkpoint，不需要数据；用随机图片 tensor 验证 B-L 模型 forward/backward、selected decoder cross-attention weights、`attention_shape`、`hr_loss` 和 freeze summary。
+- `SMOKE_MODE=train`：复用现有 `tokenizer/tokenizer_image/vq/vq_train.py` 入口，单卡跑 2 到 5 个 iteration；未提供 `DATA_PATH` 时自动生成极小 ImageFolder dummy 数据。
+
+## 静态验证
+- 已运行：`bash -n scripts/dev/run_stage1_smoke.sh`
+- 结果：通过。
