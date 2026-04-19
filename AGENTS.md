@@ -49,3 +49,45 @@ Average over batch, heads, and the selected layer.
 - 未经我明确要求，不要同时做模型改动、数据集接入和全量训练。
 - 每个阶段结束后，把结论写入 docs/codex_worklog.md。
 - 修改代码后，先做 smoke test，再建议长时间训练。
+
+## Current phase: Stage-1 pilot
+
+### Goal
+Run a small controlled pilot for GigaTok stage-1:
+- compare baseline vs HR loss
+- target tokenizer: GigaTok B-L (dino disc)
+
+### Constraints
+- do NOT modify tokenizer architecture
+- do NOT modify AR model
+- keep frozen DINOv2-B
+- keep current pinned DINOv2 loading strategy
+- keep decoder-only finetune
+- HR only on decoder cross-attention
+- plan first before coding
+
+### Data
+Use only:
+- CleanTextSynth
+- StyledTextSynth
+- LongWordsSubset-M
+- TextScenesHQ
+
+Do not use:
+- TextVisionBlend
+- PPT2Structured
+- Paper2Text
+
+### Preprocess
+- keep aspect ratio
+- resize and pad to 256x256
+- no center crop
+
+### Experiment rule
+Baseline and HR must be strictly comparable:
+- same checkpoint
+- same data
+- same lr
+- same batch size
+- same steps
+- same seed when possible
