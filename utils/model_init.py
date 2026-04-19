@@ -50,7 +50,13 @@ def load_model_from_config(config):
     return model
 
 
-def download_load_multiprocess(repo, model):
+def _torch_hub_load(repo, model, source=None):
+    if source is None:
+        return torch.hub.load(repo, model)
+    return torch.hub.load(repo, model, source=source)
+
+
+def download_load_multiprocess(repo, model, source=None):
     import torch.distributed as dist
     success_flag = False
     node_rank = int(os.environ.get('NODE_RANK', 0))
@@ -61,7 +67,7 @@ def download_load_multiprocess(repo, model):
         rank = 0
 
     if node_rank == 0 and rank == 0:
-        model = torch.hub.load(repo, model)
+        model = _torch_hub_load(repo, model, source=source)
         success_flag = True
     else:
         # wait until the master process downloads the model
@@ -72,10 +78,17 @@ def download_load_multiprocess(repo, model):
 
     if not success_flag:
         # for the non master process, load the model later
-        model = torch.hub.load(repo, model)
+        model = _torch_hub_load(repo, model, source=source)
         success_flag = True
     
     return model
+
+
+def get_dinov2_hub_repo():
+    dinov2_repo_dir = os.environ.get("DINOV2_REPO_DIR", "").strip()
+    if dinov2_repo_dir:
+        return dinov2_repo_dir, "local"
+    return "facebookresearch/dinov2", None
 
 
 @torch.no_grad()
@@ -86,16 +99,19 @@ def load_encoders(enc_type, device, debug_mode=False):
         raise NotImplementedError()
 
     elif 'dinov2' in encoder_type:
+        repo, source = get_dinov2_hub_repo()
         if 'reg' in encoder_type:
             if debug_mode:
-                encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14_reg')
+                encoder = _torch_hub_load(repo, f'dinov2_vit{model_config}14_reg', source=source)
             else:
-                encoder = download_load_multiprocess('facebookresearch/dinov2', f'dinov2_vit{model_config}14_reg')
+                encoder = download_load_multiprocess(repo, f'dinov2_vit{model_config}14_reg', source=source)
         else:
             if debug_mode:
-                encoder = torch.hub.load('facebookresearch/dinov2', f'dinov2_vit{model_config}14')
+                encoder = _torch_hub_load(repo, f'dinov2_vit{model_config}14', source=source)
             else:
-                encoder = download_load_multiprocess('facebookresearch/dinov2', f'dinov2_vit{model_config}14')
+                encoder = download_load_multiprocess(repo, f'dinov2_vit{model_config}14', source=source)
+
+        assert encoder.embed_dim == 768, f"Expected DINOv2 ViT-B embed_dim=768, got {encoder.embed_dim}"
 
         del encoder.head
         encoder.pos_embed.data = timm.layers.pos_embed.resample_abs_pos_embed(
@@ -321,4 +337,3 @@ if __name__ == "__main__":
         # print(encoder.visual.output_dim)
         print(processor)
         """
-

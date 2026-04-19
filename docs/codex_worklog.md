@@ -141,3 +141,66 @@
 ## 静态验证
 - 已运行：`bash -n scripts/dev/run_stage1_smoke.sh`
 - 结果：通过。
+
+# 2026-04-19 云服务器环境搭建方案补充
+
+## 本轮改动
+- 扩展 `docs/server_stage1_setup.md`，补齐从 clone 仓库、conda 环境创建、依赖安装、环境变量、checkpoint 放置、官方 baseline reconstruction 到 stage-1 HR smoke test 的完整云服务器操作流程。
+- 新增 `scripts/dev/setup_stage1_env.sh`，用于创建 `gigatok-hr` conda 环境并安装 smoke test / reconstruction 所需依赖。
+- 未修改模型逻辑，未接入 TextAtlas5M，未跑训练。
+
+## 方案重点
+- 先用 `configs/vq/VQ_BL256_dino_disc.yaml` + 官方 B-L dino disc checkpoint 跑 qualitative reconstruction，验证官方 tokenizer 基线和服务器环境。
+- 再用 `configs/vq/VQ_BL256_dino_disc_hr.yaml` 跑 `SMOKE_MODE=import` 和 `SMOKE_MODE=random_forward`，验证 HR loss、selected decoder cross-attention、freeze summary 和 backward。
+- `SMOKE_MODE=train` 仅在 checkpoint 包含 optimizer/discriminator state 时运行；官方 release checkpoint 若只有模型权重，则以 `random_forward` 作为最小 stage-1 smoke 结论。
+
+# 2026-04-19 DINO 依赖固定策略文档化
+
+## 本轮改动
+- 更新 `docs/server_stage1_setup.md`，增加 DINO 依赖固定策略章节。
+- 明确区分 DINOv2 repo commit 固定和旧 DINO discriminator checkpoint checksum 固定：前者固定 `torch.hub` 使用的 DINOv2 源码，后者固定 `disc_type: "dinodisc"` 使用的 DINOv1 权重文件。
+- 增加服务器侧记录命令，生成：
+  - `/root/gigatok_persist/versions/dinov2.commit`
+  - `/root/gigatok_persist/versions/dinov2.status`
+  - `/root/gigatok_persist/versions/dinov2.load_test.txt`
+  - `/root/gigatok_persist/versions/dino_deitsmall16_pretrain.sha256`
+- 记录当前已验证的 DINOv2 Python 3.9 兼容 commit：`4d83ffd4f4b39df112cef7ed7833de7ebf3a202e`。
+
+## 边界
+- 未修改模型逻辑。
+- 未修改训练入口。
+- 未跑全量训练。
+
+# 2026-04-19 Stage-1 train-entry smoke 通过
+
+## 服务器验证结果
+- 已运行 `SMOKE_MODE=train ITERATIONS=3 GLOBAL_BATCH_SIZE=1 NUM_WORKERS=0 MIXED_PRECISION=bf16 bash scripts/dev/run_stage1_smoke.sh`。
+- 使用固定 DINOv2 cache：`/root/gigatok_persist/cache/torch/hub/facebookresearch_dinov2_main`。
+- DINOv2 teacher 输出维度：`out_inner_dim=768`。
+- LPIPS 权重从 `tokenizer/tokenizer_image/cache/vgg.pth` 加载成功。
+- 官方 checkpoint `/root/gigatok_persist/checkpoints/VQ_BL256_dino_disc.pt` 以 finetune 方式 resume 成功。
+- Stage-1 freeze summary：`trainable_params=480,559,363`，`frozen_params=141,077,768`。
+- 3 个 step 均记录到 `hr_loss`、`weighted_hr_loss`、`selected_layer`、`hr_spectrum_uniformity`，最后输出 `Done!`。
+
+## 边界
+- 使用 dummy ImageFolder 8 张图片。
+- 未接入 TextAtlas5M。
+- 未跑全量训练。
+
+# 2026-04-19 DINOv2 本地 repo 优先加载与 preflight 脚本
+
+## 本轮改动
+- 新增 `scripts/dev/source_stage1_env.sh`，集中设置 stage-1 服务器环境变量，并默认固定：
+  - `DINOV2_REPO_DIR=/root/gigatok_persist/cache/torch/hub/facebookresearch_dinov2_main`
+  - `DINOV2_EXPECTED_COMMIT=4d83ffd4f4b39df112cef7ed7833de7ebf3a202e`
+- 新增 `scripts/dev/check_dino_deps.sh`，用于训练前检查 DINOv2 commit、repo clean 状态、DINOv1 checksum，并执行轻量本地 `torch.hub.load` 测试。
+- `scripts/dev/run_stage1_smoke.sh` 会 source stage-1 环境并打印 `DINOV2_REPO_DIR`、`DINOV2_EXPECTED_COMMIT`。
+- `utils/model_init.py` 在 `DINOV2_REPO_DIR` 存在时优先使用本地 repo 加载 DINOv2；否则回退到原 torch.hub 行为。
+- DINOv2 加载后增加 `embed_dim == 768` 的运行时安全检查。
+
+## 边界
+- 未修改 `vq_train.py`。
+- 未修改 `vq_loss.py`。
+- 未修改 tokenizer forward/decoder HR loss 逻辑。
+- 未接入 TextAtlas5M。
+- 未跑全量训练。

@@ -4,8 +4,17 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
+export PROJECT_ROOT="${PROJECT_ROOT:-${REPO_ROOT}}"
+if [[ -f "${REPO_ROOT}/scripts/dev/source_stage1_env.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "${REPO_ROOT}/scripts/dev/source_stage1_env.sh"
+fi
+
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-true}"
+
+echo "[stage1-smoke] DINOV2_REPO_DIR=${DINOV2_REPO_DIR:-}"
+echo "[stage1-smoke] DINOV2_EXPECTED_COMMIT=${DINOV2_EXPECTED_COMMIT:-}"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 TORCH_RUN_PATH="${TORCH_RUN_PATH:-torchrun}"
