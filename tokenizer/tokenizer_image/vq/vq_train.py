@@ -19,6 +19,7 @@ import PIL
 import os
 import time
 import argparse
+from contextlib import nullcontext
 from math import ceil
 from glob import glob
 from copy import deepcopy
@@ -55,6 +56,39 @@ warnings.filterwarnings('ignore')
 
 
 wandb_project_name = "vqvit_imagenet_train"
+
+
+def prepare_device_backend(device_backend):
+    if device_backend == "cuda":
+        assert torch.cuda.is_available(), "Training currently requires at least one CUDA GPU."
+        return torch.cuda
+    if device_backend == "npu":
+        import torch_npu  # noqa: F401
+        assert torch.npu.is_available(), "Training currently requires at least one Ascend NPU."
+        return torch.npu
+    raise ValueError(f"Unsupported device backend: {device_backend}")
+
+
+def autocast_context(device_backend, mixed_precision, dtype=None):
+    if mixed_precision == "none":
+        return nullcontext()
+    if device_backend == "cuda":
+        return torch.cuda.amp.autocast(dtype=dtype)
+    if device_backend == "npu":
+        npu_amp = getattr(getattr(torch, "npu", None), "amp", None)
+        if npu_amp is not None and hasattr(npu_amp, "autocast"):
+            return npu_amp.autocast(dtype=dtype)
+        return torch.autocast(device_type="npu", dtype=dtype)
+    raise ValueError(f"Unsupported device backend: {device_backend}")
+
+
+def synchronize_device(device_backend):
+    if device_backend == "cuda":
+        torch.cuda.synchronize()
+    elif device_backend == "npu":
+        torch.npu.synchronize()
+    else:
+        raise ValueError(f"Unsupported device backend: {device_backend}")
 
 
 CLIP_DEFAULT_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -105,7 +139,7 @@ def main(args):
     """
     Trains a new model.
     """
-    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+    device_module = prepare_device_backend(args.device_backend)
 
     with open(args.model_config, "r") as f:
         config = yaml.safe_load(f)
@@ -165,10 +199,11 @@ def main(args):
     node_rank = int(os.environ.get('NODE_RANK', 0))
     print("rank", rank)
     print("node_rank", node_rank)
-    device = rank % torch.cuda.device_count()
+    local_device = rank % device_module.device_count()
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
-    torch.cuda.set_device(device)
+    device_module.set_device(local_device)
+    device = torch.device(f"{args.device_backend}:{local_device}")
 
 
 
@@ -245,7 +280,10 @@ def main(args):
 
 
     # training env
-    logger.info(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    logger.info(
+        f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}, "
+        f"device_backend={args.device_backend}."
+    )
 
     ######################################################################
     ## Load Teacher model for distillation
@@ -316,8 +354,8 @@ def main(args):
     logger.info(f"Discriminator Parameters: {sum(p.numel() for p in vq_loss.discriminator.parameters()):,}")
 
     # initialize a GradScaler. If enabled=False scaler is a no-op
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision =='fp16'))
-    scaler_disc = torch.cuda.amp.GradScaler(enabled=(args.mixed_precision =='fp16'))
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.device_backend == "cuda" and args.mixed_precision =='fp16'))
+    scaler_disc = torch.cuda.amp.GradScaler(enabled=(args.device_backend == "cuda" and args.mixed_precision =='fp16'))
 
     ###################################
     # Setup optimizer
@@ -687,7 +725,7 @@ def main(args):
             # prepare the distillive features
             if config["trainer"].get("distill_loss", False) is True:
                 with torch.no_grad():
-                    with torch.cuda.amp.autocast():
+                    with autocast_context(args.device_backend, args.mixed_precision, dtype=ptdtype):
                         # if preprocess is defined as a local variable then use it
                            # use REPA style code
                         raw_image_ = preprocess_raw_image(imgs, encoder_type)
@@ -705,7 +743,7 @@ def main(args):
                 z = None
 
 
-            with torch.cuda.amp.autocast(dtype=ptdtype):  
+            with autocast_context(args.device_backend, args.mixed_precision, dtype=ptdtype):  
                 if config["trainer"].get("distill_loss", False) is True:
                     vq_outputs = vq_model(
                         imgs,
@@ -770,7 +808,7 @@ def main(args):
             # discriminator training            
             if train_steps + 1 >= int(config["loss"]["params"]["disc_start"]):
                 optimizer_disc.zero_grad()
-                with torch.cuda.amp.autocast(dtype=ptdtype):
+                with autocast_context(args.device_backend, args.mixed_precision, dtype=ptdtype):
                     loss_disc = vq_loss(inter_loss_set, imgs, recons_imgs, optimizer_idx=1, global_step=train_steps+1, exp_dir=exp_dir,
                                         logger=logger, log_every=args.log_every, ckpt_every=args.ckpt_every, sem_enc_feat=z)
                 scaler_disc.scale(loss_disc).backward()
@@ -803,7 +841,7 @@ def main(args):
 
             if train_steps % args.log_every == 0:
                 # Measure training speed:
-                torch.cuda.synchronize()
+                synchronize_device(args.device_backend)
                 end_time = time.time()
                 steps_per_sec = log_steps / (end_time - start_time)
                 # Reduce loss history over all processes:
@@ -927,6 +965,7 @@ if __name__ == "__main__":
     parser.add_argument("--global-batch-size", type=int, default=None)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=16)
+    parser.add_argument("--device-backend", type=str, default="cuda", choices=["cuda", "npu"])
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"]) 
     parser.add_argument("--aux-loss-end", type=int, default=None, help="iteration to stop using auxiliary loss")

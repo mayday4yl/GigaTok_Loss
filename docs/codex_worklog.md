@@ -362,3 +362,32 @@
 - 这些脚本不启动训练。
 - 这些脚本不修改模型、loss、tokenizer 或数据集范围。
 - 清理脚本默认只 dry-run，训练 runner 集成时必须先看 dry-run 输出，再决定是否传 `--execute`。
+
+# 2026-04-21 Stage-1 最小 NPU 训练入口兼容
+
+## 本轮目标
+- 只做训练入口设备后端兼容，支持新服务器 Ascend NPU baseline smoke。
+- 保留 CUDA 原路径。
+- 不修改模型逻辑、HR loss 公式、tokenizer 主结构或 AR model。
+- 不修改当前四子集 image-only 数据方案。
+
+## 本轮改动
+- `utils/distributed.py`
+  - `init_distributed_mode(args)` 根据 `args.device_backend` 选择设备模块。
+  - `cuda` 使用原 `nccl` backend。
+  - `npu` import `torch_npu`，使用 `torch.npu` 和 `hccl` backend。
+- `tokenizer/tokenizer_image/vq/vq_train.py`
+  - 新增 `--device-backend {cuda,npu}`，默认 `cuda`。
+  - CUDA 路径保留原设备检查、DDP 和 AMP 行为。
+  - NPU 路径使用 `torch_npu` / `torch.npu`、`torch.device("npu:<local_rank>")`。
+  - `torch.cuda.synchronize()` 改为按后端同步。
+  - autocast 增加后端分支；baseline smoke 推荐先使用 `--mixed-precision none`，避免 NPU AMP 兼容风险。
+- `scripts/train_vq_npu.sh`
+  - 新增 NPU 专用启动脚本。
+  - 默认 `GPUS=1`，用于单卡 NPU baseline smoke。
+  - 调用 `vq_train.py --device-backend npu`。
+
+## Smoke 边界
+- baseline smoke 第一版推荐单卡 NPU、`--mixed-precision none`、`--no-wandb`。
+- 当前不跑长训练。
+- 当前不启用多卡 HCCL 性能优化。

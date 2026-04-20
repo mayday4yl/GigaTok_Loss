@@ -3,6 +3,20 @@ import torch
 import subprocess
 
 
+def _device_backend(args):
+    return getattr(args, "device_backend", "cuda")
+
+
+def _device_module(args):
+    backend = _device_backend(args)
+    if backend == "cuda":
+        return torch.cuda
+    if backend == "npu":
+        import torch_npu  # noqa: F401
+        return torch.npu
+    raise ValueError(f"Unsupported device backend: {backend}")
+
+
 def setup_for_distributed(is_master):
     """
     This function disables printing when not in master process
@@ -18,17 +32,18 @@ def setup_for_distributed(is_master):
     __builtin__.print = print
 
 def init_distributed_mode(args):
+    device_module = _device_module(args)
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ['WORLD_SIZE'])
         args.gpu = int(os.environ['LOCAL_RANK'])
         args.dist_url = 'env://'
-        os.environ['LOCAL_SIZE'] = str(torch.cuda.device_count())
+        os.environ['LOCAL_SIZE'] = str(device_module.device_count())
     elif 'SLURM_PROCID' in os.environ:
         proc_id = int(os.environ['SLURM_PROCID'])
         ntasks = int(os.environ['SLURM_NTASKS'])
         node_list = os.environ['SLURM_NODELIST']
-        num_gpus = torch.cuda.device_count()
+        num_gpus = device_module.device_count()
         addr = subprocess.getoutput(
             'scontrol show hostname {} | head -n1'.format(node_list))
         os.environ['MASTER_PORT'] = os.environ.get('MASTER_PORT', '29500')
@@ -48,8 +63,8 @@ def init_distributed_mode(args):
 
     args.distributed = True
 
-    torch.cuda.set_device(args.gpu)
-    args.dist_backend = 'nccl'
+    device_module.set_device(args.gpu)
+    args.dist_backend = 'nccl' if _device_backend(args) == "cuda" else 'hccl'
     print('| distributed init (rank {}): {}'.format(
         args.rank, args.dist_url), flush=True)
     torch.distributed.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
