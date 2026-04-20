@@ -295,3 +295,70 @@
 - 未改当前 TextAtlas 四子集方案。
 - 未改训练入口和模型逻辑。
 - 未跑训练。
+
+# 2026-04-21 Stage-1 存储控制与清理策略工具
+
+## 本轮目标
+- 只实现磁盘与大文件控制工具。
+- 不修改模型逻辑、HR loss 公式、tokenizer 主结构或 AR model。
+- 不加入 `TextVisionBlend`。
+- 当前仍保持四子集 image-only stage-1 路线：`CleanTextSynth`、`StyledTextSynth`、`LongWordsSubset-M`、`TextScenesHQ`。
+
+## 大文件风险排序
+1. materialized train chunks：最容易快速增长，尤其是 current / prefetch / archive 同时存在时。
+2. full resume checkpoint：包含 model、optimizer、discriminator、optimizer_disc、steps、args，必须 rotation。
+3. eval 重建输出：禁止默认保留全量 reconstruction PNG / GT PNG / `.npz`。
+4. torch / HF / DINO / LPIPS cache：DINO pinned 信息和必需权重不能自动清理；HF 临时下载和 pip cache 可按需清理。
+5. fixed val images：HR / baseline 共用，长期保留但纳入预算。
+6. model-only checkpoint：用于 eval / 汇报 / baseline 对齐，体积小于 full resume。
+7. logs / metrics / manifests / run_state：体积小，默认长期保留。
+
+## 本轮新增
+- `scripts/dev/check_disk_budget.sh`
+  - 只读打印 `df -h`、关键目录 `du -sh` 和 normal / warning / hard / emergency 水位线状态。
+  - 默认阈值：warning `75%` 或 `<350GB`，hard `85%` 或 `<200GB`，emergency `90%` 或 `<100GB`。
+- `scripts/dev/cleanup_stage1_artifacts.sh`
+  - 默认 dry-run；只有显式传 `--execute` 才删除。
+  - 强制执行 chunk 唯一实例策略：`chunks/` 下只保护 `current/` 和 `prefetch/`，其他历史 chunk 立即列入清理候选。
+  - 清理 eval bulky 输出，并调用 checkpoint rotation。
+  - 保护 manifests、run_state、current chunk、prefetch chunk、fixed val、latest/best/final checkpoint。
+- `scripts/dev/rotate_stage1_checkpoints.py`
+  - 管理 `checkpoints/full_resume` 和 `checkpoints/model_only`。
+  - full resume 默认保留最近 2 份，model-only 默认保留最近 3 份。
+  - 永远保护 `latest.pt`、`best.pt`、`final.pt` 和 `.protected` 标记文件。
+- `scripts/dev/prune_stage1_eval_outputs.py`
+  - eval 后只保留 metrics / config / grid 类输出。
+  - 默认最多保留 32 张非 grid sample image，并将 eval 目录控制在 1GB 以内。
+  - 删除超额图片、`.npz`、`.npy` 和 `eval/tmp` 内容。
+
+## 不可删除对象
+- `train_manifest.jsonl`
+- `val_manifest.jsonl`
+- `manifest.sha256`
+- `exact_count.json`
+- `chunk_order.json`
+- `chunk_order.sha256`
+- `run_state.json`
+- 当前 latest 可恢复 full checkpoint
+- 当前正在训练的 chunk
+- `val_image_paths.json`
+- fixed val images 和 fixed val manifest
+- 起点 checkpoint `VQ_BL256_dino_disc.pt`
+- DINO pinned repo/version 信息和必需权重
+- 当前 run config、实际命令记录和本 worklog
+
+## 建议目录策略
+- `checkpoints/full_resume/`：最近 2 份 + `latest.pt`。
+- `checkpoints/model_only/`：最近 3 份 + `latest.pt` / `best.pt` / `final.pt`。
+- `chunks/current/`：当前训练 chunk，禁止自动删除。
+- `chunks/prefetch/`：最多 1 个预取 chunk。
+- `chunks/` 下除 `current/` 和 `prefetch/` 外的任何历史 chunk：默认清理。
+- `eval/latest/`：只保留 metrics 和 sample grid。
+- `eval/history/`：只保留 metrics。
+- `eval/tmp/`：eval 后清空。
+- eval 输出硬上限：默认 `MAX_SAMPLES=32`，`MAX_DIR_SIZE=1GB`。
+
+## 使用边界
+- 这些脚本不启动训练。
+- 这些脚本不修改模型、loss、tokenizer 或数据集范围。
+- 清理脚本默认只 dry-run，训练 runner 集成时必须先看 dry-run 输出，再决定是否传 `--execute`。
