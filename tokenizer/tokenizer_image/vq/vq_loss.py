@@ -197,6 +197,7 @@ class VQLoss(nn.Module):
                  use_semantic_input=False,    # (deprecated)choosing from "local" or "global", for Semantic discriminator
                  perceptual_model="vgg",      # for perceptual loss setting
                  gamma=15,  # for r3gan R1+R2 panelty, deprecated
+                 discriminator_device="cuda",
     ):
         super().__init__()
         # discriminator loss
@@ -248,7 +249,7 @@ class VQLoss(nn.Module):
             )
         elif disc_type == "dinodisc":
             aug_prob = 1.0
-            self.discriminator = DINODiscriminator(norm_type="bn")  # default 224 otherwise crop
+            self.discriminator = DINODiscriminator(norm_type="bn", device=discriminator_device)  # default 224 otherwise crop
             self.daug = DiffAug(prob=aug_prob, cutout=0.2)
         elif disc_type == "patchvit":
             self.discriminator = PatchViTDiscriminator(

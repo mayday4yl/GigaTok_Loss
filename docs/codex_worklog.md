@@ -391,3 +391,24 @@
 - baseline smoke 第一版推荐单卡 NPU、`--mixed-precision none`、`--no-wandb`。
 - 当前不跑长训练。
 - 当前不启用多卡 HCCL 性能优化。
+
+# 2026-04-21 NPU baseline smoke: DINO discriminator device 修复
+
+## 现象
+- 新服务器单卡 NPU baseline smoke 已进入 HCCL 初始化、gate dataloader、DINOv2 teacher load 和 VQ model 构造。
+- 随后在 `VQLoss(...disc_type="dinodisc")` 构造 DINO discriminator 时失败：
+  - `DINODiscriminator` 默认 `device="cuda"`。
+  - NPU 环境的 PyTorch 未编译 CUDA，因此 `.to("cuda")` 报 `Torch not compiled with CUDA enabled`。
+
+## 本轮修复
+- `tokenizer/tokenizer_image/vq/vq_loss.py`
+  - 给 `VQLoss` 新增 `discriminator_device` 参数，默认仍为 `"cuda"`，保持 CUDA 原路径。
+  - `disc_type="dinodisc"` 时把该设备传给 `DINODiscriminator`。
+- `tokenizer/tokenizer_image/vq/vq_train.py`
+  - 构造 `VQLoss` 时传入当前训练设备 `device`。
+
+## 边界
+- 不修改 DINO discriminator 结构。
+- 不修改 loss 公式。
+- 不修改 HR loss、tokenizer 主结构或 AR model。
+- 目标只是让 NPU baseline smoke 不再强制走 CUDA。
