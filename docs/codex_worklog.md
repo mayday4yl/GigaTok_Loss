@@ -204,3 +204,57 @@
 - 未修改 tokenizer forward/decoder HR loss 逻辑。
 - 未接入 TextAtlas5M。
 - 未跑全量训练。
+
+# 2026-04-20 TextAtlas image-only 数据桥接实现
+
+## 实施前确认
+- 已确认 `dataset/openimage.py` 中 `MixedDatasetJson` 的输入格式：`json_path` 必须指向一个 JSON 字符串数组，每个元素是完整本地图片路径。
+- `MixedDatasetJson.getdata()` 会直接对数组元素执行 `Image.open(image_path_full).convert('RGB')`，因此 `train_image_paths.json` 不能是对象数组，也不能是 rich manifest JSONL。
+
+## 本轮改动
+- 新增 `scripts/stage1/build_textatlas_image_manifest.py`。
+  - 只 materialize 当前 stage-1 pilot 允许的四个 subset：`CleanTextSynth`、`StyledTextSynth`、`LongWordsSubset-M`、`TextScenesHQ`。
+  - 默认规模为每 subset `10000` train + `500` val，总计 `40000` train + `2000` val。
+  - 输出训练实际读取的 `train_image_paths.json` / `val_image_paths.json`，格式为 JSON 字符串数组，完全兼容 `MixedDatasetJson`。
+  - 同时输出 `train_manifest.jsonl` / `val_manifest.jsonl` rich manifest，用于审计和复现。
+  - 图像保存和校验均使用 RGB 路径；保存后校验调用 `PIL.Image.open(...).convert("RGB")` 和 `load()`。
+- 新增 `scripts/stage1/check_textatlas_manifest.py`。
+  - 校验 image path list 与 rich manifest 的 `image_path` 顺序一致。
+  - 校验 subset 白名单、计数、字段完整性、text_source 映射、本地图片存在且可 RGB decode/load。
+  - 校验 `manifest.sha256` 中记录的文件 digest。
+- 新增 `docs/textatlas_stage1_bridge.md`。
+  - 记录当前 image-only 决策、训练实际读取文件、rich manifest 字段、构建/校验命令、磁盘估计和边界。
+
+## Rich manifest 字段
+- 保留：`dataset`、`subset`、`split`、`hf_split`、`hf_row_idx`、`hf_image_path`、`image_path`、`text`、`text_source`、`raw_annotation`。
+- 当前训练不使用 `text`、`text_source`、`raw_annotation`。
+- text 映射只做字段复制：
+  - `CleanTextSynth` / `StyledTextSynth` / `LongWordsSubset-M` 使用 `annotation`。
+  - `TextScenesHQ` 使用 `raw_text`，并把 `annotation` 保留到 `raw_annotation`。
+
+## 边界
+- 未修改模型逻辑。
+- 未修改 tokenizer 主结构。
+- 未修改 AR model。
+- 未加 OCR 评测。
+- 未做 text injection。
+- 未下载全量 TextAtlas5M。
+
+# 2026-04-20 TextAtlas materialize 默认格式修正
+
+## 修改
+- 将 `scripts/stage1/build_textatlas_image_manifest.py` 的默认 `--save-format` 从 `jpeg` 改为 `png`。
+- 构建脚本新增 `image_paths.sha256`，单独记录 `train_image_paths.json` 和 `val_image_paths.json` 的 sha256。
+- `manifest.sha256` 现在同时覆盖 rich manifest、image path list、`counts.json`、`build_config.json`、`bad_rows.jsonl` 和 `image_paths.sha256`。
+- `scripts/stage1/check_textatlas_manifest.py` 新增校验：
+  - `counts.json`、`manifest.sha256`、`image_paths.sha256`、`bad_rows.jsonl` 必须存在。
+  - 同一 subset 内 train / val 的 `hf_row_idx` 不得有交集。
+  - `bad_rows.jsonl` 若非空，每行必须是合法 JSON 对象，并包含 `dataset`、`subset`、`hf_split`、`hf_row_idx`、`error`。
+  - `counts.json` 中 train/val 总数和各 subset 计数必须与 manifest 一致。
+- 更新 `docs/textatlas_stage1_bridge.md`，将推荐构建命令改为 `--save-format png`，并说明 PNG 无损保存是为了避免二次 JPEG 压缩污染 reconstruction 指标。
+
+## 边界
+- 训练仍然只读取 `train_image_paths.json` / `val_image_paths.json` 字符串数组。
+- rich manifest 中的 text 字段仍仅用于审计和复现。
+- 未修改模型逻辑、tokenizer 主结构或 AR model。
+- 未加 OCR 评测。
