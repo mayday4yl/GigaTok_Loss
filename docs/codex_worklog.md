@@ -258,3 +258,40 @@
 - rich manifest 中的 text 字段仍仅用于审计和复现。
 - 未修改模型逻辑、tokenizer 主结构或 AR model。
 - 未加 OCR 评测。
+
+# 2026-04-20 Stage-1 服务器迁移审计与计划
+
+## 本轮目标
+- 只做迁移审计、迁移文档和辅助脚本。
+- 保持当前四子集方案不变：`CleanTextSynth`、`StyledTextSynth`、`LongWordsSubset-M`、`TextScenesHQ`。
+- 不加入 `TextVisionBlend`。
+- 不修改模型逻辑、训练逻辑、tokenizer 主结构或 AR model。
+- 不跑训练。
+
+## 绝对路径风险
+- `scripts/dev/source_stage1_env.sh` 原先默认绑定 `/root/GigaTok_hr/GigaTok_Loss` 和 `/root/gigatok_persist`。
+- `train_image_paths.json` / `val_image_paths.json` 是训练实际读取的 JSON 字符串数组，内部保存本地图像绝对路径。
+- rich manifest 中 `image_path` 也是绝对路径，必须与 image path list 顺序和内容一致。
+- `docs/server_stage1_setup.md` 中的 `/root/...` 路径应视为旧服务器示例，新服务器需要用实际 `PROJECT_ROOT` / `PERSIST_ROOT`。
+
+## 本轮改动
+- 更新 `scripts/dev/source_stage1_env.sh`：
+  - 默认从脚本位置自动推导 `PROJECT_ROOT`。
+  - 默认 `PERSIST_ROOT=${HOME}/gigatok_persist`。
+  - 仍允许通过环境变量显式覆盖新服务器路径。
+- 新增 `docs/server_migration_plan.md`：
+  - 记录必须迁移、可重下、可重建但必须保留 manifest 的内容。
+  - 记录旧服务器导出、新服务器恢复、路径重写和迁移验证顺序。
+- 新增 `scripts/dev/export_env_state.sh`：
+  - 在旧服务器导出 git/env/python/conda/GPU/disk/checkpoint/DINO/manifest 元信息。
+  - 不复制图片、checkpoint 或 cache，只记录迁移审计状态。
+- 新增 `scripts/dev/check_migration_ready.sh`：
+  - 在新服务器检查代码、依赖、checkpoint、manifest、image path list、rich manifest、sha256 和可选 DINO preflight。
+- 新增 `scripts/dev/rewrite_manifest_paths.py`：
+  - 当新服务器路径不同，重写 `train_image_paths.json` / `val_image_paths.json` 和 rich manifest 的 `image_path`。
+  - 同步更新 `build_config.json` 并重算 `manifest.sha256` / `image_paths.sha256`。
+
+## 边界
+- 未改当前 TextAtlas 四子集方案。
+- 未改训练入口和模型逻辑。
+- 未跑训练。

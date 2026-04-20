@@ -2,8 +2,19 @@
 # Source this file before stage-1 smoke or finetune commands.
 # It only exports environment variables; it does not start training.
 
-export PROJECT_ROOT="${PROJECT_ROOT:-/root/GigaTok_hr/GigaTok_Loss}"
-export PERSIST_ROOT="${PERSIST_ROOT:-/root/gigatok_persist}"
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+  _STAGE1_ENV_SCRIPT_PATH="${BASH_SOURCE[0]}"
+elif [[ -n "${ZSH_VERSION:-}" ]]; then
+  _STAGE1_ENV_SCRIPT_PATH="${(%):-%x}"
+else
+  _STAGE1_ENV_SCRIPT_PATH="$0"
+fi
+
+_STAGE1_ENV_SCRIPT_DIR="$(cd "$(dirname "${_STAGE1_ENV_SCRIPT_PATH}")" && pwd)"
+_STAGE1_ENV_REPO_ROOT="$(cd "${_STAGE1_ENV_SCRIPT_DIR}/../.." && pwd)"
+
+export PROJECT_ROOT="${PROJECT_ROOT:-${_STAGE1_ENV_REPO_ROOT}}"
+export PERSIST_ROOT="${PERSIST_ROOT:-${HOME}/gigatok_persist}"
 
 export CKPT_DIR="${CKPT_DIR:-${PERSIST_ROOT}/checkpoints}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${PERSIST_ROOT}/outputs}"
