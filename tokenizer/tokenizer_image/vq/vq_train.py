@@ -349,6 +349,7 @@ def main(args):
         use_semantic_input=config["loss"]["params"].get("use_semantic_input", False),
         perceptual_model=config["loss"]["params"].get("perceptual_model", "vgg"),
         gamma=config["loss"]["params"].get("gamma", 15),
+        discriminator_device=device,
     ).to(device)
 
     logger.info(f"Discriminator Parameters: {sum(p.numel() for p in vq_loss.discriminator.parameters()):,}")
