@@ -76,6 +76,20 @@ python scripts/stage1/materialize_textatlas_local.py \
   --image-size 256
 ```
 
+如果 `datasets` streaming 在 ModelArts 网络下频繁 timeout，可改用 parquet shard cache 版本。它会逐个下载 parquet shard 到本地 cache，再从本地 parquet 解出需要的图片，支持断点续跑：
+
+```bash
+HF_ENDPOINT=https://huggingface.co \
+python scripts/stage1/materialize_textatlas_parquet_shards.py \
+  --manifest-root "$OUTPUT_DIR/textatlas_stage1_fixed_240k/manifest" \
+  --image-root "$OUTPUT_DIR/textatlas_stage1_fixed_240k/images" \
+  --output-root "$OUTPUT_DIR/textatlas_stage1_fixed_240k/manifest" \
+  --parquet-cache-root "$PERSIST_ROOT/cache/textatlas_parquet" \
+  --splits val \
+  --preprocess resize-pad \
+  --image-size 256
+```
+
 校验 materialized 文件：
 
 ```bash
