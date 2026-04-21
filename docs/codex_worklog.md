@@ -435,3 +435,26 @@
 ## 原因
 - 当前服务器约定所有数据和 cache 放在 `/home/ma-user/work/GigaTok_hr/gigatok_persist`。
 - 避免后台 materialize 误写到 `/home/ma-user/gigatok_persist`。
+
+# 2026-04-21 Stage-1 顺序 parquet 落盘路径
+
+## 背景
+- ModelArts 上 `datasets` streaming + 随机行抽样会频繁触发远端 parquet seek，实际下载很慢且容易超时。
+- 直接通过 ModelArts 默认代理 `proxy-notebook.modelarts.com:8083` 用 `curl` 下载 Hugging Face converted parquet shard 可达到十几 MB/s，明显更稳定。
+
+## 本轮修正
+- 新增 `scripts/stage1/materialize_textatlas_sequential_parquet.py`。
+- 新路径不做随机抽样；每个 subset 从前往后连续取样：
+  - `val`: 前 `2000` 行。
+  - `hold-out`: 接下来的 `500` 行，仅写 source manifest。
+  - `train`: 后续 `TextScenesHQ=40000` 行，其余 subset 各 `50000` 行。
+- 脚本直接下载 `refs/convert/parquet` 下的连续 parquet shard，解码图片并按 `resize-pad` 落盘到训练需要的 `train_image_paths.json` / `val_image_paths.json`。
+- 默认保留 parquet cache，便于失败后断点续跑；如确认空间紧张，可显式传 `--delete-parquet-after-materialize`。
+
+## 验证
+- 本地通过 `py_compile` 检查新增脚本和现有 stage-1 数据脚本。
+- 本地用伪 parquet 对象做了小型顺序 materialize smoke，验证连续行号、split 跳过 hold-out、图片路径命名和 `resize-pad` 保存逻辑。
+
+## 边界
+- 不修改模型逻辑、HR loss 公式、tokenizer 主结构或 AR model。
+- 顺序抽样会牺牲随机覆盖面，但 baseline/HR 仍使用同一份本地数据，满足当前 pilot 的严格可比性。

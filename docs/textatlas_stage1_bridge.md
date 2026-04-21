@@ -26,7 +26,7 @@
 
 ## Rich Manifest
 
-`build_textatlas_fixed_manifest.py` 输出 source-only manifest：
+随机抽样路径中，`build_textatlas_fixed_manifest.py` 输出 source-only manifest：
 
 - `exact_count.json`
 - `train_manifest.jsonl`
@@ -48,6 +48,51 @@
 | `LongWordsSubset-A` | `annotation` |
 
 ## 构建命令
+
+### 首选：顺序 parquet 落盘
+
+如果 ModelArts 上 `datasets` streaming 很慢，但 `curl` 直接下载 Hugging Face converted parquet 较快，优先使用顺序 parquet 落盘。该路径不做随机抽样；每个 subset 从前往后连续取样，直接写出 source manifest、materialized manifest 和训练需要的 image paths：
+
+```bash
+unset http_proxy https_proxy ftp_proxy all_proxy no_proxy
+unset HTTP_PROXY HTTPS_PROXY FTP_PROXY ALL_PROXY NO_PROXY
+export HTTP_PROXY=http://proxy-notebook.modelarts.com:8083
+export HTTPS_PROXY=http://proxy-notebook.modelarts.com:8083
+export HF_ENDPOINT=https://huggingface.co
+
+rm -rf "$OUTPUT_DIR/textatlas_stage1_fixed_240k/images"
+rm -rf "$PERSIST_ROOT/cache/textatlas_parquet_test"
+rm -rf "$PERSIST_ROOT/cache/textatlas_parquet_seq"
+
+python scripts/stage1/materialize_textatlas_sequential_parquet.py \
+  --output-root "$OUTPUT_DIR/textatlas_stage1_fixed_240k/manifest" \
+  --image-root "$OUTPUT_DIR/textatlas_stage1_fixed_240k/images" \
+  --parquet-cache-root "$PERSIST_ROOT/cache/textatlas_parquet_seq" \
+  --splits train val \
+  --preprocess resize-pad \
+  --image-size 256 \
+  --overwrite-manifest
+```
+
+该脚本默认：
+
+- `TextScenesHQ=40,000 train`
+- 其余 4 个 subset 各 `50,000 train`
+- 每 subset `2,000 val`
+- 每 subset `500 hold-out`，写 source manifest，但默认不落盘图片
+- 从 Hugging Face `refs/convert/parquet` 下载连续 parquet shard
+
+下载和落盘完成后再校验：
+
+```bash
+python scripts/stage1/check_textatlas_fixed_manifest.py \
+  --manifest-root "$OUTPUT_DIR/textatlas_stage1_fixed_240k/manifest" \
+  --materialized-root "$OUTPUT_DIR/textatlas_stage1_fixed_240k/manifest"
+```
+
+如果需要节省磁盘，可在确认可断点重跑策略后增加 `--delete-parquet-after-materialize`；默认保留 parquet cache，便于失败后续跑和排查。
+
+### 备选：随机 manifest + streaming
 
 ```bash
 python scripts/stage1/build_textatlas_fixed_manifest.py \
