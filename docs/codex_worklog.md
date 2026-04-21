@@ -412,3 +412,36 @@
 - 不修改 loss 公式。
 - 不修改 HR loss、tokenizer 主结构或 AR model。
 - 目标只是让 NPU baseline smoke 不再强制走 CUDA。
+
+# 2026-04-21 Stage-1 full manifest / chunk 数据准备脚本
+
+## 本轮目标
+- 进入 full-train 数据准备阶段，保持 4 个 TextAtlas 子集不变。
+- 固定 `3,000,000` train + `10,000` fixed val 的当前方案。
+- train 不一次性 materialize 到本地；只先生成 source-only manifest，然后按 chunk 落盘。
+- fixed val 一次性 materialize，供 HR 3M 和 baseline 3M 共用。
+- 不修改模型逻辑、HR loss 公式、tokenizer 主结构或 AR model。
+
+## 新增脚本
+- `scripts/stage1/textatlas_manifest_utils.py`
+  - 共用 TextAtlas 子集常量、sha256、JSON/JSONL、比例分配、图片保存、streaming materialize helper。
+- `scripts/stage1/build_textatlas_full_manifest.py`
+  - 统计每个 subset 的 exact row count。
+  - 先按 exact row count 比例抽 fixed val。
+  - 再从扣掉 val 后的剩余样本里按比例无放回抽 `3M train`。
+  - 输出 `exact_count.json`、`train_manifest.jsonl`、`val_manifest.jsonl`、`manifest.sha256`。
+- `scripts/stage1/build_textatlas_chunk_order.py`
+  - 从 `train_manifest.jsonl` 构建冻结的 `chunk_order.json`。
+  - 默认前 2 个 chunk 使用 `20,000`，后续使用 `50,000`。
+  - 默认 `subset-round-robin`：按 subset 比例交织，同时保持每个 subset 内 hf row index 单调推进，方便 streaming materialize。
+- `scripts/stage1/materialize_textatlas_val.py`
+  - 从 source-only `val_manifest.jsonl` 一次性落盘 fixed val。
+  - 输出 `val_image_paths.json`、`val_materialized_manifest.jsonl`、`val_materialized.sha256`。
+- `scripts/stage1/materialize_textatlas_chunk.py`
+  - 从 `train_manifest.jsonl + chunk_order.json` materialize 单个 train chunk。
+  - 输出 `chunk_image_paths.json`、`chunk_manifest.jsonl`、`chunk_materialized.sha256`。
+
+## 当前边界
+- 这些脚本只准备数据和 chunk，不启动训练。
+- 第一版 chunk materialize 可以独立运行；正式 runner 后续再串联 materialize / train / checkpoint / run_state。
+- source-only full manifest 不直接给 `MixedDatasetJson` 使用；训练时使用 materialized chunk 产生的 `chunk_image_paths.json`。
