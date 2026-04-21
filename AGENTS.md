@@ -67,16 +67,22 @@ Run a small controlled pilot for GigaTok stage-1:
 - plan first before coding
 
 ### Data
-Use only:
+Use only the current fixed-count TextAtlas subset:
 - CleanTextSynth
 - StyledTextSynth
-- LongWordsSubset-M
-- TextScenesHQ
-
-Do not use:
 - TextVisionBlend
-- PPT2Structured
-- Paper2Text
+- TextScenesHQ
+- LongWordsSubset-A
+
+Default train counts:
+- TextScenesHQ: 40,000
+- CleanTextSynth / StyledTextSynth / TextVisionBlend / LongWordsSubset-A: 50,000 each
+
+Validation:
+- balanced val, 2,000 images per subset
+- optional source-only hold-out, 500 rows per subset
+
+Do not add other TextAtlas subsets unless explicitly requested.
 
 ### Preprocess
 - keep aspect ratio

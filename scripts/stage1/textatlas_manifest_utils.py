@@ -15,16 +15,30 @@ from urllib.parse import quote
 
 
 DEFAULT_DATASET = "CSU-JPG/TextAtlas5M"
-ALLOWED_SUBSETS = (
+DEFAULT_STAGE1_SUBSETS = (
     "CleanTextSynth",
     "StyledTextSynth",
-    "LongWordsSubset-M",
+    "TextVisionBlend",
     "TextScenesHQ",
+    "LongWordsSubset-A",
+)
+KNOWN_TEXTATLAS_SUBSETS = DEFAULT_STAGE1_SUBSETS
+ALLOWED_SUBSETS = DEFAULT_STAGE1_SUBSETS
+SOURCE_ONLY_REQUIRED_FIELDS = (
+    "dataset",
+    "subset",
+    "split",
+    "hf_split",
+    "hf_row_idx",
+    "source_key",
+    "selection_seed",
+    "selection_strategy",
 )
 TEXT_SOURCE_BY_SUBSET = {
     "CleanTextSynth": "annotation",
     "StyledTextSynth": "annotation",
-    "LongWordsSubset-M": "annotation",
+    "TextVisionBlend": "annotation",
+    "LongWordsSubset-A": "annotation",
     "TextScenesHQ": "raw_text",
 }
 _PIL_IMAGE = None
@@ -138,6 +152,49 @@ def row_to_rgb_image(value: Any) -> Any:
     return rgb
 
 
+def parse_pad_color(value: str) -> Tuple[int, int, int]:
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) == 1:
+        parts = parts * 3
+    if len(parts) != 3:
+        raise ValueError("pad color must be one integer or three comma-separated integers.")
+    color = tuple(int(part) for part in parts)
+    if any(channel < 0 or channel > 255 for channel in color):
+        raise ValueError("pad color channels must be in [0, 255].")
+    return color  # type: ignore[return-value]
+
+
+def resize_pad_image(img: Any, image_size: int, pad_color: Tuple[int, int, int]) -> Any:
+    if image_size <= 0:
+        raise ValueError("image_size must be positive for resize-pad preprocessing.")
+    pil_image = import_pillow()
+    width, height = img.size
+    if width <= 0 or height <= 0:
+        raise ValueError(f"invalid image size: {img.size}")
+    scale = min(image_size / width, image_size / height)
+    resized_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    resized = img.resize(resized_size, resample=pil_image.Resampling.BICUBIC)
+    canvas = pil_image.new("RGB", (image_size, image_size), pad_color)
+    paste_x = (image_size - resized_size[0]) // 2
+    paste_y = (image_size - resized_size[1]) // 2
+    canvas.paste(resized, (paste_x, paste_y))
+    return canvas
+
+
+def preprocess_image(
+    img: Any,
+    *,
+    preprocess: str,
+    image_size: int,
+    pad_color: Tuple[int, int, int],
+) -> Any:
+    if preprocess == "none":
+        return img
+    if preprocess == "resize-pad":
+        return resize_pad_image(img, image_size, pad_color)
+    raise ValueError(f"Unknown image preprocess mode: {preprocess}")
+
+
 def save_image(img: Any, path: Path, save_format: str, jpeg_quality: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if save_format == "jpeg":
@@ -193,12 +250,16 @@ def materialize_source_record(
     save_format: str,
     jpeg_quality: int,
     overwrite: bool,
+    preprocess: str = "none",
+    image_size: int = 256,
+    pad_color: Tuple[int, int, int] = (255, 255, 255),
 ) -> Dict[str, Any]:
     output_path = output_path.resolve()
     if output_path.exists() and not overwrite:
         width, height = validate_saved_image(output_path)
     else:
         img = row_to_rgb_image(row.get("image"))
+        img = preprocess_image(img, preprocess=preprocess, image_size=image_size, pad_color=pad_color)
         save_image(img, output_path, save_format, jpeg_quality)
         width, height = validate_saved_image(output_path)
 
@@ -264,6 +325,16 @@ def allocate_proportional(
         if not progressed:
             raise ValueError("Allocation stalled; capacities are too small.")
     return allocation
+
+
+def validate_subset_names(subsets: Sequence[str], *, known_subsets: Sequence[str] = KNOWN_TEXTATLAS_SUBSETS) -> None:
+    seen = set()
+    for subset in subsets:
+        if subset in seen:
+            raise ValueError(f"duplicate subset: {subset}")
+        seen.add(subset)
+        if subset not in known_subsets:
+            raise ValueError(f"unknown TextAtlas subset: {subset}")
 
 
 def summarize_records(records: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -380,6 +451,9 @@ def stream_materialize_records(
     load_timeout: int = 60,
     load_retries: int = 5,
     retry_sleep: int = 5,
+    preprocess: str = "none",
+    image_size: int = 256,
+    pad_color: Tuple[int, int, int] = (255, 255, 255),
 ) -> List[Dict[str, Any]]:
     if not requests_by_row_idx:
         return []
@@ -405,6 +479,9 @@ def stream_materialize_records(
                 save_format=save_format,
                 jpeg_quality=jpeg_quality,
                 overwrite=overwrite,
+                preprocess=preprocess,
+                image_size=image_size,
+                pad_color=pad_color,
             )
             record["materialize_order"] = request["order"]
             materialized.append(record)

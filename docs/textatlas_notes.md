@@ -1,19 +1,25 @@
 # TextAtlas5M Notes for Stage-1
 
 ## Goal
-Use TextAtlas5M only after the HR-loss model code path is stable.
+Use a fixed local TextAtlas subset to compare baseline vs HR loss for tokenizer text reconstruction.
 
-## First-stage subset choice
-Use only:
+## Current stage-1 subset choice
+The current fixed-count text reconstruction validation run uses:
 - CleanTextSynth
 - StyledTextSynth
-- LongWordsSubset-M
+- TextVisionBlend
 - TextScenesHQ
+- LongWordsSubset-A
 
-Do not use in the first round:
+TextScenesHQ uses `40,000` train images. The other four subsets use `50,000`
+train images each. This stage no longer follows the original TextAtlas row
+distribution.
+
+Do not use in this round:
 - PPT2Structured
 - Paper2Text
-- TextVisionBlend
+- CoverBook
+- PPT2Details
 
 ## Preprocess
 - keep aspect ratio
@@ -22,5 +28,6 @@ Do not use in the first round:
 - do not center crop text-heavy images
 
 ## Suggested sample scale
-- smoke test: 5k to 10k images
-- first formal run: about 200k images total
+- formal run: fixed local materialized set, `40k TextScenesHQ + 4 * 50k other train`
+- validation: balanced 2k images per subset
+- optional hold-out: source-only 500 images per subset
