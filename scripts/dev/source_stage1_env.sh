@@ -12,9 +12,10 @@ fi
 
 _STAGE1_ENV_SCRIPT_DIR="$(cd "$(dirname "${_STAGE1_ENV_SCRIPT_PATH}")" && pwd)"
 _STAGE1_ENV_REPO_ROOT="$(cd "${_STAGE1_ENV_SCRIPT_DIR}/../.." && pwd)"
+_STAGE1_ENV_REPO_PARENT="$(cd "${_STAGE1_ENV_REPO_ROOT}/.." && pwd)"
 
 export PROJECT_ROOT="${PROJECT_ROOT:-${_STAGE1_ENV_REPO_ROOT}}"
-export PERSIST_ROOT="${PERSIST_ROOT:-${HOME}/gigatok_persist}"
+export PERSIST_ROOT="${PERSIST_ROOT:-${_STAGE1_ENV_REPO_PARENT}/gigatok_persist}"
 
 export CKPT_DIR="${CKPT_DIR:-${PERSIST_ROOT}/checkpoints}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${PERSIST_ROOT}/outputs}"

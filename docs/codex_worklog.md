@@ -425,3 +425,13 @@
 - 之前的大规模分块训练方案不再有可执行脚本。
 - 之前的容量反推方案不再有可执行脚本。
 - 现行方案以后续固定数量章节为准。
+
+# 2026-04-21 Stage-1 persist root 默认路径修正
+
+## 修正
+- `scripts/dev/source_stage1_env.sh` 的默认 `PERSIST_ROOT` 从 `${HOME}/gigatok_persist` 改为仓库同级目录下的 `gigatok_persist`。
+- 在 ModelArts 路径 `/home/ma-user/work/GigaTok_hr/GigaTok_Loss` 下，默认会解析到 `/home/ma-user/work/GigaTok_hr/gigatok_persist`。
+
+## 原因
+- 当前服务器约定所有数据和 cache 放在 `/home/ma-user/work/GigaTok_hr/gigatok_persist`。
+- 避免后台 materialize 误写到 `/home/ma-user/gigatok_persist`。
