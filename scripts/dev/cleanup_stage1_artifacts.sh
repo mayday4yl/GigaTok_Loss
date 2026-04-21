@@ -22,7 +22,7 @@ Options:
 
 Protected by policy:
   manifests, sha256 files, run_state, fixed val, latest/best/final checkpoints,
-  current chunk, prefetch chunk, DINO pinned records, and start checkpoints.
+  fixed train images, DINO pinned records, and start checkpoints.
 EOF
 }
 
@@ -167,8 +167,7 @@ echo "== protected paths =="
 for protected in \
   "${stage1_root}/manifests" \
   "${stage1_root}/run_state/run_state.json" \
-  "${stage1_root}/chunks/current" \
-  "${stage1_root}/chunks/prefetch" \
+  "${stage1_root}/train" \
   "${stage1_root}/val" \
   "${stage1_root}/checkpoints/full_resume/latest.pt" \
   "${stage1_root}/checkpoints/model_only/latest.pt" \
@@ -176,25 +175,6 @@ for protected in \
   "${stage1_root}/checkpoints/model_only/final.pt"; do
   echo "protect ${protected}"
 done
-
-echo
-echo "== enforce single chunk lifecycle =="
-chunks_root="${stage1_root}/chunks"
-if [[ -d "${chunks_root}" ]]; then
-  while IFS= read -r -d '' item; do
-    name="$(basename "${item}")"
-    case "${name}" in
-      current|prefetch)
-        echo "protect ${item}"
-        ;;
-      *)
-        delete_path "${item}"
-        ;;
-    esac
-  done < <(find "${chunks_root}" -mindepth 1 -maxdepth 1 -print0)
-else
-  echo "missing ${chunks_root}"
-fi
 
 echo
 echo "== prune eval outputs =="

@@ -205,107 +205,22 @@
 - 未接入 TextAtlas5M。
 - 未跑全量训练。
 
-# 2026-04-20 TextAtlas image-only 数据桥接实现
+# 2026-04-20 TextAtlas 早期数据方案归档
 
-## 实施前确认
-- 已确认 `dataset/openimage.py` 中 `MixedDatasetJson` 的输入格式：`json_path` 必须指向一个 JSON 字符串数组，每个元素是完整本地图片路径。
-- `MixedDatasetJson.getdata()` 会直接对数组元素执行 `Image.open(image_path_full).convert('RGB')`，因此 `train_image_paths.json` 不能是对象数组，也不能是 rich manifest JSONL。
-
-## 本轮改动
-- 新增 `scripts/stage1/build_textatlas_image_manifest.py`。
-  - 只 materialize 当前 stage-1 pilot 允许的四个 subset：`CleanTextSynth`、`StyledTextSynth`、`LongWordsSubset-M`、`TextScenesHQ`。
-  - 默认规模为每 subset `10000` train + `500` val，总计 `40000` train + `2000` val。
-  - 输出训练实际读取的 `train_image_paths.json` / `val_image_paths.json`，格式为 JSON 字符串数组，完全兼容 `MixedDatasetJson`。
-  - 同时输出 `train_manifest.jsonl` / `val_manifest.jsonl` rich manifest，用于审计和复现。
-  - 图像保存和校验均使用 RGB 路径；保存后校验调用 `PIL.Image.open(...).convert("RGB")` 和 `load()`。
-- 新增 `scripts/stage1/check_textatlas_manifest.py`。
-  - 校验 image path list 与 rich manifest 的 `image_path` 顺序一致。
-  - 校验 subset 白名单、计数、字段完整性、text_source 映射、本地图片存在且可 RGB decode/load。
-  - 校验 `manifest.sha256` 中记录的文件 digest。
-- 新增 `docs/textatlas_stage1_bridge.md`。
-  - 记录当前 image-only 决策、训练实际读取文件、rich manifest 字段、构建/校验命令、磁盘估计和边界。
-
-## Rich manifest 字段
-- 保留：`dataset`、`subset`、`split`、`hf_split`、`hf_row_idx`、`hf_image_path`、`image_path`、`text`、`text_source`、`raw_annotation`。
-- 当前训练不使用 `text`、`text_source`、`raw_annotation`。
-- text 映射只做字段复制：
-  - `CleanTextSynth` / `StyledTextSynth` / `LongWordsSubset-M` 使用 `annotation`。
-  - `TextScenesHQ` 使用 `raw_text`，并把 `annotation` 保留到 `raw_annotation`。
-
-## 边界
-- 未修改模型逻辑。
-- 未修改 tokenizer 主结构。
-- 未修改 AR model。
-- 未加 OCR 评测。
-- 未做 text injection。
-- 未下载全量 TextAtlas5M。
-
-# 2026-04-20 TextAtlas materialize 默认格式修正
-
-## 修改
-- 将 `scripts/stage1/build_textatlas_image_manifest.py` 的默认 `--save-format` 从 `jpeg` 改为 `png`。
-- 构建脚本新增 `image_paths.sha256`，单独记录 `train_image_paths.json` 和 `val_image_paths.json` 的 sha256。
-- `manifest.sha256` 现在同时覆盖 rich manifest、image path list、`counts.json`、`build_config.json`、`bad_rows.jsonl` 和 `image_paths.sha256`。
-- `scripts/stage1/check_textatlas_manifest.py` 新增校验：
-  - `counts.json`、`manifest.sha256`、`image_paths.sha256`、`bad_rows.jsonl` 必须存在。
-  - 同一 subset 内 train / val 的 `hf_row_idx` 不得有交集。
-  - `bad_rows.jsonl` 若非空，每行必须是合法 JSON 对象，并包含 `dataset`、`subset`、`hf_split`、`hf_row_idx`、`error`。
-  - `counts.json` 中 train/val 总数和各 subset 计数必须与 manifest 一致。
-- 更新 `docs/textatlas_stage1_bridge.md`，将推荐构建命令改为 `--save-format png`，并说明 PNG 无损保存是为了避免二次 JPEG 压缩污染 reconstruction 指标。
-
-## 边界
-- 训练仍然只读取 `train_image_paths.json` / `val_image_paths.json` 字符串数组。
-- rich manifest 中的 text 字段仍仅用于审计和复现。
-- 未修改模型逻辑、tokenizer 主结构或 AR model。
-- 未加 OCR 评测。
-
-# 2026-04-20 Stage-1 服务器迁移审计与计划
-
-## 本轮目标
-- 只做迁移审计、迁移文档和辅助脚本。
-- 保持当前四子集方案不变：`CleanTextSynth`、`StyledTextSynth`、`LongWordsSubset-M`、`TextScenesHQ`。
-- 不加入 `TextVisionBlend`。
-- 不修改模型逻辑、训练逻辑、tokenizer 主结构或 AR model。
-- 不跑训练。
-
-## 绝对路径风险
-- `scripts/dev/source_stage1_env.sh` 原先默认绑定 `/root/GigaTok_hr/GigaTok_Loss` 和 `/root/gigatok_persist`。
-- `train_image_paths.json` / `val_image_paths.json` 是训练实际读取的 JSON 字符串数组，内部保存本地图像绝对路径。
-- rich manifest 中 `image_path` 也是绝对路径，必须与 image path list 顺序和内容一致。
-- `docs/server_stage1_setup.md` 中的 `/root/...` 路径应视为旧服务器示例，新服务器需要用实际 `PROJECT_ROOT` / `PERSIST_ROOT`。
-
-## 本轮改动
-- 更新 `scripts/dev/source_stage1_env.sh`：
-  - 默认从脚本位置自动推导 `PROJECT_ROOT`。
-  - 默认 `PERSIST_ROOT=${HOME}/gigatok_persist`。
-  - 仍允许通过环境变量显式覆盖新服务器路径。
-- 新增 `docs/server_migration_plan.md`：
-  - 记录必须迁移、可重下、可重建但必须保留 manifest 的内容。
-  - 记录旧服务器导出、新服务器恢复、路径重写和迁移验证顺序。
-- 新增 `scripts/dev/export_env_state.sh`：
-  - 在旧服务器导出 git/env/python/conda/GPU/disk/checkpoint/DINO/manifest 元信息。
-  - 不复制图片、checkpoint 或 cache，只记录迁移审计状态。
-- 新增 `scripts/dev/check_migration_ready.sh`：
-  - 在新服务器检查代码、依赖、checkpoint、manifest、image path list、rich manifest、sha256 和可选 DINO preflight。
-- 新增 `scripts/dev/rewrite_manifest_paths.py`：
-  - 当新服务器路径不同，重写 `train_image_paths.json` / `val_image_paths.json` 和 rich manifest 的 `image_path`。
-  - 同步更新 `build_config.json` 并重算 `manifest.sha256` / `image_paths.sha256`。
-
-## 边界
-- 未改当前 TextAtlas 四子集方案。
-- 未改训练入口和模型逻辑。
-- 未跑训练。
+## 结论
+- 早期 TextAtlas pilot、服务器迁移审计和路径重写方案已废弃。
+- 相关可执行脚本和旧服务器文档已在后续清理中删除。
+- 当前 TextAtlas 数据入口以固定数量 5-subset 方案为准。
 
 # 2026-04-21 Stage-1 存储控制与清理策略工具
 
 ## 本轮目标
 - 只实现磁盘与大文件控制工具。
 - 不修改模型逻辑、HR loss 公式、tokenizer 主结构或 AR model。
-- 不加入 `TextVisionBlend`。
-- 当前仍保持四子集 image-only stage-1 路线：`CleanTextSynth`、`StyledTextSynth`、`LongWordsSubset-M`、`TextScenesHQ`。
+- 当前数据路线以固定数量 5-subset 本地 materialize 为准。
 
 ## 大文件风险排序
-1. materialized train chunks：最容易快速增长，尤其是 current / prefetch / archive 同时存在时。
+1. materialized train images：最容易快速增长。
 2. full resume checkpoint：包含 model、optimizer、discriminator、optimizer_disc、steps、args，必须 rotation。
 3. eval 重建输出：禁止默认保留全量 reconstruction PNG / GT PNG / `.npz`。
 4. torch / HF / DINO / LPIPS cache：DINO pinned 信息和必需权重不能自动清理；HF 临时下载和 pip cache 可按需清理。
@@ -319,9 +234,8 @@
   - 默认阈值：warning `75%` 或 `<350GB`，hard `85%` 或 `<200GB`，emergency `90%` 或 `<100GB`。
 - `scripts/dev/cleanup_stage1_artifacts.sh`
   - 默认 dry-run；只有显式传 `--execute` 才删除。
-  - 强制执行 chunk 唯一实例策略：`chunks/` 下只保护 `current/` 和 `prefetch/`，其他历史 chunk 立即列入清理候选。
   - 清理 eval bulky 输出，并调用 checkpoint rotation。
-  - 保护 manifests、run_state、current chunk、prefetch chunk、fixed val、latest/best/final checkpoint。
+  - 保护 manifests、fixed train/val、latest/best/final checkpoint。
 - `scripts/dev/rotate_stage1_checkpoints.py`
   - 管理 `checkpoints/full_resume` 和 `checkpoints/model_only`。
   - full resume 默认保留最近 2 份，model-only 默认保留最近 3 份。
@@ -336,11 +250,9 @@
 - `val_manifest.jsonl`
 - `manifest.sha256`
 - `exact_count.json`
-- `chunk_order.json`
-- `chunk_order.sha256`
 - `run_state.json`
 - 当前 latest 可恢复 full checkpoint
-- 当前正在训练的 chunk
+- fixed train images
 - `val_image_paths.json`
 - fixed val images 和 fixed val manifest
 - 起点 checkpoint `VQ_BL256_dino_disc.pt`
@@ -350,9 +262,6 @@
 ## 建议目录策略
 - `checkpoints/full_resume/`：最近 2 份 + `latest.pt`。
 - `checkpoints/model_only/`：最近 3 份 + `latest.pt` / `best.pt` / `final.pt`。
-- `chunks/current/`：当前训练 chunk，禁止自动删除。
-- `chunks/prefetch/`：最多 1 个预取 chunk。
-- `chunks/` 下除 `current/` 和 `prefetch/` 外的任何历史 chunk：默认清理。
 - `eval/latest/`：只保留 metrics 和 sample grid。
 - `eval/history/`：只保留 metrics。
 - `eval/tmp/`：eval 后清空。
@@ -413,76 +322,106 @@
 - 不修改 HR loss、tokenizer 主结构或 AR model。
 - 目标只是让 NPU baseline smoke 不再强制走 CUDA。
 
-# 2026-04-21 Stage-1 full manifest / chunk 数据准备脚本
+# 2026-04-21 大规模数据方案归档
 
-## 本轮目标
-- 进入 full-train 数据准备阶段，保持 4 个 TextAtlas 子集不变。
-- 固定 `3,000,000` train + `10,000` fixed val 的当前方案。
-- train 不一次性 materialize 到本地；只先生成 source-only manifest，然后按 chunk 落盘。
-- fixed val 一次性 materialize，供 HR 3M 和 baseline 3M 共用。
-- 不修改模型逻辑、HR loss 公式、tokenizer 主结构或 AR model。
+## 结论
+- 大规模 source-only manifest、分块落盘和独立 fixed-val 方案已废弃。
+- 相关可执行脚本已删除。
+- 当前只维护固定数量 5-subset manifest + 本地 train/val materialize 路线。
 
-## 新增脚本
+# 2026-04-21 Stage-1 固定数量文字重建验证数据方案
+
+## 最新目标
+- 当前不再执行大规模原始比例训练，也不按 TextAtlas 原始比例抽样。
+- 目标改为用固定数量的本地 materialized 数据，验证：
+  - baseline = `original_gigatok_loss`
+  - HR = `original_gigatok_loss + hr_loss_weight * hr_loss`
+- baseline 和 HR 必须共用同一份 `train / val / optional hold-out`、同一起点 checkpoint、batch、lr、steps 和 seed。
+- 训练时只读本地 `*_image_paths.json`，不走 Hugging Face streaming。
+
+## 数据设计
+- 当前 5 个 subset：
+  - `CleanTextSynth`
+  - `StyledTextSynth`
+  - `TextVisionBlend`
+  - `TextScenesHQ`
+  - `LongWordsSubset-A`
+- `TextScenesHQ`：抽 `40000` 张 train。
+- 其余 4 个 subset：每个抽 `50000` 张 train。
+- 总 train 为 `240000` 张；balanced val 为 `10000` 张；optional hold-out 为 source-only `2500` 张。
+- 空间估算只作为可选步骤，不再作为构建 manifest 的前置条件。
+- 当前采用 `LongWordsSubset-A`，因为更重视 256 下可读性和预处理稳定性。
+
+## Val / Test
+- 自建 balanced val：每个 subset `2000` 张，总计 `10000`。
+- 额外冻结 source-only hold-out：每个 subset `500` 张，总计 `2500`，默认不提前 materialize。
+- `TextAtlasEval` 只作为最终独立 benchmark/test，不参与调参或 checkpoint 选择；它不覆盖 `LongWordsSubset-A`，不能替代当前 balanced val。
+
+## 本轮实现
 - `scripts/stage1/textatlas_manifest_utils.py`
-  - 共用 TextAtlas 子集常量、sha256、JSON/JSONL、比例分配、图片保存、streaming materialize helper。
-- `scripts/stage1/build_textatlas_full_manifest.py`
-  - 统计每个 subset 的 exact row count。
-  - 先按 exact row count 比例抽 fixed val。
-  - 再从扣掉 val 后的剩余样本里按比例无放回抽 `3M train`。
-  - 输出 `exact_count.json`、`train_manifest.jsonl`、`val_manifest.jsonl`、`manifest.sha256`。
-- `scripts/stage1/build_textatlas_chunk_order.py`
-  - 从 `train_manifest.jsonl` 构建冻结的 `chunk_order.json`。
-  - 默认前 2 个 chunk 使用 `20,000`，后续使用 `50,000`。
-  - 默认 `subset-round-robin`：按 subset 比例交织，同时保持每个 subset 内 hf row index 单调推进，方便 streaming materialize。
-- `scripts/stage1/materialize_textatlas_val.py`
-  - 从 source-only `val_manifest.jsonl` 一次性落盘 fixed val。
-  - 输出 `val_image_paths.json`、`val_materialized_manifest.jsonl`、`val_materialized.sha256`。
-- `scripts/stage1/materialize_textatlas_chunk.py`
-  - 从 `train_manifest.jsonl + chunk_order.json` materialize 单个 train chunk。
-  - 输出 `chunk_image_paths.json`、`chunk_manifest.jsonl`、`chunk_materialized.sha256`。
+  - 新增当前 5-subset 默认常量。
+  - 新增 `resize-pad` 预处理 helper，支持按长边缩放并 pad 到 `256x256`。
+- `scripts/stage1/build_textatlas_fixed_manifest.py`
+  - 根据 exact counts 构建固定 source-only manifest。
+  - 默认 `TextScenesHQ=40000 train`，其他 4 个 subset 各 `50000 train`。
+  - 输出 `exact_count.json`、`train_manifest.jsonl`、`val_manifest.jsonl`、`holdout_manifest.jsonl`、`manifest.sha256`。
+- `scripts/stage1/materialize_textatlas_local.py`
+  - 从 source-only manifest 一次性 materialize fixed local train/val。
+  - 输出 `train_image_paths.json`、`val_image_paths.json`、materialized manifests、`materialized.sha256`。
+- `scripts/stage1/check_textatlas_fixed_manifest.py`
+  - 校验 5-subset source-only manifest、train/val/hold-out disjoint、balanced val、固定 train count 和 materialized 图片可读性。
+- 删除旧的大规模训练和独立 val 脚本，避免后续误用旧方案。
+
+## 推荐执行顺序
+1. `build_textatlas_fixed_manifest.py` 构建固定数量 manifest。
+2. `check_textatlas_fixed_manifest.py` 校验 source-only manifest。
+3. `materialize_textatlas_local.py --splits train val --preprocess resize-pad` 落盘本地 fixed train/val。
+4. `check_textatlas_fixed_manifest.py --materialized-root ...` 校验本地图像路径和可读性。
+5. 再跑 baseline smoke、HR smoke，最后进入 baseline/HR 正式对比训练。
+
+# 2026-04-21 Stage-1 固定数量数据方案简化与脚本清理
+
+## 本轮修正
+- 进一步简化固定数量数据方案：不再通过单独空间采样反推 `N_main`。
+- `TextScenesHQ` 默认 train count 固定为 `40000`。
+- `CleanTextSynth`、`StyledTextSynth`、`TextVisionBlend`、`LongWordsSubset-A` 默认每个 train count 固定为 `50000`。
+- balanced val 仍为每 subset `2000`，optional hold-out 仍为每 subset `500`。
+
+## 代码影响
+- 保留当前方案需要的 stage-1 数据脚本：
+  - `scripts/stage1/build_textatlas_fixed_manifest.py`
+  - `scripts/stage1/materialize_textatlas_local.py`
+  - `scripts/stage1/check_textatlas_fixed_manifest.py`
+  - `scripts/stage1/textatlas_manifest_utils.py`
+- 删除旧方案残留脚本，只保留当前固定数量方案所需入口。
+- `scripts/stage1/build_textatlas_fixed_manifest.py`
+  - 新增默认参数：
+    - `--textsceneshq-train-count 40000`
+    - `--same-train-count 50000`
+  - 构建 manifest 时直接按固定数量抽样，仍保证 val/hold-out/train 无交集。
+- `scripts/stage1/check_textatlas_fixed_manifest.py`
+  - 新增默认检查：
+    - `--expected-textsceneshq-train-count 40000`
+    - `--expected-same-train-count 50000`
+
+## 边界
+- 不修改模型逻辑、HR loss 公式、tokenizer 主结构或 AR model。
+- 不保留单独空间采样脚本；如需估算空间，直接用 materialize smoke 或 `du` 观测。
+- 不引入 OCR/CER/F1 作为阻塞指标。
+- 不再维护“小训练集调参 + 大训练集正式跑”的两阶段数据集。
+
+# 2026-04-21 Stage-1 旧方案残留清理复查
+
+## 清理结论
+- 当前 stage-1 可执行数据路径只保留固定数量方案：
+  - `scripts/stage1/build_textatlas_fixed_manifest.py`
+  - `scripts/stage1/materialize_textatlas_local.py`
+  - `scripts/stage1/check_textatlas_fixed_manifest.py`
+  - `scripts/stage1/textatlas_manifest_utils.py`
+- 继续删除旧服务器迁移和旧 smoke 残留，避免误调用已删除脚本。
+- `AGENTS.md` 已同步到当前 5-subset 固定数量方案，避免后续 agent 继续按旧 4-subset 约束工作。
 
 ## 当前边界
-- 这些脚本只准备数据和 chunk，不启动训练。
-- 第一版 chunk materialize 可以独立运行；正式 runner 后续再串联 materialize / train / checkpoint / run_state。
-- source-only full manifest 不直接给 `MixedDatasetJson` 使用；训练时使用 materialized chunk 产生的 `chunk_image_paths.json`。
-
-# 2026-04-21 TextAtlas exact count 超时修正
-
-## 现象
-- 新服务器运行 `build_textatlas_full_manifest.py --count-method auto` 时，`datasets` 在解析 HF parquet metadata 阶段触发 `hf-mirror.com read timeout=10`。
-- 当前步骤仍未下载全量图片；失败发生在 full manifest exact count 阶段。
-
-## 修正
-- `--count-method auto` 改为只使用轻量 exact-count 来源：
-  - Hugging Face Dataset Viewer `/splits` API。
-  - `datasets` builder metadata。
-- `auto` 不再自动 fallback 到 streaming count，避免意外扫完整 parquet image 数据。
-- 新增 `--count-method viewer`，可强制只用 Dataset Viewer。
-- 新增 `--viewer-api-url` 和 `--api-timeout`。
-- 新增 `--exact-counts-json`，在 Dataset Viewer/API 网络不可用时允许显式传入 exact rows。
-
-## 边界
-- 仍然不 materialize 3M train images。
-- `--count-method streaming` 仍保留，但必须显式指定；只有确认接受完整 streaming scan 成本时才使用。
-
-# 2026-04-21 TextAtlas materialize 初始化重试
-
-## 现象
-- `materialize_textatlas_val.py` 在 `load_dataset(...streaming=True)` 初始化 CleanTextSynth 时触发 `hf-mirror.com read timeout=10`。
-- 失败发生在 streaming dataset 初始化阶段，尚未开始批量保存 fixed val 图片。
-
-## 修正
-- `stream_materialize_records` 新增 Hugging Face / datasets timeout defaults：
-  - `HF_HUB_ETAG_TIMEOUT`
-  - `HF_HUB_DOWNLOAD_TIMEOUT`
-  - `HF_DATASETS_DOWNLOAD_TIMEOUT`
-- `materialize_textatlas_val.py` 和 `materialize_textatlas_chunk.py` 新增：
-  - `--load-timeout`
-  - `--load-retries`
-  - `--retry-sleep`
-- streaming dataset 初始化失败时会按线性 backoff 重试，默认最多 5 次。
-
-## 边界
-- 不修改 manifest 分配。
-- 不修改模型训练逻辑。
-- 不下载 full train，只影响 fixed val / 单 chunk materialize 的网络稳健性。
+- 之前的大规模分块训练方案不再有可执行脚本。
+- 之前的容量反推方案不再有可执行脚本。
+- 现行方案以后续固定数量章节为准。
