@@ -435,3 +435,21 @@
 ## 原因
 - 当前服务器约定所有数据和 cache 放在 `/home/ma-user/work/GigaTok_hr/gigatok_persist`。
 - 避免后台 materialize 误写到 `/home/ma-user/gigatok_persist`。
+
+# 2026-04-21 TextAtlas parquet shard materialize 方案
+
+## 背景
+- ModelArts 服务器通过 `datasets` streaming 直接访问 Hugging Face parquet 时，在首个 `CleanTextSynth` parquet 上多次出现 proxy 503 和 read timeout。
+- Mac 本地空间不足，不适合把整批数据下载到本地再中转。
+
+## 本轮新增
+- 新增 `scripts/stage1/materialize_textatlas_parquet_shards.py`。
+  - 读取既有 fixed manifest，不重建 split。
+  - 逐个下载 Hugging Face parquet shard 到 `$PERSIST_ROOT/cache/textatlas_parquet`。
+  - 从本地 parquet 解出 manifest 中需要的行，做 `resize-pad` 后保存图片。
+  - 已存在 parquet shard 会跳过下载，已存在图片会复用。
+  - 输出仍为 `train_image_paths.json` / `val_image_paths.json`，训练入口不变。
+
+## 使用边界
+- 不修改模型逻辑、HR loss 公式、tokenizer 主结构或 AR model。
+- parquet cache 会额外占用磁盘；materialize 校验通过后可清理 `$PERSIST_ROOT/cache/textatlas_parquet`。
