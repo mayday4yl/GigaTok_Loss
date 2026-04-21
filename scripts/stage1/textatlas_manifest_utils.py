@@ -10,6 +10,7 @@ from collections import Counter
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import quote
 
 
 DEFAULT_DATASET = "CSU-JPG/TextAtlas5M"
@@ -279,7 +280,27 @@ def get_exact_count(
     subset: str,
     hf_split: str,
     count_method: str,
+    viewer_api_url: str = "https://datasets-server.huggingface.co",
+    api_timeout: int = 60,
+    exact_counts: Optional[Mapping[str, int]] = None,
 ) -> Tuple[int, str]:
+    if exact_counts is not None and subset in exact_counts:
+        return int(exact_counts[subset]), "exact_counts_json"
+
+    if count_method in {"auto", "viewer"}:
+        try:
+            count = get_count_from_dataset_viewer(
+                dataset_name=dataset_name,
+                subset=subset,
+                hf_split=hf_split,
+                viewer_api_url=viewer_api_url,
+                api_timeout=api_timeout,
+            )
+            return count, "dataset-viewer.splits"
+        except Exception:
+            if count_method == "viewer":
+                raise
+
     load_dataset, load_dataset_builder = import_datasets()
     if count_method in {"auto", "builder"}:
         try:
@@ -290,6 +311,13 @@ def get_exact_count(
         except Exception:
             if count_method == "builder":
                 raise
+    if count_method == "auto":
+        raise RuntimeError(
+            f"{subset}: failed to get exact rows from Dataset Viewer or builder metadata. "
+            "Do not auto-fallback to streaming because it may scan large parquet image data. "
+            "Pass --count-method viewer with a reachable Dataset Viewer API, or pass "
+            "--exact-counts-json, or explicitly pass --count-method streaming if you accept the cost."
+        )
     if count_method not in {"auto", "streaming"}:
         raise ValueError(f"Unknown count method: {count_method}")
 
@@ -298,6 +326,45 @@ def get_exact_count(
     for _ in dataset:
         count += 1
     return count, "streaming_iteration"
+
+
+def get_count_from_dataset_viewer(
+    *,
+    dataset_name: str,
+    subset: str,
+    hf_split: str,
+    viewer_api_url: str,
+    api_timeout: int,
+) -> int:
+    try:
+        import requests  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("requests is required for Dataset Viewer count lookup.") from exc
+
+    base_url = viewer_api_url.rstrip("/")
+    dataset_param = quote(dataset_name, safe="")
+    url = f"{base_url}/splits?dataset={dataset_param}"
+    response = requests.get(url, timeout=api_timeout)
+    response.raise_for_status()
+    payload = response.json()
+    splits = payload.get("splits")
+    if not isinstance(splits, list):
+        raise RuntimeError(f"Dataset Viewer response missing splits list: {url}")
+
+    for item in splits:
+        if not isinstance(item, dict):
+            continue
+        if item.get("config") == subset and item.get("split") == hf_split:
+            value = item.get("num_rows")
+            if value is None:
+                raise RuntimeError(f"Dataset Viewer split has no num_rows: config={subset}, split={hf_split}")
+            return int(value)
+
+    configs = sorted({str(item.get("config")) for item in splits if isinstance(item, dict) and item.get("config")})
+    raise RuntimeError(
+        f"Dataset Viewer did not return config={subset!r}, split={hf_split!r}. "
+        f"Available configs preview={configs[:20]}"
+    )
 
 
 def stream_materialize_records(
