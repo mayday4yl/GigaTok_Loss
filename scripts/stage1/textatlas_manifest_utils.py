@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from collections import Counter
 from io import BytesIO
@@ -376,13 +377,22 @@ def stream_materialize_records(
     save_format: str,
     jpeg_quality: int,
     overwrite: bool,
+    load_timeout: int = 60,
+    load_retries: int = 5,
+    retry_sleep: int = 5,
 ) -> List[Dict[str, Any]]:
     if not requests_by_row_idx:
         return []
-    load_dataset, _ = import_datasets()
     pending = {int(key): list(value) for key, value in requests_by_row_idx.items()}
     materialized: List[Dict[str, Any]] = []
-    dataset = load_dataset(dataset_name, subset, split=hf_split, streaming=True)
+    dataset = load_streaming_dataset_with_retries(
+        dataset_name=dataset_name,
+        subset=subset,
+        hf_split=hf_split,
+        load_timeout=load_timeout,
+        load_retries=load_retries,
+        retry_sleep=retry_sleep,
+    )
 
     for row_idx, row in enumerate(dataset):
         if row_idx not in pending:
@@ -405,3 +415,47 @@ def stream_materialize_records(
         preview = sorted(pending)[:10]
         raise RuntimeError(f"{subset}: failed to materialize row indices {preview} (remaining={len(pending)}).")
     return materialized
+
+
+def load_streaming_dataset_with_retries(
+    *,
+    dataset_name: str,
+    subset: str,
+    hf_split: str,
+    load_timeout: int,
+    load_retries: int,
+    retry_sleep: int,
+) -> Any:
+    os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", str(load_timeout))
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", str(load_timeout))
+    os.environ.setdefault("HF_DATASETS_DOWNLOAD_TIMEOUT", str(load_timeout))
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, load_retries + 1):
+        try:
+            from datasets import DownloadConfig, load_dataset  # type: ignore
+
+            download_config = DownloadConfig(max_retries=load_retries)
+            return load_dataset(
+                dataset_name,
+                subset,
+                split=hf_split,
+                streaming=True,
+                download_config=download_config,
+            )
+        except Exception as exc:  # noqa: BLE001 - network failures vary by HF/datasets version.
+            last_exc = exc
+            if attempt >= load_retries:
+                break
+            sleep_s = retry_sleep * attempt
+            print(
+                "[textatlas] "
+                f"load_dataset subset={subset} attempt={attempt}/{load_retries} failed: {exc!r}; "
+                f"retrying in {sleep_s}s",
+                flush=True,
+            )
+            time.sleep(sleep_s)
+
+    raise RuntimeError(
+        f"Failed to initialize streaming dataset subset={subset} after {load_retries} attempts."
+    ) from last_exc

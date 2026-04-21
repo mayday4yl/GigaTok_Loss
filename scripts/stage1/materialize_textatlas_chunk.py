@@ -31,6 +31,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--save-format", choices=("jpeg", "png"), default="png")
     parser.add_argument("--jpeg-quality", type=int, default=95)
+    parser.add_argument("--load-timeout", type=int, default=60)
+    parser.add_argument("--load-retries", type=int, default=5)
+    parser.add_argument("--retry-sleep", type=int, default=5)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -87,6 +90,9 @@ def main() -> None:
                 save_format=args.save_format,
                 jpeg_quality=args.jpeg_quality,
                 overwrite=args.overwrite,
+                load_timeout=args.load_timeout,
+                load_retries=args.load_retries,
+                retry_sleep=args.retry_sleep,
             )
         )
     materialized.sort(key=lambda row: int(row["materialize_order"]))
@@ -110,6 +116,9 @@ def main() -> None:
         "estimated_total_gb": round(total_bytes / (1024 ** 3), 3),
         "save_format": args.save_format,
         "jpeg_quality": args.jpeg_quality,
+        "load_timeout": args.load_timeout,
+        "load_retries": args.load_retries,
+        "retry_sleep": args.retry_sleep,
     }
     write_json(chunk_meta, meta)
     sha_path = write_sha256_manifest(

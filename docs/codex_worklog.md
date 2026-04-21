@@ -464,3 +464,25 @@
 ## 边界
 - 仍然不 materialize 3M train images。
 - `--count-method streaming` 仍保留，但必须显式指定；只有确认接受完整 streaming scan 成本时才使用。
+
+# 2026-04-21 TextAtlas materialize 初始化重试
+
+## 现象
+- `materialize_textatlas_val.py` 在 `load_dataset(...streaming=True)` 初始化 CleanTextSynth 时触发 `hf-mirror.com read timeout=10`。
+- 失败发生在 streaming dataset 初始化阶段，尚未开始批量保存 fixed val 图片。
+
+## 修正
+- `stream_materialize_records` 新增 Hugging Face / datasets timeout defaults：
+  - `HF_HUB_ETAG_TIMEOUT`
+  - `HF_HUB_DOWNLOAD_TIMEOUT`
+  - `HF_DATASETS_DOWNLOAD_TIMEOUT`
+- `materialize_textatlas_val.py` 和 `materialize_textatlas_chunk.py` 新增：
+  - `--load-timeout`
+  - `--load-retries`
+  - `--retry-sleep`
+- streaming dataset 初始化失败时会按线性 backoff 重试，默认最多 5 次。
+
+## 边界
+- 不修改 manifest 分配。
+- 不修改模型训练逻辑。
+- 不下载 full train，只影响 fixed val / 单 chunk materialize 的网络稳健性。
