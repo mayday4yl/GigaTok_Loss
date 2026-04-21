@@ -445,3 +445,22 @@
 - 这些脚本只准备数据和 chunk，不启动训练。
 - 第一版 chunk materialize 可以独立运行；正式 runner 后续再串联 materialize / train / checkpoint / run_state。
 - source-only full manifest 不直接给 `MixedDatasetJson` 使用；训练时使用 materialized chunk 产生的 `chunk_image_paths.json`。
+
+# 2026-04-21 TextAtlas exact count 超时修正
+
+## 现象
+- 新服务器运行 `build_textatlas_full_manifest.py --count-method auto` 时，`datasets` 在解析 HF parquet metadata 阶段触发 `hf-mirror.com read timeout=10`。
+- 当前步骤仍未下载全量图片；失败发生在 full manifest exact count 阶段。
+
+## 修正
+- `--count-method auto` 改为只使用轻量 exact-count 来源：
+  - Hugging Face Dataset Viewer `/splits` API。
+  - `datasets` builder metadata。
+- `auto` 不再自动 fallback 到 streaming count，避免意外扫完整 parquet image 数据。
+- 新增 `--count-method viewer`，可强制只用 Dataset Viewer。
+- 新增 `--viewer-api-url` 和 `--api-timeout`。
+- 新增 `--exact-counts-json`，在 Dataset Viewer/API 网络不可用时允许显式传入 exact rows。
+
+## 边界
+- 仍然不 materialize 3M train images。
+- `--count-method streaming` 仍保留，但必须显式指定；只有确认接受完整 streaming scan 成本时才使用。

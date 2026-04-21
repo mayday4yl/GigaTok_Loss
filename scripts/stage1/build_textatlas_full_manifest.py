@@ -34,9 +34,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--count-method",
-        choices=("auto", "builder", "streaming"),
+        choices=("auto", "viewer", "builder", "streaming"),
         default="auto",
-        help="Use dataset metadata when available; streaming is exact but slower.",
+        help=(
+            "auto uses Dataset Viewer / builder metadata only. It does not auto-fallback "
+            "to streaming because streaming can scan large parquet image data."
+        ),
+    )
+    parser.add_argument("--viewer-api-url", default="https://datasets-server.huggingface.co")
+    parser.add_argument("--api-timeout", type=int, default=60)
+    parser.add_argument(
+        "--exact-counts-json",
+        type=Path,
+        default=None,
+        help="Optional JSON mapping subset->row_count, or object with exact_rows_by_subset.",
     )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
@@ -51,6 +62,19 @@ def ensure_args(args: argparse.Namespace) -> None:
         raise SystemExit("--subsets contains duplicates.")
     if args.output_root.exists() and any(args.output_root.iterdir()) and not args.overwrite:
         raise SystemExit(f"output root is not empty; pass --overwrite to replace: {args.output_root}")
+    if args.api_timeout <= 0:
+        raise SystemExit("--api-timeout must be positive.")
+
+
+def load_exact_counts(path: Path) -> Dict[str, int]:
+    with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if isinstance(data, dict) and isinstance(data.get("exact_rows_by_subset"), dict):
+        data = data["exact_rows_by_subset"]
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a subset->count mapping or exact_rows_by_subset object.")
+    counts = {str(key): int(value) for key, value in data.items()}
+    return counts
 
 
 def sample_available_indices(
@@ -112,6 +136,7 @@ def main() -> None:
     args.output_root = args.output_root.resolve()
     args.output_root.mkdir(parents=True, exist_ok=True)
     started_at = now_str()
+    exact_counts_override = load_exact_counts(args.exact_counts_json.resolve()) if args.exact_counts_json else None
 
     exact_counts: Dict[str, int] = {}
     count_sources: Dict[str, str] = {}
@@ -122,6 +147,9 @@ def main() -> None:
             subset=subset,
             hf_split=args.hf_split,
             count_method=args.count_method,
+            viewer_api_url=args.viewer_api_url,
+            api_timeout=args.api_timeout,
+            exact_counts=exact_counts_override,
         )
         exact_counts[subset] = count
         count_sources[subset] = source
@@ -227,6 +255,9 @@ def main() -> None:
         "val_total": args.val_total,
         "seed": args.seed,
         "count_method": args.count_method,
+        "viewer_api_url": args.viewer_api_url,
+        "api_timeout": args.api_timeout,
+        "exact_counts_json": str(args.exact_counts_json.resolve()) if args.exact_counts_json else None,
         "output_root": str(args.output_root),
         "source_manifest_only": True,
         "image_materialization": "fixed_val_once_train_chunked",
