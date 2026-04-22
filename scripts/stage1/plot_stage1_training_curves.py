@@ -33,6 +33,7 @@ def parse_log_spec(value: str) -> LogSpec:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log", action="append", type=parse_log_spec, required=True, help="NAME:/path/to/train.log")
+    parser.add_argument("--val-metrics", action="append", type=Path, default=[], help="Optional evaluate_textatlas_reconstruction.py metrics.json.")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--smooth-window", type=int, default=1, help="Moving average window for plotted curves.")
     return parser.parse_args()
@@ -112,6 +113,11 @@ def write_json(path: Path, data: Any) -> None:
         handle.write("\n")
 
 
+def read_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def write_csv(path: Path, all_rows: Mapping[str, Sequence[Mapping[str, float]]]) -> None:
     fields = {"run", "step"}
     for rows in all_rows.values():
@@ -153,6 +159,25 @@ def summarize(all_rows: Mapping[str, Sequence[Mapping[str, float]]]) -> Dict[str
             "last_weighted_hr_loss": last.get("weighted_hr_loss"),
         }
     return summary
+
+
+def read_val_metrics(paths: Sequence[Path]) -> Dict[str, Dict[str, float]]:
+    rows: Dict[str, Dict[str, float]] = {}
+    for path in paths:
+        data = read_json(path)
+        runs = data.get("runs", {})
+        source_name = path.parent.name
+        for run_name, metrics in runs.items():
+            label = run_name
+            if label in rows:
+                label = f"{source_name}:{run_name}"
+            overall = metrics.get("overall", {})
+            rows[label] = {
+                key: float(value)
+                for key, value in overall.items()
+                if isinstance(value, (int, float)) and not math.isnan(float(value))
+            }
+    return rows
 
 
 def import_pyplot() -> Any:
@@ -201,6 +226,66 @@ def plot_metric_group(
     return True
 
 
+def plot_val_metrics(plt: Any, val_metrics: Mapping[str, Mapping[str, float]], output_path: Path) -> bool:
+    metrics = [metric for metric in ("mse", "mae", "psnr", "ssim") if any(metric in row for row in val_metrics.values())]
+    if not metrics:
+        return False
+
+    run_names = list(val_metrics.keys())
+    fig, axes = plt.subplots(1, len(metrics), figsize=(4.2 * len(metrics), 4.2))
+    if len(metrics) == 1:
+        axes = [axes]
+
+    for ax, metric in zip(axes, metrics):
+        values = [val_metrics[run].get(metric, math.nan) for run in run_names]
+        ax.bar(run_names, values)
+        ax.set_title(f"val {metric}")
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.tick_params(axis="x", rotation=25)
+    fig.suptitle("Stage-1 validation reconstruction metrics")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+    return True
+
+
+def plot_train_val_summary(
+    plt: Any,
+    all_rows: Mapping[str, Sequence[Mapping[str, float]]],
+    val_metrics: Mapping[str, Mapping[str, float]],
+    output_path: Path,
+    smooth_window: int,
+) -> bool:
+    if not val_metrics:
+        return False
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+    ax_train, ax_psnr, ax_mse, ax_ssim = axes.flatten()
+
+    for run_name, rows in all_rows.items():
+        steps, values = metric_values(rows, "train_loss", smooth_window)
+        if steps:
+            ax_train.plot(steps, values, label=run_name, linewidth=1.8)
+    ax_train.set_title("train loss")
+    ax_train.set_xlabel("step")
+    ax_train.grid(True, alpha=0.25)
+    ax_train.legend(loc="best")
+
+    run_names = list(val_metrics.keys())
+    for ax, metric in ((ax_psnr, "psnr"), (ax_mse, "mse"), (ax_ssim, "ssim")):
+        values = [val_metrics[run].get(metric, math.nan) for run in run_names]
+        ax.bar(run_names, values)
+        ax.set_title(f"val {metric}")
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.tick_params(axis="x", rotation=25)
+
+    fig.suptitle("Stage-1 train/validation summary")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+    return True
+
+
 def main() -> None:
     args = parse_args()
     output_dir = args.output_dir.resolve()
@@ -215,6 +300,9 @@ def main() -> None:
 
     write_csv(output_dir / "training_curves.csv", all_rows)
     write_json(output_dir / "training_summary.json", summarize(all_rows))
+    val_metrics = read_val_metrics(args.val_metrics)
+    if val_metrics:
+        write_json(output_dir / "val_metrics_summary.json", val_metrics)
 
     plt = import_pyplot()
     plot_metric_group(
@@ -242,6 +330,15 @@ def main() -> None:
         smooth_window=args.smooth_window,
         logy_metrics=("hr_loss", "weighted_hr_loss"),
     )
+    if val_metrics:
+        plot_val_metrics(plt, val_metrics, output_dir / "val_metrics.png")
+        plot_train_val_summary(
+            plt,
+            all_rows,
+            val_metrics,
+            output_dir / "train_val_summary.png",
+            smooth_window=args.smooth_window,
+        )
 
     print(f"Wrote plots and summaries to {output_dir}")
 
