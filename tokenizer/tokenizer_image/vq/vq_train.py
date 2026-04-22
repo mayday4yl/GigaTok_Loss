@@ -45,6 +45,11 @@ from utils.model_init import load_encoders
 import wandb
 import yaml
 
+try:
+    from skimage.metrics import structural_similarity as ssim_metric
+except ImportError:
+    ssim_metric = None
+
 
 from dataset.augmentation import random_crop_arr
 from dataset.build import build_dataset
@@ -127,6 +132,8 @@ def compute_reconstruction_metrics(vq_model, val_loader, device, args, causal_ty
     mae_sum = torch.tensor(0.0, device=device)
     elem_count = torch.tensor(0.0, device=device)
     image_count = torch.tensor(0.0, device=device)
+    ssim_sum = torch.tensor(0.0, device=device)
+    ssim_count = torch.tensor(0.0, device=device)
 
     with torch.no_grad():
         for imgs, _ in val_loader:
@@ -138,27 +145,39 @@ def compute_reconstruction_metrics(vq_model, val_loader, device, args, causal_ty
                     selected_decoder_layer=None,
                 )
             recons = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
-            diff = recons.float() - imgs.float()
+            diff = (recons.float() - imgs.float()) * 0.5
             mse_sum += diff.pow(2).sum()
             mae_sum += diff.abs().sum()
             elem_count += diff.numel()
             image_count += imgs.shape[0]
+            if args.val_compute_ssim and ssim_metric is not None:
+                rec_np = torch.clamp((recons.float() + 1.0) * 0.5, 0.0, 1.0).detach().cpu().permute(0, 2, 3, 1).numpy()
+                gt_np = torch.clamp((imgs.float() + 1.0) * 0.5, 0.0, 1.0).detach().cpu().permute(0, 2, 3, 1).numpy()
+                for gt, rec in zip(gt_np, rec_np):
+                    ssim_sum += float(ssim_metric(gt, rec, channel_axis=-1, data_range=1.0))
+                    ssim_count += 1
 
-    for value in (mse_sum, mae_sum, elem_count, image_count):
+    for value in (mse_sum, mae_sum, elem_count, image_count, ssim_sum, ssim_count):
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
 
     mse = (mse_sum / elem_count.clamp_min(1.0)).item()
     mae = (mae_sum / elem_count.clamp_min(1.0)).item()
-    psnr = 10.0 * np.log10(4.0 / max(mse, 1e-12))
+    psnr = -10.0 * np.log10(max(mse, 1e-12))
+    val_ssim = float("nan")
+    if ssim_count.item() > 0:
+        val_ssim = (ssim_sum / ssim_count).item()
     return {
         "val_mse": mse,
         "val_mae": mae,
         "val_psnr": float(psnr),
+        "val_ssim": val_ssim,
         "val_images": int(image_count.item()),
     }
 
 
 def metric_is_better(value, best_value, mode):
+    if not np.isfinite(value):
+        return False
     if best_value is None:
         return True
     if mode == "min":
@@ -199,7 +218,7 @@ def plot_train_val_curves(metrics_dir):
     if not os.path.exists(train_path) and not os.path.exists(val_path):
         return
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
 
     if os.path.exists(train_path):
         train_steps = []
@@ -214,8 +233,9 @@ def plot_train_val_curves(metrics_dir):
     axes[0].grid(True, alpha=0.25)
     axes[0].legend(loc="best")
 
+    val_steps = []
+    val_ssim = []
     if os.path.exists(val_path):
-        val_steps = []
         val_mse = []
         val_psnr = []
         with open(val_path, "r") as handle:
@@ -223,16 +243,24 @@ def plot_train_val_curves(metrics_dir):
                 val_steps.append(int(row["step"]))
                 val_mse.append(float(row["val_mse"]))
                 val_psnr.append(float(row["val_psnr"]))
+                if "val_ssim" in row and row["val_ssim"] not in ("", "nan"):
+                    val_ssim.append(float(row["val_ssim"]))
         if val_steps:
             axes[1].plot(val_steps, val_mse, label="val_mse", linewidth=1.6)
             ax2 = axes[1].twinx()
             ax2.plot(val_steps, val_psnr, label="val_psnr", color="tab:orange", linewidth=1.6)
             ax2.set_ylabel("val_psnr")
             ax2.legend(loc="upper right")
-    axes[1].set_xlabel("step")
     axes[1].set_ylabel("val_mse")
     axes[1].grid(True, alpha=0.25)
     axes[1].legend(loc="upper left")
+
+    if os.path.exists(val_path) and len(val_ssim) == len(val_steps) and val_steps:
+        axes[2].plot(val_steps, val_ssim, label="val_ssim", color="tab:green", linewidth=1.6)
+    axes[2].set_xlabel("step")
+    axes[2].set_ylabel("val_ssim")
+    axes[2].grid(True, alpha=0.25)
+    axes[2].legend(loc="best")
 
     fig.suptitle("Stage-1 train / validation curves")
     fig.tight_layout()
@@ -1089,17 +1117,19 @@ def main(args):
                         f"(step={train_steps:07d}) Val MSE: {val_metrics['val_mse']:.6f}, "
                         f"Val MAE: {val_metrics['val_mae']:.6f}, "
                         f"Val PSNR: {val_metrics['val_psnr']:.4f}, "
+                        f"Val SSIM: {val_metrics['val_ssim']:.4f}, "
                         f"best={is_best}"
                     )
                     append_csv_row(
                         os.path.join(metrics_dir, "val_metrics.csv"),
-                        ["step", "epoch", "val_mse", "val_mae", "val_psnr", "val_images", "is_best"],
+                        ["step", "epoch", "val_mse", "val_mae", "val_psnr", "val_ssim", "val_images", "is_best"],
                         {
                             "step": train_steps,
                             "epoch": epoch,
                             "val_mse": val_metrics["val_mse"],
                             "val_mae": val_metrics["val_mae"],
                             "val_psnr": val_metrics["val_psnr"],
+                            "val_ssim": val_metrics["val_ssim"],
                             "val_images": val_metrics["val_images"],
                             "is_best": int(is_best),
                         }
@@ -1260,9 +1290,10 @@ if __name__ == "__main__":
     parser.add_argument("--eval-batch-size", type=int, default=8, help="Per-rank validation batch size.")
     parser.add_argument("--val-num-workers", type=int, default=4, help="Validation dataloader workers per rank.")
     parser.add_argument("--val-max-images", type=int, default=0, help="Limit online validation images. 0 means all validation images.")
+    parser.add_argument("--val-compute-ssim", action='store_true', help="Compute online validation SSIM. Slower than MSE/PSNR.")
     parser.add_argument("--save-best", action='store_true', help="Save checkpoints/best.pt according to online validation metric.")
     parser.add_argument("--save-last", action='store_true', help="Save checkpoints/last.pt at the end of training.")
-    parser.add_argument("--best-metric", type=str, default="val_mse", choices=["val_mse", "val_mae", "val_psnr"])
+    parser.add_argument("--best-metric", type=str, default="val_mse", choices=["val_mse", "val_mae", "val_psnr", "val_ssim"])
     parser.add_argument("--best-mode", type=str, default="min", choices=["min", "max"])
     parser.add_argument("--sub-exp-dir", type=str, default=None, help="sub experiment dir")
     parser.add_argument("--milestone-step", type=int, default=50_000, help="milestone step for checkpoint saving")
