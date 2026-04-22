@@ -522,3 +522,33 @@
 
 ## 边界
 - 只读训练日志，不修改训练代码、checkpoint、数据集或评估逻辑。
+
+# 2026-04-23 Stage-1 在线 validation 训练准备
+
+## 背景
+- 第一轮 `HR=0.05` 与 baseline 训练曲线和重建效果基本重合，说明 HR 接入稳定但权重偏弱。
+- `HR=50` 的 4 NPU `gbs48` 短测可运行，`weighted_hr_loss` 达到可见量级。
+- 下一轮计划重跑 baseline 与 HR 强权重版本，并在训练过程中在线验证、保存 best checkpoint。
+
+## 本轮新增
+- `tokenizer/tokenizer_image/vq/vq_train.py` 增加在线验证参数：
+  - `--val-json-path`
+  - `--val-every`
+  - `--eval-batch-size`
+  - `--val-num-workers`
+  - `--val-max-images`
+  - `--save-best`
+  - `--save-last`
+  - `--best-metric`
+  - `--best-mode`
+- 在线验证每隔固定 step 在 `torch.no_grad()` 下计算 `val_mse`、`val_mae`、`val_psnr`，不参与反传，不调用判别器。
+- rank 0 写出：
+  - `metrics/train_metrics.csv`
+  - `metrics/val_metrics.csv`
+  - `metrics/train_val_curves.png`
+- 当验证指标更优时保存 `checkpoints/best.pt`。
+- 新增 `configs/vq/VQ_BL256_dino_disc_hr_w50.yaml`，只将 `hr_loss_weight` 改为 `50.0`，其余 stage-1 decoder-only finetune 边界保持不变。
+
+## 边界
+- 不修改 tokenizer 架构、AR model、数据抽样或判别器启动策略。
+- 在线 validation 当前只记录重建数值指标；最终视觉对比仍使用独立重建评估脚本生成 grid。

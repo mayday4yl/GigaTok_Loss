@@ -14,11 +14,13 @@ from torchvision.datasets import ImageFolder
 from torchvision import transforms
 import torch.nn.functional as F
 
-import PIL
+from PIL import Image
 
 import os
 import time
 import argparse
+import csv
+import json
 from contextlib import nullcontext
 from math import ceil
 from glob import glob
@@ -58,6 +60,25 @@ warnings.filterwarnings('ignore')
 wandb_project_name = "vqvit_imagenet_train"
 
 
+class JsonImageDataset(Dataset):
+    def __init__(self, json_path, transform=None, max_images=0):
+        with open(json_path, "r") as handle:
+            image_paths = json.load(handle)
+        if max_images and max_images > 0:
+            image_paths = image_paths[:max_images]
+        self.image_paths = image_paths
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        image = Image.open(self.image_paths[idx]).convert("RGB")
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, torch.tensor(0)
+
+
 def prepare_device_backend(device_backend):
     if device_backend == "cuda":
         assert torch.cuda.is_available(), "Training currently requires at least one CUDA GPU."
@@ -89,6 +110,134 @@ def synchronize_device(device_backend):
         torch.npu.synchronize()
     else:
         raise ValueError(f"Unsupported device backend: {device_backend}")
+
+
+def append_csv_row(path, fieldnames, row):
+    exists = os.path.exists(path)
+    with open(path, "a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def compute_reconstruction_metrics(vq_model, val_loader, device, args, causal_type):
+    vq_model.eval()
+    mse_sum = torch.tensor(0.0, device=device)
+    mae_sum = torch.tensor(0.0, device=device)
+    elem_count = torch.tensor(0.0, device=device)
+    image_count = torch.tensor(0.0, device=device)
+
+    with torch.no_grad():
+        for imgs, _ in val_loader:
+            imgs = imgs.to(device, non_blocking=True)
+            with autocast_context(args.device_backend, args.mixed_precision):
+                outputs = vq_model(
+                    imgs,
+                    causal_type=causal_type,
+                    selected_decoder_layer=None,
+                )
+            recons = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+            diff = recons.float() - imgs.float()
+            mse_sum += diff.pow(2).sum()
+            mae_sum += diff.abs().sum()
+            elem_count += diff.numel()
+            image_count += imgs.shape[0]
+
+    for value in (mse_sum, mae_sum, elem_count, image_count):
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+
+    mse = (mse_sum / elem_count.clamp_min(1.0)).item()
+    mae = (mae_sum / elem_count.clamp_min(1.0)).item()
+    psnr = 10.0 * np.log10(4.0 / max(mse, 1e-12))
+    return {
+        "val_mse": mse,
+        "val_mae": mae,
+        "val_psnr": float(psnr),
+        "val_images": int(image_count.item()),
+    }
+
+
+def metric_is_better(value, best_value, mode):
+    if best_value is None:
+        return True
+    if mode == "min":
+        return value < best_value
+    if mode == "max":
+        return value > best_value
+    raise ValueError(f"Unsupported best mode: {mode}")
+
+
+def save_training_checkpoint(path, vq_model, vq_loss, optimizer, optimizer_disc, train_steps, args, ema=None, compile_model=False):
+    if compile_model:
+        model_weight = vq_model.module._orig_mod.state_dict()
+    else:
+        model_weight = vq_model.module.state_dict()
+    checkpoint = {
+        "model": model_weight,
+        "optimizer": optimizer.state_dict(),
+        "discriminator": vq_loss.module.discriminator.state_dict(),
+        "optimizer_disc": optimizer_disc.state_dict(),
+        "steps": train_steps,
+        "args": args
+    }
+    if ema is not None:
+        checkpoint["ema"] = ema.state_dict()
+    torch.save(checkpoint, path)
+
+
+def plot_train_val_curves(metrics_dir):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+
+    train_path = os.path.join(metrics_dir, "train_metrics.csv")
+    val_path = os.path.join(metrics_dir, "val_metrics.csv")
+    if not os.path.exists(train_path) and not os.path.exists(val_path):
+        return
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+
+    if os.path.exists(train_path):
+        train_steps = []
+        train_losses = []
+        with open(train_path, "r") as handle:
+            for row in csv.DictReader(handle):
+                train_steps.append(int(row["step"]))
+                train_losses.append(float(row["train_loss"]))
+        if train_steps:
+            axes[0].plot(train_steps, train_losses, label="train_loss", linewidth=1.6)
+    axes[0].set_ylabel("train_loss")
+    axes[0].grid(True, alpha=0.25)
+    axes[0].legend(loc="best")
+
+    if os.path.exists(val_path):
+        val_steps = []
+        val_mse = []
+        val_psnr = []
+        with open(val_path, "r") as handle:
+            for row in csv.DictReader(handle):
+                val_steps.append(int(row["step"]))
+                val_mse.append(float(row["val_mse"]))
+                val_psnr.append(float(row["val_psnr"]))
+        if val_steps:
+            axes[1].plot(val_steps, val_mse, label="val_mse", linewidth=1.6)
+            ax2 = axes[1].twinx()
+            ax2.plot(val_steps, val_psnr, label="val_psnr", color="tab:orange", linewidth=1.6)
+            ax2.set_ylabel("val_psnr")
+            ax2.legend(loc="upper right")
+    axes[1].set_xlabel("step")
+    axes[1].set_ylabel("val_mse")
+    axes[1].grid(True, alpha=0.25)
+    axes[1].legend(loc="upper left")
+
+    fig.suptitle("Stage-1 train / validation curves")
+    fig.tight_layout()
+    fig.savefig(os.path.join(metrics_dir, "train_val_curves.png"), dpi=160)
+    plt.close(fig)
 
 
 CLIP_DEFAULT_MEAN = (0.48145466, 0.4578275, 0.40821073)
@@ -232,6 +381,36 @@ def main(args):
         drop_last=True
     )
 
+    val_loader = None
+    val_sampler = None
+    if args.val_json_path is not None:
+        val_transform = transforms.Compose([
+            transforms.Resize((args.image_size, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+        ])
+        val_dataset = JsonImageDataset(
+            args.val_json_path,
+            transform=val_transform,
+            max_images=args.val_max_images,
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=dist.get_world_size(),
+            rank=rank,
+            shuffle=False,
+            seed=args.global_seed
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.eval_batch_size,
+            shuffle=False,
+            sampler=val_sampler,
+            num_workers=args.val_num_workers,
+            pin_memory=True,
+            drop_last=False
+        )
+
 
     total_steps = args.iterations
     if use_wsd:
@@ -251,6 +430,8 @@ def main(args):
 
         os.makedirs(args.save_path, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         os.makedirs(checkpoint_dir, exist_ok=True)
+        metrics_dir = os.path.join(exp_dir, "metrics")
+        os.makedirs(metrics_dir, exist_ok=True)
         if use_wsd:
             os.makedirs(cd_checkpoint_dir, exist_ok=True)
         logger = create_logger(exp_dir)
@@ -272,11 +453,14 @@ def main(args):
                 args.no_wandb = True
     else:
         logger = create_logger(None)
+        metrics_dir = None
 
 
     # training args
     logger.info(f"{args}")
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+    if val_loader is not None:
+        logger.info(f"Validation dataset contains {len(val_loader.dataset):,} images ({args.val_json_path})")
 
 
     # training env
@@ -656,6 +840,7 @@ def main(args):
 
     wandb_updates = []
     epochs = ceil(total_steps / (len(dataset) // args.global_batch_size))
+    best_val_metric = None
 
     logger.info(f"Training for {epochs} epochs...")
     if use_wsd:
@@ -850,6 +1035,19 @@ def main(args):
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}, LR: {current_lr:.4e}, LR_disc: {current_lr_disc:.4e}")
+                if rank == 0 and node_rank == 0:
+                    append_csv_row(
+                        os.path.join(metrics_dir, "train_metrics.csv"),
+                        ["step", "epoch", "train_loss", "steps_per_sec", "lr", "lr_disc"],
+                        {
+                            "step": train_steps,
+                            "epoch": epoch,
+                            "train_loss": avg_loss,
+                            "steps_per_sec": steps_per_sec,
+                            "lr": current_lr,
+                            "lr_disc": current_lr_disc,
+                        }
+                    )
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -865,6 +1063,66 @@ def main(args):
                         "lr_disc": current_lr_disc,
                     }
                 )
+
+            if (
+                val_loader is not None
+                and args.val_every is not None
+                and args.val_every > 0
+                and train_steps % args.val_every == 0
+                and train_steps > 0
+            ):
+                val_start_time = time.time()
+                val_metrics = compute_reconstruction_metrics(
+                    vq_model=vq_model,
+                    val_loader=val_loader,
+                    device=device,
+                    args=args,
+                    causal_type=causal_type,
+                )
+                metric_value = val_metrics[args.best_metric]
+                is_best = metric_is_better(metric_value, best_val_metric, args.best_mode)
+                if is_best:
+                    best_val_metric = metric_value
+
+                if rank == 0 and node_rank == 0:
+                    logger.info(
+                        f"(step={train_steps:07d}) Val MSE: {val_metrics['val_mse']:.6f}, "
+                        f"Val MAE: {val_metrics['val_mae']:.6f}, "
+                        f"Val PSNR: {val_metrics['val_psnr']:.4f}, "
+                        f"best={is_best}"
+                    )
+                    append_csv_row(
+                        os.path.join(metrics_dir, "val_metrics.csv"),
+                        ["step", "epoch", "val_mse", "val_mae", "val_psnr", "val_images", "is_best"],
+                        {
+                            "step": train_steps,
+                            "epoch": epoch,
+                            "val_mse": val_metrics["val_mse"],
+                            "val_mae": val_metrics["val_mae"],
+                            "val_psnr": val_metrics["val_psnr"],
+                            "val_images": val_metrics["val_images"],
+                            "is_best": int(is_best),
+                        }
+                    )
+                    if args.save_best and is_best:
+                        save_ckpt_dir = cd_checkpoint_dir if (use_wsd and const_end_flag) else checkpoint_dir
+                        best_path = f"{save_ckpt_dir}/best.pt"
+                        save_training_checkpoint(
+                            best_path,
+                            vq_model,
+                            vq_loss,
+                            optimizer,
+                            optimizer_disc,
+                            train_steps,
+                            args,
+                            ema=ema if args.ema else None,
+                            compile_model=args.compile,
+                        )
+                        logger.info(f"Saved best checkpoint to {best_path}")
+
+                vq_model.train()
+                dist.barrier()
+                start_time += time.time() - val_start_time
 
             # Save checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
@@ -922,6 +1180,24 @@ def main(args):
             break
 
     dist.barrier()
+    if args.save_last and rank == 0 and node_rank == 0:
+        final_ckpt_dir = cd_checkpoint_dir if (use_wsd and const_end_flag) else checkpoint_dir
+        last_path = f"{final_ckpt_dir}/last.pt"
+        save_training_checkpoint(
+            last_path,
+            vq_model,
+            vq_loss,
+            optimizer,
+            optimizer_disc,
+            train_steps,
+            args,
+            ema=ema if args.ema else None,
+            compile_model=args.compile,
+        )
+        logger.info(f"Saved last checkpoint to {last_path}")
+    if rank == 0 and node_rank == 0:
+        if metrics_dir is not None:
+            plot_train_val_curves(metrics_dir)
     vq_model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
@@ -979,6 +1255,15 @@ if __name__ == "__main__":
     # log and ckpts
     parser.add_argument("--log-every", type=int, default=500)
     parser.add_argument("--ckpt-every", type=int, default=5000)
+    parser.add_argument("--val-json-path", type=str, default=None, help="JSON list of validation image paths for online reconstruction eval.")
+    parser.add_argument("--val-every", type=int, default=0, help="Run online validation every N train steps. 0 disables online validation.")
+    parser.add_argument("--eval-batch-size", type=int, default=8, help="Per-rank validation batch size.")
+    parser.add_argument("--val-num-workers", type=int, default=4, help="Validation dataloader workers per rank.")
+    parser.add_argument("--val-max-images", type=int, default=0, help="Limit online validation images. 0 means all validation images.")
+    parser.add_argument("--save-best", action='store_true', help="Save checkpoints/best.pt according to online validation metric.")
+    parser.add_argument("--save-last", action='store_true', help="Save checkpoints/last.pt at the end of training.")
+    parser.add_argument("--best-metric", type=str, default="val_mse", choices=["val_mse", "val_mae", "val_psnr"])
+    parser.add_argument("--best-mode", type=str, default="min", choices=["min", "max"])
     parser.add_argument("--sub-exp-dir", type=str, default=None, help="sub experiment dir")
     parser.add_argument("--milestone-step", type=int, default=50_000, help="milestone step for checkpoint saving")
     parser.add_argument("--milestone-start", type=int, default=50_000, help="milestone start for checkpoint saving")
