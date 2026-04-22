@@ -505,3 +505,20 @@
 ## 边界
 - 不修改训练代码、模型结构、HR loss 或数据抽样。
 - 第一轮评估使用当前 materialized val 作为固定测试/验证集；若后续要独立 hold-out 图片，需要先 materialize hold-out。
+
+# 2026-04-22 Stage-1 训练曲线可视化脚本
+
+## 背景
+- 当前 baseline 与 HR 训练已完成，日志里已有 `Train Loss` 和 generator 组件 loss。
+- 需要把日志曲线画出来，便于判断训练是否进入平台期，以及汇报 baseline/HR 的训练动态。
+
+## 本轮新增
+- 新增 `scripts/stage1/plot_stage1_training_curves.py`。
+- 功能：
+  - 读取一个或多个 `NAME:/path/to/train.log`。
+  - 解析 `Train Loss`、`steps/sec`、学习率，以及 generator 行里的 `rec_loss`、`direct_rec_loss`、`perceptual_loss`、`feature_rec_loss`、`hr_loss` 等字段。
+  - 输出 `train_loss.png`、`reconstruction_components.png`、`hr_metrics.png`。
+  - 同时输出 `training_curves.csv` 和 `training_summary.json`，便于后续写报告或画其他图。
+
+## 边界
+- 只读训练日志，不修改训练代码、checkpoint、数据集或评估逻辑。
