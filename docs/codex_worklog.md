@@ -522,10 +522,3 @@
 
 ## 边界
 - 只读训练日志，不修改训练代码、checkpoint、数据集或评估逻辑。
-
-## 补充
-- `plot_stage1_training_curves.py` 增加可选 `--val-metrics` 参数，可读取重建评估输出的 `metrics.json`。
-- 额外输出：
-  - `val_metrics.png`：当前 val reconstruction metrics 柱状图。
-  - `train_val_summary.png`：train loss 曲线与 val PSNR/MSE/SSIM 放在同一张图中。
-  - `val_metrics_summary.json`：从 eval `metrics.json` 提取的 overall 指标。
