@@ -39,7 +39,7 @@ from utils.model_init import load_model_from_config, custom_load
 
 from utils.resume_log import (
     init_wandb, upload_wandb_cache, wandb_cache_file_append,
-    manage_ckpt_num, get_int_prefix_value, wsd_find_newest_ckpt
+    manage_ckpt_num, get_int_prefix_value, int_prefix_paths, wsd_find_newest_ckpt
 )
 from utils.model_init import load_encoders
 import wandb
@@ -652,7 +652,7 @@ def main(args):
         pretrain_loaded_flag = True
     
     # auto resume accurately
-    elif len(glob(f"{checkpoint_dir}/*.pt")) != 0:
+    elif len(int_prefix_paths(f"{checkpoint_dir}/*.pt")) != 0:
 
         if config["trainer"]["lr_scheduler"] == "wsd":
             # Is the constant training already ended?
@@ -667,7 +667,7 @@ def main(args):
             latest_checkpoint = resume_checkpoint
             checkpoint = torch.load(resume_checkpoint, map_location="cpu")
         else:
-            latest_checkpoint = max(glob(f"{checkpoint_dir}/*.pt"), key=get_int_prefix_value)
+            latest_checkpoint = max(int_prefix_paths(f"{checkpoint_dir}/*.pt"), key=get_int_prefix_value)
             checkpoint = torch.load(latest_checkpoint, map_location="cpu")
 
         custom_load(vq_model, checkpoint["model"])

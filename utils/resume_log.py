@@ -151,11 +151,24 @@ def save_wandb_project(exp_dir):
 
     
 
-def get_int_prefix_value(f_name):
-    f_name = f_name.split("/")[-1]
+def try_get_int_prefix_value(f_name):
+    f_name = os.path.basename(f_name)
     f_name = f_name.split(".")[0]
-    f_value = int(f_name)
+    try:
+        return int(f_name)
+    except ValueError:
+        return None
+
+
+def get_int_prefix_value(f_name):
+    f_value = try_get_int_prefix_value(f_name)
+    if f_value is None:
+        raise ValueError(f"checkpoint path does not start with an integer step: {f_name}")
     return f_value
+
+
+def int_prefix_paths(pattern):
+    return [f for f in glob(pattern) if try_get_int_prefix_value(f) is not None]
 
 
 def manage_ckpt_num(
@@ -170,7 +183,7 @@ def manage_ckpt_num(
     the checkpoints before the milestone will be deleted (except those saved at a milestone tick).
     We keep only max_milestone_num milestones.
     """
-    ckpt_files = glob(os.path.join(ckpt_dir, "*.pt"))
+    ckpt_files = int_prefix_paths(os.path.join(ckpt_dir, "*.pt"))
     ckpt_file_values = [[f, get_int_prefix_value(f)] for f in ckpt_files]
     ckpt_file_values = sorted(ckpt_file_values, key=lambda x: x[1])
 
@@ -226,11 +239,11 @@ def manage_fsdp_ckpt_num(
     This function is specifically for mananging the checkpoints saved by fsdp. The difference is that
     it also manages the optimizer state ckpts.
     """
-    ckpt_files = glob(os.path.join(ckpt_dir, "*.pt"))
+    ckpt_files = int_prefix_paths(os.path.join(ckpt_dir, "*.pt"))
     ckpt_file_values = [[f, get_int_prefix_value(f)] for f in ckpt_files]
     ckpt_file_values = sorted(ckpt_file_values, key=lambda x: x[1])
 
-    optim_ckpt_dirs = glob(os.path.join(optim_ckpt_dir, "*"))
+    optim_ckpt_dirs = int_prefix_paths(os.path.join(optim_ckpt_dir, "*"))
     optim_ckpt_values = [[f, get_int_prefix_value(f)] for f in optim_ckpt_dirs]
     optim_ckpt_values = sorted(optim_ckpt_values, key=lambda x: x[1])
 
@@ -331,8 +344,9 @@ def wsd_find_newest_ckpt(
     fract_decay = fract_decay if fract_decay is not None else config["trainer"].get("fract_decay", 0.2)
     # constant_epochs = int(args.epochs * fract_decay)
     constant_steps = int(total_steps * (1 - fract_decay))
-    if len(glob(f"{const_ckpt_dir}/*.pt"))!= 0:
-        latest_checkpoint_const = max(glob(f"{const_ckpt_dir}/*.pt"), key=get_int_prefix_value)
+    const_ckpts = int_prefix_paths(f"{const_ckpt_dir}/*.pt")
+    if len(const_ckpts)!= 0:
+        latest_checkpoint_const = max(const_ckpts, key=get_int_prefix_value)
     else:
         const_end_flag = False
         return None, const_end_flag
@@ -343,13 +357,12 @@ def wsd_find_newest_ckpt(
     if largest_step_const >= constant_steps:
         const_end_flag = True
         # check the sub folder for cooldown stage latest ckpt
-        if len(glob(f"{cd_sub_dir}/checkpoints/*.pt")) != 0:
-            latest_checkpoint_cd = max(glob(f"{cd_sub_dir}/checkpoints/*.pt"), 
-                                       key=get_int_prefix_value)
+        cd_ckpts = int_prefix_paths(f"{cd_sub_dir}/checkpoints/*.pt")
+        if len(cd_ckpts) != 0:
+            latest_checkpoint_cd = max(cd_ckpts, key=get_int_prefix_value)
             resume_checkpoint = latest_checkpoint_cd
         else:
             # find the biggest const step that is smaller than the constant steps
-            const_ckpts = glob(f"{const_ckpt_dir}/*.pt")
             const_ckpts = [ckpt for ckpt in const_ckpts if get_int_prefix_value(ckpt) <= constant_steps]
             resume_checkpoint = max(const_ckpts, key=get_int_prefix_value)
             const_end_flag = False

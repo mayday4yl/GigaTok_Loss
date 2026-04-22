@@ -554,3 +554,18 @@
 ## 边界
 - 不修改 tokenizer 架构、AR model、数据抽样或判别器启动策略。
 - 在线 validation 当前只记录重建数值指标；最终视觉对比仍使用独立重建评估脚本生成 grid。
+
+# 2026-04-23 Stage-1 best checkpoint 轮转修复
+
+## 背景
+- 在线 validation 保存 `checkpoints/best.pt` 后，原有 checkpoint 轮转逻辑会把所有 `*.pt` 都当成数字步数 checkpoint。
+- 在保存 `0001000.pt` 后调用 `manage_ckpt_num()` 时，`best.pt` 被解析成整数 `best`，触发 `ValueError` 并中断训练。
+
+## 修复
+- `utils/resume_log.py` 新增数字前缀 checkpoint 过滤 helper。
+- `manage_ckpt_num()`、`manage_fsdp_ckpt_num()` 和 WSD checkpoint 查找只处理 `0001000.pt` 这类数字前缀文件。
+- `tokenizer/tokenizer_image/vq/vq_train.py` 自动恢复也只从数字前缀 checkpoint 中选择 latest，避免 `best.pt`、`last.pt` 参与 step 恢复排序。
+
+## 边界
+- `best.pt`、`last.pt` 仍正常保留。
+- 不改变 checkpoint 保存内容、验证指标或训练损失。
