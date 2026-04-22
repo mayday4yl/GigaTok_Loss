@@ -481,3 +481,27 @@
 ## 下一步
 - 先用 310k train JSON 跑短 smoke，确认 dataloader、checkpoint、DINO distill 和 NPU 后端都能闭环。
 - smoke 通过后跑 baseline 与 HR 两个严格可比实验，除 HR 开关/权重外，其余训练预算和数据保持一致。
+
+# 2026-04-22 Stage-1 TextAtlas 重建评估脚本
+
+## 背景
+- 4 NPU baseline 与 4 NPU HR 训练已跑完 `10000` steps；两者 train loss 基本重合。
+- 下一步不能只看 train loss，需要在固定 val 图像上比较重建指标和可视化结果。
+- 仓库已有 `reconstruction_ddp.py` 主要是 CUDA/NCCL 和内置 dataset 路线，不适合直接用于当前 NPU + 本地 `val_image_paths.json`。
+
+## 本轮新增
+- 新增 `scripts/stage1/evaluate_textatlas_reconstruction.py`。
+- 功能：
+  - 读取本地 `val_image_paths.json` 和可选 `val_manifest.jsonl`。
+  - 加载一个或多个 `NAME:CONFIG:CKPT` tokenizer run。
+  - 使用 VQ encode/decode 重建图像。
+  - 输出 `metrics.json`，包含 `mse`、`mae`、`psnr`、`ssim` 的 overall 和 subset 统计。
+  - 输出 `comparison_grid.png`，按 `GT / baseline / HR` 并排可视化。
+  - 默认不保存全量 reconstruction PNG，避免评估产物占用过多空间。
+
+## 验证
+- 本地已运行：`python3 -m py_compile scripts/stage1/evaluate_textatlas_reconstruction.py`，通过。
+
+## 边界
+- 不修改训练代码、模型结构、HR loss 或数据抽样。
+- 第一轮评估使用当前 materialized val 作为固定测试/验证集；若后续要独立 hold-out 图片，需要先 materialize hold-out。
