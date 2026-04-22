@@ -11,9 +11,9 @@ The current fixed-count text reconstruction validation run uses:
 - TextScenesHQ
 - LongWordsSubset-A
 
-TextScenesHQ uses `40,000` train images. The other four subsets use `50,000`
-train images each. This stage no longer follows the original TextAtlas row
-distribution.
+TextScenesHQ uses `40,000` train images. The other four subsets use `65,000`
+train images each for the current `textatlas_stage1_fixed_310k` run. This stage
+no longer follows the original TextAtlas row distribution.
 
 Do not use in this round:
 - PPT2Structured
@@ -28,6 +28,6 @@ Do not use in this round:
 - do not center crop text-heavy images
 
 ## Suggested sample scale
-- formal run: fixed local materialized set, `40k TextScenesHQ + 4 * 50k other train`
+- formal run: fixed local materialized set, `40k TextScenesHQ + 4 * 65k other train`
 - validation: balanced 2k images per subset
 - optional hold-out: source-only 500 images per subset
