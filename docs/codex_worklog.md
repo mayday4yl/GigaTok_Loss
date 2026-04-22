@@ -458,3 +458,26 @@
 ## 边界
 - 不修改模型逻辑、HR loss 公式、tokenizer 主结构或 AR model。
 - 顺序抽样会牺牲随机覆盖面，但 baseline/HR 仍使用同一份本地数据，满足当前 pilot 的严格可比性。
+
+# 2026-04-22 Stage-1 310k 训练配置准备
+
+## 数据状态
+- 当前固定数据集为 `textatlas_stage1_fixed_310k`。
+- train 共 `300000` 张：`TextScenesHQ=40000`，其余 4 个 subset 各 `65000`。
+- val 共 `10000` 张：每个 subset `2000`。
+- `check_textatlas_fixed_manifest.py --materialized-root ...` 校验通过，`errors=[]`。
+
+## 训练配置
+- 新增 `configs/vq/VQ_BL256_dino_disc_stage1_baseline.yaml`。
+- baseline 配置与 HR 配置保持同样的 decoder-only finetune 边界：
+  - `freeze_encoder=True`
+  - `freeze_quantizer=True`
+  - `freeze_codebook=True`
+- baseline 只关闭 HR：
+  - `hr_on=False`
+  - `hr_loss_weight=0.0`
+- HR 继续使用 `configs/vq/VQ_BL256_dino_disc_hr.yaml`，当前 `hr_loss_weight=0.05`。
+
+## 下一步
+- 先用 310k train JSON 跑短 smoke，确认 dataloader、checkpoint、DINO distill 和 NPU 后端都能闭环。
+- smoke 通过后跑 baseline 与 HR 两个严格可比实验，除 HR 开关/权重外，其余训练预算和数据保持一致。
