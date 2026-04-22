@@ -537,11 +537,13 @@
   - `--eval-batch-size`
   - `--val-num-workers`
   - `--val-max-images`
+  - `--val-compute-ssim`
   - `--save-best`
   - `--save-last`
   - `--best-metric`
   - `--best-mode`
-- 在线验证每隔固定 step 在 `torch.no_grad()` 下计算 `val_mse`、`val_mae`、`val_psnr`，不参与反传，不调用判别器。
+- 在线验证每隔固定 step 在 `torch.no_grad()` 下计算 `val_mse`、`val_mae`、`val_psnr`，可选计算 `val_ssim`，不参与反传，不调用判别器。
+- 在线 validation 的 MSE/MAE/PSNR/SSIM 均按 `[0,1]` 图像范围统计，和离线重建评估脚本保持一致。
 - rank 0 写出：
   - `metrics/train_metrics.csv`
   - `metrics/val_metrics.csv`
