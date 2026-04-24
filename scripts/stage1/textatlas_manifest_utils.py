@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from collections import Counter
 from io import BytesIO
@@ -41,6 +42,39 @@ TEXT_SOURCE_BY_SUBSET = {
     "LongWordsSubset-A": "annotation",
     "TextScenesHQ": "raw_text",
 }
+ANNOTATION_TEXT_MARKERS = (
+    "displaying the text",
+    "written with the text",
+    "with the text",
+    "showing the text",
+    "containing the text",
+    "that reads",
+    "reads",
+    "says",
+)
+ANNOTATION_FIELD_MARKERS = (
+    "text",
+    "word",
+    "words",
+    "phrase",
+    "raw_text",
+)
+PROMPT_INDICATORS = (
+    "image",
+    "background",
+    "font",
+    "color",
+    "style",
+    "displaying",
+    "showing",
+    "containing",
+    "written",
+    "render",
+    "scene",
+    "photo",
+    "poster",
+    "sign",
+)
 _PIL_IMAGE = None
 
 
@@ -211,11 +245,187 @@ def validate_saved_image(path: Path) -> Tuple[int, int]:
         return rgb.size
 
 
-def get_text_fields(subset: str, row: Mapping[str, Any]) -> Tuple[str, str, str]:
+def normalize_text_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        return " ".join(normalize_text_value(item) for item in value if normalize_text_value(item)).strip()
+    if isinstance(value, dict):
+        for key in ("text", "raw_text", "word", "words", "content", "ocr", "transcription"):
+            if key in value:
+                text = normalize_text_value(value[key])
+                if text:
+                    return text
+        return ""
+    return str(value).strip()
+
+
+def strip_text_wrappers(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"^[`'\"“”‘’\s]+", "", text)
+    text = re.sub(r"[`'\"“”‘’\s]+$", "", text)
+    return text.strip()
+
+
+def join_extracted_texts(texts: Sequence[str]) -> str:
+    output: List[str] = []
+    seen = set()
+    for text in texts:
+        text = strip_text_wrappers(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(text)
+    return "\n".join(output)
+
+
+def parse_the_text_clauses(text: str) -> List[str]:
+    clauses: List[str] = []
+    patterns = (
+        r"the\s+text\s*[:：]\s*''(.*?)''",
+        r'the\s+text\s*[:：]\s*""(.*?)""',
+        r"the\s+text\s*[:：]\s*'([^']+)'",
+        r'the\s+text\s*[:：]\s*"([^"]+)"',
+    )
+    for pattern in patterns:
+        clauses.extend(match.group(1) for match in re.finditer(pattern, text, flags=re.IGNORECASE | re.DOTALL))
+    return clauses
+
+
+def parse_clean_text_synth(annotation: str) -> Tuple[str, str]:
+    marker = re.search(r"displaying\s+the\s+text\s*[:：]\s*", annotation, flags=re.IGNORECASE)
+    if marker is None:
+        return "", "failed_clean_marker"
+    return strip_text_wrappers(annotation[marker.end():]), "clean_displaying_text"
+
+
+def parse_styled_text_synth(annotation: str) -> Tuple[str, str]:
+    clauses = parse_the_text_clauses(annotation)
+    if not clauses:
+        quoted_after_marker = re.findall(
+            r"(?:text\s+reads|that\s+reads|reads|says)\s*[:：]?\s*\"([^\"]+)\"",
+            annotation,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        for quoted in quoted_after_marker:
+            nested = parse_the_text_clauses(quoted)
+            clauses.extend(nested if nested else [quoted])
+    text = join_extracted_texts(clauses)
+    if text:
+        return text, "styled_text_clauses"
+    return "", "failed_styled_parse"
+
+
+def parse_text_vision_blend(annotation: str) -> Tuple[str, str]:
+    marker = re.search(r"For text elements\b", annotation, flags=re.IGNORECASE)
+    section = annotation[marker.start():] if marker else annotation
+    clauses = re.findall(
+        r"^\s*\d+\.\s+\"([^\n\"]+)\"\s+in\s+size\b",
+        section,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    text = join_extracted_texts(clauses)
+    if text:
+        return text, "textvision_text_elements"
+    return "", "failed_textvision_parse"
+
+
+def parse_long_words_subset(annotation: str) -> Tuple[str, str]:
+    patterns = (
+        r"with\s+text\s+reading\s+(.+?)(?:\.|$)",
+        r"text\s+reading\s+(.+?)(?:\.|$)",
+        r"we\s+note\s+(.+?)\s+visible(?:\.|$)",
+        r"along\s+with\s+visible\s+(.+?)(?:\.|$)",
+        r"\band\s+(.+?)\s+clearly\s+shown(?:\.|$)",
+        r"\band\s+(.+?)\s+text(?:\.|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, annotation, flags=re.IGNORECASE | re.DOTALL)
+        if match is not None:
+            text = strip_text_wrappers(match.group(1))
+            text = re.sub(r"\s+", " ", text).strip()
+            if text:
+                return text, "longwords_pattern"
+
+    quoted = re.findall(r"[\"“”'‘’`]([^\"“”'‘’`]+)[\"“”'‘’`]", annotation)
+    text = join_extracted_texts(quoted)
+    if text:
+        return text, "longwords_quote"
+    return "", "failed_longwords_parse"
+
+
+def parse_annotation_text(subset: str, annotation: Any) -> Tuple[str, str]:
+    text = normalize_text_value(annotation)
+    if not text:
+        return "", "empty_annotation"
+
+    if subset == "CleanTextSynth":
+        return parse_clean_text_synth(text)
+    if subset == "StyledTextSynth":
+        return parse_styled_text_synth(text)
+    if subset == "TextVisionBlend":
+        return parse_text_vision_blend(text)
+    if subset == "LongWordsSubset-A":
+        return parse_long_words_subset(text)
+
+    if text[:1] in ("{", "["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if parsed is not None:
+            parsed_text = normalize_text_value(parsed)
+            if parsed_text:
+                return parsed_text, "parsed_annotation_json"
+
+    phrase_marker_pattern = "|".join(re.escape(marker) for marker in ANNOTATION_TEXT_MARKERS)
+    field_marker_pattern = "|".join(re.escape(marker) for marker in ANNOTATION_FIELD_MARKERS)
+    matches = list(re.finditer(rf"(?:{phrase_marker_pattern})\s*[:：]?\s*", text, flags=re.IGNORECASE))
+    matches.extend(re.finditer(rf"(?:{field_marker_pattern})\s*[:：]\s*", text, flags=re.IGNORECASE))
+    matches = sorted(matches, key=lambda match: match.start())
+    if matches:
+        rendered = text[matches[-1].end():].strip()
+        rendered = strip_text_wrappers(rendered)
+        if rendered:
+            return rendered, "parsed_annotation_marker"
+
+    quoted = re.findall(r"[\"“”'‘’`]([^\"“”'‘’`]+)[\"“”'‘’`]", text)
+    if quoted:
+        rendered = strip_text_wrappers(quoted[-1])
+        if rendered:
+            return rendered, "parsed_annotation_quote"
+
+    lowered = text.lower()
+    looks_like_prompt = any(indicator in lowered for indicator in PROMPT_INDICATORS)
+    if not looks_like_prompt and len(text) <= 256:
+        return text, "plain_annotation"
+
+    return "", "failed_annotation_parse"
+
+
+def get_text_fields(subset: str, row: Mapping[str, Any]) -> Tuple[str, str, str, str]:
     text_source = TEXT_SOURCE_BY_SUBSET[subset]
-    text = row.get(text_source) or ""
-    raw_annotation = row.get("annotation") or ""
-    return str(text), text_source, str(raw_annotation)
+    raw_annotation = normalize_text_value(row.get("annotation") or row.get("raw_annotation"))
+
+    if text_source == "raw_text":
+        text = normalize_text_value(row.get("raw_text") or row.get("text"))
+        if text:
+            return text, text_source, raw_annotation, "raw_text"
+        text, status = parse_annotation_text(subset, raw_annotation)
+        return text, "annotation", raw_annotation, f"fallback_{status}"
+
+    if text_source == "annotation":
+        text, status = parse_annotation_text(subset, row.get("annotation") or row.get("raw_annotation"))
+        return text, text_source, raw_annotation, status
+
+    text = normalize_text_value(row.get(text_source))
+    return text, text_source, raw_annotation, text_source
 
 
 def build_source_record(
@@ -264,7 +474,12 @@ def materialize_source_record(
         width, height = validate_saved_image(output_path)
 
     subset = str(source_record["subset"])
-    text, text_source, raw_annotation = get_text_fields(subset, row)
+    text, text_source, raw_annotation, text_extraction_status = get_text_fields(subset, row)
+    if not text:
+        raise ValueError(
+            f"empty rendered text after extraction: subset={subset}, "
+            f"text_source={text_source}, status={text_extraction_status}, raw_annotation={raw_annotation!r}"
+        )
     record = dict(source_record)
     record.update(
         {
@@ -273,6 +488,7 @@ def materialize_source_record(
             "materialized": True,
             "text": text,
             "text_source": text_source,
+            "text_extraction_status": text_extraction_status,
             "raw_annotation": raw_annotation,
             "width": width,
             "height": height,

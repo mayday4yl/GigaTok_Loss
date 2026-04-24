@@ -284,6 +284,9 @@ class VQVitModelPlus(nn.Module):
         else:
             self.quant_conv = nn.Conv2d(self.config.z_channels, config.codebook_embed_dim, 1)
             self.post_quant_conv = nn.Conv2d(config.codebook_embed_dim, self.config.z_channels, 1)
+
+        self.text_projection = None
+        self.text_type_embedding = None
         
         self.freeze_but_2d_decoder_flag = False
 
@@ -337,7 +340,8 @@ class VQVitModelPlus(nn.Module):
             self,
             freeze_encoder=False,
             freeze_quantizer=False,
-            freeze_codebook=False):
+            freeze_codebook=False,
+            freeze_post_quant_conv=False):
         if freeze_encoder:
             set_requires_grad(False, self.encoder, self.s2to1encoder, self.quant_conv)
 
@@ -346,6 +350,54 @@ class VQVitModelPlus(nn.Module):
 
         if freeze_codebook and hasattr(self.quantize, "embedding"):
             self.quantize.embedding.weight.requires_grad = False
+
+        if freeze_post_quant_conv:
+            set_requires_grad(False, self.post_quant_conv)
+
+    def configure_text_conditioning(
+            self,
+            text_feature_dim,
+            text_projection="linear_layernorm",
+            text_type_embedding=True):
+        decoder_width = self.s1to2decoder.width
+        if text_projection == "linear":
+            self.text_projection = nn.Linear(text_feature_dim, decoder_width)
+        elif text_projection == "linear_layernorm":
+            self.text_projection = nn.Sequential(
+                nn.Linear(text_feature_dim, decoder_width),
+                nn.LayerNorm(decoder_width),
+            )
+        elif text_projection == "identity":
+            if text_feature_dim != decoder_width:
+                raise ValueError(
+                    f"identity text_projection requires text_feature_dim={text_feature_dim} "
+                    f"to match decoder width={decoder_width}"
+                )
+            self.text_projection = nn.Identity()
+        else:
+            raise ValueError(f"Unknown text_projection: {text_projection}")
+
+        if isinstance(self.text_projection, nn.Module):
+            self.text_projection.apply(self._init_weights)
+
+        if text_type_embedding:
+            self.text_type_embedding = nn.Parameter(torch.zeros(1, 1, decoder_width))
+            nn.init.trunc_normal_(self.text_type_embedding, mean=0.0, std=0.02)
+        else:
+            self.text_type_embedding = None
+
+    def project_text_memory(self, decoder_text_features):
+        if decoder_text_features is None:
+            return None
+        if self.text_projection is None:
+            raise RuntimeError("Text conditioning is enabled, but text_projection is not configured.")
+        text_memory = self.text_projection(decoder_text_features)
+        if self.text_type_embedding is not None:
+            text_memory = text_memory + self.text_type_embedding.to(
+                device=text_memory.device,
+                dtype=text_memory.dtype,
+            )
+        return text_memory
     
     def _init_weights(self, module):
         """ Initialize the weights.
@@ -427,12 +479,22 @@ class VQVitModelPlus(nn.Module):
             ret_inner_feat=False, # the feature passed through a MLP for alignment loss
             return_feat=False,    # the feature for linear probe
             selected_decoder_layer=None,
+            decoder_text_features=None,
+            decoder_text_key_padding_mask=None,
             ):
         quant = self.post_quant_conv(quant)
+        text_memory = self.project_text_memory(decoder_text_features)
+        if text_memory is not None and selected_decoder_layer is None:
+            raise ValueError("decoder_text_features requires selected_decoder_layer for text injection.")
         if ret_inner_feat:
             if selected_decoder_layer is not None:
                 rec_spatial, inner_feat, decoder_cross_attn = self.s1to2decoder(
-                    quant, ret_inner_feat=True, selected_decoder_layer=selected_decoder_layer)
+                    quant,
+                    ret_inner_feat=True,
+                    selected_decoder_layer=selected_decoder_layer,
+                    text_memory=text_memory,
+                    text_key_padding_mask=decoder_text_key_padding_mask,
+                )
             else:
                 rec_spatial, inner_feat = self.s1to2decoder(quant, ret_inner_feat=True)
             pixel_dec = self.decoder(rec_spatial)
@@ -447,7 +509,11 @@ class VQVitModelPlus(nn.Module):
         else:
             if selected_decoder_layer is not None:
                 rec_spatial, decoder_cross_attn = self.s1to2decoder(
-                    quant, selected_decoder_layer=selected_decoder_layer)
+                    quant,
+                    selected_decoder_layer=selected_decoder_layer,
+                    text_memory=text_memory,
+                    text_key_padding_mask=decoder_text_key_padding_mask,
+                )
             else:
                 rec_spatial = self.s1to2decoder(quant)
             pixel_dec = self.decoder(rec_spatial)
@@ -472,6 +538,8 @@ class VQVitModelPlus(nn.Module):
             global_step=None,
             max_steps=None,
             selected_decoder_layer=None,
+            decoder_text_features=None,
+            decoder_text_key_padding_mask=None,
             ):
         quant, diff, spatial = self.encode(
                                     input, 
@@ -489,21 +557,34 @@ class VQVitModelPlus(nn.Module):
                 inner_feat = self.distill_mlp(inner_feat)
                 if selected_decoder_layer is not None:
                     dec, rec_spatial, decoder_cross_attn = self.decode(
-                        quant, selected_decoder_layer=selected_decoder_layer)
+                        quant,
+                        selected_decoder_layer=selected_decoder_layer,
+                        decoder_text_features=decoder_text_features,
+                        decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                    )
                 else:
                     dec, rec_spatial = self.decode(quant)
                     decoder_cross_attn = None
             else:
                 if selected_decoder_layer is not None:
                     dec, rec_spatial, inner_feat, decoder_cross_attn = self.decode(
-                        quant, ret_inner_feat=True, selected_decoder_layer=selected_decoder_layer)
+                        quant,
+                        ret_inner_feat=True,
+                        selected_decoder_layer=selected_decoder_layer,
+                        decoder_text_features=decoder_text_features,
+                        decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                    )
                 else:
                     dec, rec_spatial, inner_feat = self.decode(quant, ret_inner_feat=True)
                     decoder_cross_attn = None
         else:
             if selected_decoder_layer is not None:
                 dec, rec_spatial, decoder_cross_attn = self.decode(
-                    quant, selected_decoder_layer=selected_decoder_layer)
+                    quant,
+                    selected_decoder_layer=selected_decoder_layer,
+                    decoder_text_features=decoder_text_features,
+                    decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                )
             else:
                 dec, rec_spatial = self.decode(quant)
                 decoder_cross_attn = None
@@ -1410,5 +1491,4 @@ def compute_cosinesim_loss(feat1, feat2, dim):
     cos_sim = F.cosine_similarity(feat1, feat2, dim=dim)
     loss = 1 - cos_sim
     return torch.mean(loss)  
-
 

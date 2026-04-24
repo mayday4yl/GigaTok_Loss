@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -25,11 +26,18 @@ MATERIALIZED_REQUIRED_FIELDS = set(SOURCE_ONLY_REQUIRED_FIELDS) | {
     "materialized",
     "text",
     "text_source",
+    "text_extraction_status",
     "raw_annotation",
     "width",
     "height",
     "file_size",
 }
+PROMPT_TEXT_PATTERNS = (
+    r"displaying\s+the\s+text\s*[:：]",
+    r"written\s+with\s+the\s+text\s*[:：]",
+    r"showing\s+the\s+text\s*[:：]",
+    r"containing\s+the\s+text\s*[:：]",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,6 +95,10 @@ def validate_image(path: Path) -> tuple[int, int]:
 def require(condition: bool, errors: List[str], message: str) -> None:
     if not condition:
         errors.append(message)
+
+
+def looks_like_raw_prompt(text: str) -> bool:
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in PROMPT_TEXT_PATTERNS)
 
 
 def validate_sha_manifest(root: Path, errors: List[str]) -> Dict[str, str]:
@@ -225,11 +237,31 @@ def validate_materialized_split(
         require(not missing, errors, f"{split} materialized row {idx} missing fields: {sorted(missing)}")
         subset = str(row.get("subset"))
         counts[subset] += 1
+        extraction_status = str(row.get("text_extraction_status") or "")
         if subset in TEXT_SOURCE_BY_SUBSET:
             require(
-                row.get("text_source") == TEXT_SOURCE_BY_SUBSET[subset],
+                row.get("text_source") == TEXT_SOURCE_BY_SUBSET[subset] or extraction_status.startswith("fallback_"),
                 errors,
                 f"{split} row {idx} subset={subset} text_source={row.get('text_source')!r}",
+            )
+        text = str(row.get("text") or "").strip()
+        raw_annotation = str(row.get("raw_annotation") or "").strip()
+        require(bool(text), errors, f"{split} row {idx} subset={subset} has empty text")
+        require(
+            not (extraction_status.startswith("failed") or "_failed" in extraction_status),
+            errors,
+            f"{split} row {idx} subset={subset} failed text extraction: {extraction_status}",
+        )
+        require(
+            not looks_like_raw_prompt(text),
+            errors,
+            f"{split} row {idx} subset={subset} text still looks like raw prompt: {text[:120]!r}",
+        )
+        if raw_annotation and row.get("text_source") != "raw_text" and extraction_status != "plain_annotation":
+            require(
+                text != raw_annotation,
+                errors,
+                f"{split} row {idx} subset={subset} text equals raw_annotation",
             )
         if max_image_checks and checked >= max_image_checks:
             continue

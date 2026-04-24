@@ -569,3 +569,164 @@
 ## 边界
 - `best.pt`、`last.pt` 仍正常保留。
 - 不改变 checkpoint 保存内容、验证指标或训练损失。
+
+# 2026-04-25 Text-conditioned decoder HR v2 代码管理
+
+## 分支
+- 从 `feat/hrloss-bl-textatlas` 当前本地 HEAD 切出新分支 `codex/text-hr-decoder`。
+- 当前分支保留旧分支领先远端的 1 个本地提交作为 v2 基线。
+- 旧分支不继续混入 v2 文本注入改动。
+
+## 方案归档
+- v1 = image-only decoder attention HR。
+  - 保留旧 decoder cross-attention HR loss。
+  - 保留旧 `hr_on` / `hr_loss_weight` / `hr_random_one_layer` 配置语义。
+  - 保留旧 baseline / HR / HR=50 配置。
+- v2 = T5 text-conditioned decoder + image-to-text HR。
+  - 新增独立配置 `configs/vq/VQ_BL256_dino_disc_text_hr_v2.yaml`。
+  - v2 使用 `text_conditioning.enabled` 和 `text_hr.enabled`，不复用旧 `hr_on` 作为主开关。
+
+## v2 默认边界
+- 冻结 GigaTok encoder、`s2to1encoder`、`quant_conv`、quantizer/codebook、`post_quant_conv` 和 T5。
+- 只训练 `s1to2decoder`、final CNN `decoder`、新增 text projection 和可学习 `text_type_embedding`。
+- 不加 `text_position_embedding`；T5 hidden state 提供文本序列位置信息，GigaTok decoder image queries 提供 16x16 图像位置信息。
+- 默认层策略为中层显式 pair：decoder/T5 block `8..15`。
+- v2 HR loss 目标矩阵为选中层 post-softmax cross-attention 中裁出的 image-to-text 子矩阵。
+- padding text token 必须在 SVD 前移除。
+- 默认 SVD 策略为 per-sample all-head stack，并除以 `sqrt(num_heads)` 保持奇异值尺度稳定。
+
+## 合并安全规则
+- 后续实现只给现有 forward/loss/train 路径增加可选参数；文本参数为 `None` 或开关关闭时保持旧 image-only 行为。
+- v1 HR loss 函数保留；v2 image-to-text HR loss 使用独立函数。
+- merge 前需要分别跑旧 config smoke 和 v2 config smoke，确认 v1 未破坏、v2 文本注入与 HR loss 可用。
+
+# 2026-04-25 Text-conditioned decoder HR v2 实现
+
+## 本轮新增
+- 新增 `dataset/textatlas.py` 和 `textatlas_image_text` dataset 入口，读取 `image_path/text` JSONL manifest，并支持相对图片路径按 manifest 所在目录解析。
+- 新增 v2 配置：
+  - `configs/vq/VQ_BL256_dino_disc_text_baseline_v2.yaml`：T5 text-conditioned decoder baseline，不启用 text HR。
+  - `configs/vq/VQ_BL256_dino_disc_text_hr_v2.yaml`：同样文本注入路径，启用 image-to-text HR loss。
+- `VQVitModelPlus` 新增可选 text conditioning：
+  - `configure_text_conditioning()` 创建 T5 hidden state 到 decoder width 的 projection。
+  - `text_type_embedding` 为可学习参数。
+  - `post_quant_conv` 可通过 `freeze_post_quant_conv` 冻结。
+- `ViTDecoder.forward()` 新增可选 `text_memory` / `text_key_padding_mask`：
+  - 只在选中的 decoder layer 把 memory 扩展为 `[image_tokens; text_tokens]`。
+  - padding text token 通过 `memory_key_padding_mask` 在 attention softmax 前 mask。
+- `vq_train.py` 新增 v2 训练路径：
+  - 冻结 T5 encoder，`output_hidden_states=True`。
+  - T5 embedding 输出 `hidden_states[0]` 不参与选层；配置中的 `t5_layer=k` 对应 `hidden_states[k + 1]`。
+  - 默认按显式中层 pair `[8,8]..[15,15]` 每 step 随机选一对。
+  - text-conditioned 数据预处理改为等比 resize + pad 到 256，不做随机裁剪和水平翻转。
+
+## v2 HR loss
+- 新函数：`high_rank_image_text_attention_loss()`。
+- 输入为选中 decoder 层的 post-softmax cross-attention weights `[B, H, Q, K]`。
+- 裁剪方式：
+  - image keys 为前 `image_token_len=256` 列。
+  - text keys 为后续 `T` 列。
+  - HR 矩阵使用 `A[:, :, :, 256:256+T]` 的有效 text token 子矩阵。
+- SVD 策略：
+  - 不在 batch 维度先求均值。
+  - 每个样本单独处理，按 `text_attention_mask` 移除 padding 列。
+  - 将 heads 垂直堆叠为 `[H*Q, valid_T]`，再除以 `sqrt(H)`。
+  - `torch.linalg.svdvals(matrix.float())` 用 float32 计算奇异值。
+- loss：
+  - `mean(abs(sigma - tau))`，默认 `tau=1.0`。
+  - `valid_T < 2` 的样本跳过，避免 padding 或极短文本制造无意义奇异值。
+
+## 兼容性
+- 旧 v1 `hr_on/hr_loss_weight` 和 `high_rank_attention_loss()` 保留。
+- `text_conditioning.enabled=False` 且 `text_hr.enabled=False` 时，旧 image-only forward/loss/train 路径保持不变。
+- v1 HR 与 v2 text HR 不允许同时开启，避免同一 attention 权重被两套语义混用。
+
+## 验证
+- 已运行 `python3 -m py_compile` 检查新增/修改的 dataset、decoder、model、loss、train 文件，语法通过。
+- 已用 Ruby YAML parser 检查旧 v1 config 与新增 v2 baseline/HR config，解析通过。
+- 已运行 `git diff --check`，无 whitespace error。
+- 当前本地 Python 环境缺少 `torch`，无法在此环境执行张量级 runtime smoke；需要在训练环境补跑旧 config smoke 与 v2 config smoke。
+
+# 2026-04-25 TextAtlas rendered text 与 T5 本地加载修补
+
+## 背景
+- v2 的 `text` 必须是图片里实际出现的文字内容，不是 caption，也不是完整 generation prompt。
+- TextAtlas 不同 subset 的 `annotation` 格式不完全一致，不能简单把整段 `annotation` 透传给 T5。
+- 当前 workspace 没有已下载的 `*_materialized_manifest.jsonl`，也没有预拉取 T5 权重；训练环境需要重新 materialize 并准备 T5 cache。
+
+## 本轮修补
+- `scripts/stage1/textatlas_manifest_utils.py`
+  - 新增 annotation 文本抽取逻辑。
+  - `CleanTextSynth`、`StyledTextSynth`、`TextVisionBlend`、`LongWordsSubset-A` 默认从 `annotation` 中解析 rendered text。
+  - `TextScenesHQ` 优先使用 `raw_text`；如果缺失则 fallback 到 annotation 解析。
+  - materialized manifest 新增 `text_extraction_status`，保留 `raw_annotation`，最终训练字段仍为 `text`。
+  - 如果抽取后 `text` 为空，materialize 直接报错，避免错误数据进入训练。
+- `dataset/textatlas.py`
+  - 训练读取 manifest 时检查 `text` 非空。
+  - 拒绝看起来仍是 raw prompt 的 `text`。
+  - annotation-based row 若 `text == raw_annotation` 且不是 `plain_annotation`，直接报错。
+- `scripts/stage1/check_textatlas_fixed_manifest.py`
+  - materialized manifest 校验新增 `text_extraction_status`。
+  - 检查空 text、抽取失败、raw prompt 残留、错误的 annotation 透传。
+- `tokenizer/tokenizer_image/vq/vq_train.py`
+  - T5 `from_pretrained()` 支持 `cache_dir` 和 `local_files_only`。
+  - `encoder_name` 可以是 Hugging Face model id，也可以是本地目录。
+- 新增 `scripts/stage1/prepare_t5_encoder.py`
+  - 用于在训练环境提前下载或验证 T5 tokenizer + encoder cache。
+
+## 注意
+- v2 训练必须使用 `train_materialized_manifest.jsonl`，不能使用旧的 `train_image_paths.json`。
+- 如果已有旧 materialized manifest，里面没有 `text_extraction_status`，且 `text` 可能是完整 `annotation`；需要用新脚本重新 materialize。
+- 离线训练时建议在 config 里设置：
+  - `text_conditioning.encoder_name: /path/to/local/t5`
+  - `text_conditioning.local_files_only: True`
+
+# 2026-04-25 TextAtlas v2 text manifest refresh
+
+## 服务器数据确认
+- 已通过 SSH 检查 ModelArts：
+  - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/images/train` 已存在，约 `20G`。
+  - `manifest/train_materialized_manifest.jsonl` 和 `manifest/val_materialized_manifest.jsonl` 已存在。
+  - `manifest_holdout_eval/holdout_materialized_manifest.jsonl` 已存在。
+- 旧 manifest 统计：
+  - train `300000` 行；val `10000` 行。
+  - annotation-based 四个子集的旧 `text` 全部等于 `raw_annotation`。
+  - 旧 manifest 没有 `text_extraction_status`。
+  - parquet cache 已不存在，但旧 manifest 保留 `raw_annotation`，因此不需要重下图片。
+- 服务器 Hugging Face cache 当前没有 T5 权重。
+
+## 本轮新增
+- 新增 `scripts/stage1/refresh_textatlas_rendered_text.py`。
+- 功能：
+  - 输入旧 `*_materialized_manifest.jsonl`。
+  - 保留原始行顺序、`image_path`、`hf_row_idx`、`source_key` 和 `materialize_order`。
+  - 只刷新 `text`、`text_source`、`raw_annotation`、`text_extraction_status`。
+  - 输出新 manifest，默认文件名增加 `_v2text` 后缀。
+  - 如果 `materialize_order` 与行号不一致、抽取为空、仍像 raw prompt、或抽取失败，则不落最终文件并报错。
+
+## 子集抽取规则
+- `CleanTextSynth`：提取 `displaying the text:` 后面的内容。
+- `StyledTextSynth`：提取所有 `the text : '...'` / `the text : "..."` 文本块，按出现顺序用换行连接。
+- `TextVisionBlend`：只解析 `For text elements` 里的编号文本项，按编号顺序用换行连接。
+- `TextScenesHQ`：保留原 `raw_text`。
+- `LongWordsSubset-A`：按 `with text reading ...`、`we note ... visible`、`along with visible ...`、`and ... text`、`and ... clearly shown` 等模式提取可见文字列表。
+
+## 云端刷新命令
+```bash
+python scripts/stage1/refresh_textatlas_rendered_text.py \
+  --manifest-root /home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/manifest \
+  --splits train val
+
+python scripts/stage1/refresh_textatlas_rendered_text.py \
+  --manifest-root /home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/manifest_holdout_eval \
+  --splits holdout
+```
+- v2 train 应使用：
+  - `train_materialized_manifest_v2text.jsonl`
+  - `val_materialized_manifest_v2text.jsonl`
+  - 可选 `holdout_materialized_manifest_v2text.jsonl`
+
+## 验证
+- 本地样例测试覆盖 `CleanTextSynth`、`StyledTextSynth`、`TextVisionBlend`、`TextScenesHQ`、`LongWordsSubset-A`，抽取结果符合预期。
+- 已运行 `python3 -m py_compile` 检查相关脚本，语法通过。
+- 已运行 `git diff --check`，无 whitespace error。

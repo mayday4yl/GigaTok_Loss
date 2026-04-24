@@ -46,6 +46,12 @@ import wandb
 import yaml
 
 try:
+    from transformers import AutoTokenizer, T5EncoderModel
+except ImportError:
+    AutoTokenizer = None
+    T5EncoderModel = None
+
+try:
     from skimage.metrics import structural_similarity as ssim_metric
 except ImportError:
     ssim_metric = None
@@ -84,6 +90,20 @@ class JsonImageDataset(Dataset):
         return image, torch.tensor(0)
 
 
+def resize_pad_arr(pil_image, image_size, fill=255):
+    pil_image = pil_image.convert("RGB")
+    width, height = pil_image.size
+    scale = min(image_size / width, image_size / height)
+    resized_width = max(1, round(width * scale))
+    resized_height = max(1, round(height * scale))
+    pil_image = pil_image.resize((resized_width, resized_height), Image.BICUBIC)
+    canvas = Image.new("RGB", (image_size, image_size), color=(fill, fill, fill))
+    left = (image_size - resized_width) // 2
+    top = (image_size - resized_height) // 2
+    canvas.paste(pil_image, (left, top))
+    return canvas
+
+
 def prepare_device_backend(device_backend):
     if device_backend == "cuda":
         assert torch.cuda.is_available(), "Training currently requires at least one CUDA GPU."
@@ -115,6 +135,32 @@ def synchronize_device(device_backend):
         torch.npu.synchronize()
     else:
         raise ValueError(f"Unsupported device backend: {device_backend}")
+
+
+def build_text_layer_pairs(text_hr_cfg, decoder_num_layers, text_num_layers=None):
+    raw_pairs = text_hr_cfg.get("layer_pairs", None)
+    if not raw_pairs:
+        shared_layers = min(decoder_num_layers, text_num_layers) if text_num_layers is not None else decoder_num_layers
+        start = shared_layers // 3
+        end = min(shared_layers, start + max(1, shared_layers // 3))
+        raw_pairs = [[layer_idx, layer_idx] for layer_idx in range(start, end)]
+
+    layer_pairs = []
+    for pair in raw_pairs:
+        if len(pair) != 2:
+            raise ValueError(f"text_hr.layer_pairs entries must be [t5_layer, decoder_layer], got {pair}")
+        text_layer, decoder_layer = int(pair[0]), int(pair[1])
+        if decoder_layer < 0 or decoder_layer >= decoder_num_layers:
+            raise ValueError(
+                f"decoder_layer={decoder_layer} is out of range for decoder_num_layers={decoder_num_layers}"
+            )
+        if text_num_layers is not None and (text_layer < 0 or text_layer >= text_num_layers):
+            raise ValueError(f"text_layer={text_layer} is out of range for T5 num_layers={text_num_layers}")
+        layer_pairs.append((text_layer, decoder_layer))
+
+    if not layer_pairs:
+        raise ValueError("No valid text/decode layer pairs configured.")
+    return layer_pairs
 
 
 def append_csv_row(path, fieldnames, row):
@@ -334,9 +380,22 @@ def main(args):
     hr_on = config["trainer"].get("hr_on", False)
     hr_loss_weight = float(config["trainer"].get("hr_loss_weight", 0.0))
     hr_random_one_layer = config["trainer"].get("hr_random_one_layer", True)
+    text_conditioning_cfg = config.get("text_conditioning", {})
+    text_hr_cfg = config.get("text_hr", {})
+    text_conditioning_on = bool(text_conditioning_cfg.get("enabled", False))
+    text_hr_on = bool(text_hr_cfg.get("enabled", False))
+    if text_hr_on and not text_conditioning_on:
+        raise ValueError("text_hr.enabled requires text_conditioning.enabled=True.")
+    if hr_on and text_hr_on:
+        raise ValueError("v1 hr_on and v2 text_hr.enabled cannot be enabled at the same time.")
+    text_hr_loss_weight = float(text_hr_cfg.get("hr_loss_weight", 0.0)) if text_hr_on else 0.0
+    text_hr_tau = float(text_hr_cfg.get("tau", 1.0))
+    text_hr_skip_if_valid_tokens_lt = int(text_hr_cfg.get("skip_if_valid_tokens_lt", 2))
+    text_max_length = int(text_conditioning_cfg.get("max_length", 128))
     freeze_encoder = config["trainer"].get("freeze_encoder", False)
     freeze_quantizer = config["trainer"].get("freeze_quantizer", False)
     freeze_codebook = config["trainer"].get("freeze_codebook", False)
+    freeze_post_quant_conv = config["trainer"].get("freeze_post_quant_conv", False)
 
 
     if args.sub_exp_dir is not None:
@@ -385,12 +444,19 @@ def main(args):
 
 
     # Setup data:
-    transform = transforms.Compose([
-        transforms.Lambda(lambda pil_image: random_crop_arr(pil_image, args.image_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
-    ])
+    if text_conditioning_on:
+        transform = transforms.Compose([
+            transforms.Lambda(lambda pil_image: resize_pad_arr(pil_image, args.image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+        ])
+    else:
+        transform = transforms.Compose([
+            transforms.Lambda(lambda pil_image: random_crop_arr(pil_image, args.image_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+        ])
     dataset = build_dataset(args, transform=transform)
     sampler = DistributedSampler(
         dataset,
@@ -412,11 +478,18 @@ def main(args):
     val_loader = None
     val_sampler = None
     if args.val_json_path is not None:
-        val_transform = transforms.Compose([
-            transforms.Resize((args.image_size, args.image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
-        ])
+        if text_conditioning_on:
+            val_transform = transforms.Compose([
+                transforms.Lambda(lambda pil_image: resize_pad_arr(pil_image, args.image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+            ])
+        else:
+            val_transform = transforms.Compose([
+                transforms.Resize((args.image_size, args.image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+            ])
         val_dataset = JsonImageDataset(
             args.val_json_path,
             transform=val_transform,
@@ -517,8 +590,44 @@ def main(args):
                 # if cannot get from attributes, then refer to a hardcoded dict
                 config["model"]["init_args"]["out_inner_dim"] = model_out_dim_dict[distill_model]
 
+    text_tokenizer = None
+    text_encoder = None
+    text_encoder_num_layers = None
+    text_feature_dim = None
+    if text_conditioning_on:
+        if AutoTokenizer is None or T5EncoderModel is None:
+            raise ImportError("text_conditioning.enabled=True requires transformers with T5EncoderModel.")
+        text_encoder_name = text_conditioning_cfg.get("encoder_name", "google/t5-v1_1-xl")
+        text_cache_dir = text_conditioning_cfg.get("cache_dir", None)
+        text_local_files_only = bool(text_conditioning_cfg.get("local_files_only", False))
+        pretrained_kwargs = {
+            "cache_dir": text_cache_dir,
+            "local_files_only": text_local_files_only,
+        }
+        text_tokenizer = AutoTokenizer.from_pretrained(text_encoder_name, **pretrained_kwargs)
+        text_encoder = T5EncoderModel.from_pretrained(text_encoder_name, **pretrained_kwargs)
+        text_feature_dim = getattr(text_encoder.config, "d_model", None)
+        text_encoder_num_layers = getattr(text_encoder.config, "num_layers", None)
+        if text_feature_dim is None:
+            raise ValueError(f"Cannot read d_model from T5 encoder config: {text_encoder_name}")
+        if text_conditioning_cfg.get("freeze", True):
+            text_encoder.requires_grad_(False)
+        text_encoder.eval()
+        text_encoder = text_encoder.to(device)
+        logger.info(
+            f"Text conditioning enabled: encoder={text_encoder_name}, "
+            f"d_model={text_feature_dim}, num_layers={text_encoder_num_layers}, "
+            f"max_length={text_max_length}, cache_dir={text_cache_dir}, "
+            f"local_files_only={text_local_files_only}"
+        )
  
     vq_model = load_model_from_config(config)
+    if text_conditioning_on:
+        vq_model.configure_text_conditioning(
+            text_feature_dim=text_feature_dim,
+            text_projection=text_conditioning_cfg.get("text_projection", "linear_layernorm"),
+            text_type_embedding=text_conditioning_cfg.get("text_type_embedding", True),
+        )
 
     # create and load model
     logger.info(f"VQ Model Parameters(training): {sum(p.numel() for p in vq_model.parameters()):,}")
@@ -630,6 +739,7 @@ def main(args):
     # Prepare models for training:
     ######################################
     pretrain_loaded_flag = False
+    skip_model_optimizer_load = args.finetune and text_conditioning_on
     if args.vq_ckpt:
         checkpoint = torch.load(args.vq_ckpt, map_location="cpu")
         custom_load(vq_model, checkpoint["model"])
@@ -637,7 +747,10 @@ def main(args):
         if args.ema:
             # ema.load_state_dict(checkpoint["ema"])
             custom_load(ema, checkpoint["ema"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        if skip_model_optimizer_load:
+            logger.info("Skipping model optimizer state for text-conditioned finetune.")
+        else:
+            optimizer.load_state_dict(checkpoint["optimizer"])
         vq_loss.discriminator.load_state_dict(checkpoint["discriminator"])
         optimizer_disc.load_state_dict(checkpoint["optimizer_disc"])
         if not args.finetune:
@@ -719,7 +832,10 @@ def main(args):
         if args.ema:
             # ema.load_state_dict(checkpoint["ema"])
             custom_load(ema, checkpoint["ema"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        if skip_model_optimizer_load:
+            logger.info("Skipping model optimizer state for text-conditioned init checkpoint.")
+        else:
+            optimizer.load_state_dict(checkpoint["optimizer"])
         try:
             vq_loss.discriminator.load_state_dict(checkpoint["discriminator"])
             optimizer_disc.load_state_dict(checkpoint["optimizer_disc"])
@@ -743,19 +859,21 @@ def main(args):
         if args.ema:
             update_ema(ema, vq_model, decay=0)  # Ensure EMA is initialized with synced weights
 
-    if freeze_encoder or freeze_quantizer or freeze_codebook:
+    if freeze_encoder or freeze_quantizer or freeze_codebook or freeze_post_quant_conv:
         if not pretrain_loaded_flag:
             raise ValueError("decoder-only finetune requires a pretrained checkpoint or an existing resume checkpoint.")
         vq_model.apply_stage1_finetune_freeze(
             freeze_encoder=freeze_encoder,
             freeze_quantizer=freeze_quantizer,
             freeze_codebook=freeze_codebook,
+            freeze_post_quant_conv=freeze_post_quant_conv,
         )
         trainable_params = sum(p.numel() for p in vq_model.parameters() if p.requires_grad)
         frozen_params = sum(p.numel() for p in vq_model.parameters() if not p.requires_grad)
         logger.info(
             f"Stage-1 finetune freeze: freeze_encoder={freeze_encoder}, "
             f"freeze_quantizer={freeze_quantizer}, freeze_codebook={freeze_codebook}, "
+            f"freeze_post_quant_conv={freeze_post_quant_conv}, "
             f"trainable_params={trainable_params:,}, frozen_params={frozen_params:,}"
         )
     
@@ -785,6 +903,18 @@ def main(args):
         assert causal_type is None
     
     decoder_num_layers = vq_model.s1to2decoder.num_layers
+    text_layer_pairs = None
+    text_hr_image_token_len = int(text_hr_cfg.get("image_token_len", vq_model.config.num_latent_tokens))
+    if text_conditioning_on:
+        text_layer_pairs = build_text_layer_pairs(
+            text_hr_cfg,
+            decoder_num_layers=decoder_num_layers,
+            text_num_layers=text_encoder_num_layers,
+        )
+        logger.info(
+            f"Text-conditioned decoder layer pairs [t5_layer, decoder_layer]={text_layer_pairs}; "
+            f"image_token_len={text_hr_image_token_len}"
+        )
     if args.compile:
         logger.info("compiling the model... (may take several minutes)")
         vq_model = torch.compile(vq_model) # requires PyTorch 2.0        
@@ -908,7 +1038,54 @@ def main(args):
             else:
                 num_en_q_level = None
 
-            if hr_on:
+            selected_text_layer = None
+            decoder_text_features = None
+            decoder_text_key_padding_mask = None
+            text_attention_mask = None
+
+            if text_conditioning_on:
+                pair_rng = random.Random(train_steps + 1 + args.global_seed)
+                if text_hr_cfg.get("random_one_pair_per_step", True):
+                    selected_text_layer, selected_decoder_layer = text_layer_pairs[
+                        pair_rng.randrange(len(text_layer_pairs))
+                    ]
+                else:
+                    selected_text_layer, selected_decoder_layer = text_layer_pairs[0]
+
+                if not isinstance(y, (list, tuple)):
+                    raise TypeError(
+                        "text_conditioning.enabled=True requires the dataset to return a batch of text strings."
+                    )
+                texts = [str(text) for text in y]
+                text_inputs = text_tokenizer(
+                    texts,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=text_max_length,
+                    return_tensors="pt",
+                )
+                input_ids = text_inputs["input_ids"].to(device, non_blocking=True)
+                text_attention_mask = text_inputs["attention_mask"].to(device, non_blocking=True)
+                decoder_text_key_padding_mask = ~text_attention_mask.bool()
+                with torch.no_grad():
+                    with autocast_context(args.device_backend, args.mixed_precision, dtype=ptdtype):
+                        text_outputs = text_encoder(
+                            input_ids=input_ids,
+                            attention_mask=text_attention_mask,
+                            output_hidden_states=True,
+                            return_dict=True,
+                        )
+                hidden_states = text_outputs.hidden_states
+                if hidden_states is None:
+                    raise RuntimeError("T5 encoder did not return hidden_states.")
+                hidden_state_index = selected_text_layer + 1
+                if hidden_state_index >= len(hidden_states):
+                    raise ValueError(
+                        f"selected_text_layer={selected_text_layer} maps to hidden_states[{hidden_state_index}], "
+                        f"but T5 returned only {len(hidden_states)} hidden states."
+                    )
+                decoder_text_features = hidden_states[hidden_state_index].detach()
+            elif hr_on:
                 if hr_random_one_layer:
                     layer_rng = random.Random(train_steps + 1 + args.global_seed)
                     selected_decoder_layer = layer_rng.randrange(decoder_num_layers)
@@ -970,8 +1147,10 @@ def main(args):
                         global_step=train_steps+1,
                         max_steps=total_steps,
                         selected_decoder_layer=selected_decoder_layer,
+                        decoder_text_features=decoder_text_features,
+                        decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                     )
-                    if hr_on:
+                    if selected_decoder_layer is not None:
                         recons_imgs, inter_loss_set, inner_feat, hr_attn_weights = vq_outputs
                     else:
                         recons_imgs, inter_loss_set, inner_feat = vq_outputs
@@ -987,8 +1166,10 @@ def main(args):
                         global_step=train_steps+1,
                         max_steps=total_steps,
                         selected_decoder_layer=selected_decoder_layer,
+                        decoder_text_features=decoder_text_features,
+                        decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                     )
-                    if hr_on:
+                    if selected_decoder_layer is not None:
                         recons_imgs, inter_loss_set, hr_attn_weights = vq_outputs
                     else:
                         recons_imgs, inter_loss_set = vq_outputs
@@ -1000,9 +1181,16 @@ def main(args):
                                    causal_type=causal_type, num_en_q_level=num_en_q_level,
                                    inner_feat=inner_feat,
                                    sem_enc_feat=z,
-                                   hr_attn_weights=hr_attn_weights,
+                                   hr_attn_weights=hr_attn_weights if hr_on else None,
                                    hr_loss_weight=hr_loss_weight if hr_on else 0.0,
                                    selected_layer=selected_decoder_layer,
+                                   text_hr_attn_weights=hr_attn_weights if text_hr_on else None,
+                                   text_attention_mask=text_attention_mask if text_hr_on else None,
+                                   text_hr_loss_weight=text_hr_loss_weight if text_hr_on else 0.0,
+                                   selected_text_layer=selected_text_layer,
+                                   text_hr_tau=text_hr_tau,
+                                   text_hr_skip_if_valid_tokens_lt=text_hr_skip_if_valid_tokens_lt,
+                                   text_hr_image_token_len=text_hr_image_token_len,
                                    )
             
             if train_steps + 1 >= int(config["loss"]["params"].get("gen_start", 0)):
@@ -1265,6 +1453,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default='imagenet')
     parser.add_argument("--json-path", type=str,
                         help="When given json path for dataset, all the images in the json will be used for training.")
+    parser.add_argument("--max-images", type=int, default=0, help="Limit training images for manifest datasets. 0 means all rows.")
 
     # training configs
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)

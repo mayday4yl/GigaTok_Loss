@@ -3,6 +3,7 @@ from dataset.coco import build_coco
 from dataset.openimage import build_openimage, build_mix_img_only
 from dataset.pexels import build_pexels
 from dataset.t2i import build_t2i, build_t2i_code, build_t2i_image
+from dataset.textatlas import build_textatlas_image_text
 
 
 def build_dataset(args, **kwargs):
@@ -23,6 +24,8 @@ def build_dataset(args, **kwargs):
         return build_t2i(args, **kwargs)
     if args.dataset == 't2i_code':
         return build_t2i_code(args, **kwargs)
+    if args.dataset == 'textatlas_image_text':
+        return build_textatlas_image_text(args, **kwargs)
     if args.dataset == 'imagenet_openimage':
         return build_mix_img_only(args, **kwargs)
     

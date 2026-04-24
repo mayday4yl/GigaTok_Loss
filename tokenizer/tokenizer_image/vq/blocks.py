@@ -1569,6 +1569,8 @@ class ViTDecoder(nn.Module):
             ret_inner_feat=False,   # return inner feature(through mlp) for distillation
             return_feat=False,      # return feature for linear probe
             selected_decoder_layer=None,
+            text_memory=None,
+            text_key_padding_mask=None,
             ):
         assert selected_decoder_layer is None or not return_feat, \
             "selected_decoder_layer is not supported with return_feat=True"
@@ -1619,12 +1621,44 @@ class ViTDecoder(nn.Module):
         query_pos = self.positional_embedding.repeat(1, bs, 1).to(x.dtype) # shape = [*, grid ** 2 + 1, width]
         pos_embed = self.latent_token_positional_embedding[:selected_latent_tokens].repeat(1, bs, 1).to(x.dtype)
 
+        text_memory_lnd = None
+        text_memory_key_padding_mask = None
+        if text_memory is not None:
+            assert selected_decoder_layer is not None, \
+                "text_memory injection requires selected_decoder_layer"
+            assert text_memory.dim() == 3, f"Invalid text_memory shape: {text_memory.shape}"
+            assert text_memory.shape[0] == bs, \
+                f"text_memory batch={text_memory.shape[0]} does not match decoder batch={bs}"
+            assert text_memory.shape[2] == self.width, \
+                f"text_memory width={text_memory.shape[2]} does not match decoder width={self.width}"
+            text_memory_lnd = text_memory.to(device=x.device, dtype=x.dtype).permute(1, 0, 2)
+            if text_key_padding_mask is not None:
+                text_memory_key_padding_mask = text_key_padding_mask.to(device=x.device, dtype=torch.bool)
+                assert text_memory_key_padding_mask.shape == text_memory.shape[:2], \
+                    f"text_key_padding_mask shape={text_memory_key_padding_mask.shape}, expected={text_memory.shape[:2]}"
+
         selected_cross_attn_weights = None
         for i in range(self.num_layers):
             return_cross_attn_weights = selected_decoder_layer == i
+            layer_memory = x
+            layer_pos_embed = pos_embed
+            layer_memory_key_padding_mask = None
+            if text_memory_lnd is not None and return_cross_attn_weights:
+                layer_memory = torch.cat([x, text_memory_lnd], dim=0)
+                layer_pos_embed = torch.cat([pos_embed, torch.zeros_like(text_memory_lnd)], dim=0)
+                image_key_padding_mask = torch.zeros(
+                    (bs, selected_latent_tokens), device=x.device, dtype=torch.bool)
+                if text_memory_key_padding_mask is None:
+                    text_padding = torch.zeros(
+                        (bs, text_memory_lnd.shape[0]), device=x.device, dtype=torch.bool)
+                else:
+                    text_padding = text_memory_key_padding_mask
+                layer_memory_key_padding_mask = torch.cat(
+                    [image_key_padding_mask, text_padding], dim=1)
             if return_cross_attn_weights:
                 latent_tokens, selected_cross_attn_weights = self.transformer[i](
-                    latent_tokens, x, pos=pos_embed, query_pos=query_pos,
+                    latent_tokens, layer_memory, pos=layer_pos_embed, query_pos=query_pos,
+                    memory_key_padding_mask=layer_memory_key_padding_mask,
                     return_cross_attn_weights=True)
             else:
                 latent_tokens = self.transformer[i](latent_tokens, x, pos=pos_embed, query_pos=query_pos)

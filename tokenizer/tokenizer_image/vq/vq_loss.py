@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import os
+import math
 import numpy as np
 
 from tokenizer.tokenizer_image.lpips import ResNet50ImgSim, LPIPS, DinoV2ImgSim
@@ -145,6 +146,81 @@ def high_rank_attention_loss(attn_weights, eps=1e-6):
         spectrum_uniformity = torch.ones((), device=attn_weights.device, dtype=hr_loss.dtype)
 
     return hr_loss, spectrum_uniformity
+
+
+def high_rank_image_text_attention_loss(
+        attn_weights,
+        text_attention_mask,
+        image_token_len=256,
+        tau=1.0,
+        skip_if_valid_tokens_lt=2):
+    if attn_weights.dim() != 4:
+        raise ValueError(f"Expected attention shape [B, H, Q, K], got {attn_weights.shape}")
+    if text_attention_mask is None:
+        raise ValueError("text_attention_mask is required for image-to-text HR loss.")
+
+    batch_size, num_heads, num_queries, num_keys = attn_weights.shape
+    text_attention_mask = text_attention_mask.to(device=attn_weights.device, dtype=torch.bool)
+    if text_attention_mask.dim() != 2 or text_attention_mask.shape[0] != batch_size:
+        raise ValueError(
+            f"Expected text_attention_mask shape [B, T], got {text_attention_mask.shape} "
+            f"for attention batch={batch_size}"
+        )
+
+    text_token_len = text_attention_mask.shape[1]
+    if num_keys < image_token_len + text_token_len:
+        raise ValueError(
+            f"Attention key length {num_keys} is smaller than image_token_len + text_token_len "
+            f"({image_token_len} + {text_token_len})."
+        )
+
+    text_attn = attn_weights[:, :, :, image_token_len:image_token_len + text_token_len]
+    losses = []
+    sigma_means = []
+    sigma_mins = []
+    sigma_maxs = []
+    valid_token_counts = []
+    skipped_samples = 0
+
+    for batch_idx in range(batch_size):
+        valid_mask = text_attention_mask[batch_idx]
+        valid_token_count = int(valid_mask.sum().item())
+        if valid_token_count < skip_if_valid_tokens_lt:
+            skipped_samples += 1
+            continue
+
+        matrix = text_attn[batch_idx, :, :, valid_mask]
+        matrix = matrix.reshape(num_heads * num_queries, valid_token_count) / math.sqrt(num_heads)
+        sigma = torch.linalg.svdvals(matrix.float())
+        losses.append(torch.abs(sigma - sigma.new_tensor(tau)).mean())
+        sigma_means.append(sigma.detach().mean())
+        sigma_mins.append(sigma.detach().min())
+        sigma_maxs.append(sigma.detach().max())
+        valid_token_counts.append(valid_token_count)
+
+    if not losses:
+        zero = attn_weights.sum() * 0.0
+        stats = {
+            "sigma_mean": zero.detach(),
+            "sigma_min": zero.detach(),
+            "sigma_max": zero.detach(),
+            "valid_text_tokens_mean": zero.detach(),
+            "valid_samples": 0,
+            "skipped_samples": skipped_samples,
+        }
+        return zero, stats
+
+    hr_loss = torch.stack(losses).mean()
+    valid_tokens = torch.tensor(valid_token_counts, device=attn_weights.device, dtype=torch.float32)
+    stats = {
+        "sigma_mean": torch.stack(sigma_means).mean(),
+        "sigma_min": torch.stack(sigma_mins).mean(),
+        "sigma_max": torch.stack(sigma_maxs).mean(),
+        "valid_text_tokens_mean": valid_tokens.mean(),
+        "valid_samples": len(losses),
+        "skipped_samples": skipped_samples,
+    }
+    return hr_loss, stats
 
 # LeCam Regularziation loss
 # from https://github.com/google/lecam-gan/
@@ -343,7 +419,10 @@ class VQLoss(nn.Module):
     def forward(self, inter_loss_set, inputs, all_reconstructions, optimizer_idx, global_step, exp_dir, last_layer=None, 
                 logger=None, log_every=100, ckpt_every=500, num_en_q_level=None, causal_type=None,
                 check_nan_loss=True, inner_feat=None, sem_enc_feat=None,
-                hr_attn_weights=None, hr_loss_weight=0.0, selected_layer=None, hr_eps=1e-6
+                hr_attn_weights=None, hr_loss_weight=0.0, selected_layer=None, hr_eps=1e-6,
+                text_hr_attn_weights=None, text_attention_mask=None, text_hr_loss_weight=0.0,
+                selected_text_layer=None, text_hr_tau=1.0,
+                text_hr_skip_if_valid_tokens_lt=2, text_hr_image_token_len=256
                 ):
         assert len(inter_loss_set) == 2
         assert isinstance(all_reconstructions, list)
@@ -475,10 +554,25 @@ class VQLoss(nn.Module):
                 raise ValueError("hr_loss_weight is non-zero but hr_attn_weights is None.")
 
             hr_loss_term = hr_loss_weight * hr_loss if hr_loss is not None else 0.0
+            text_hr_loss = None
+            text_hr_stats = {}
+            if text_hr_attn_weights is not None:
+                text_hr_loss, text_hr_stats = high_rank_image_text_attention_loss(
+                    text_hr_attn_weights,
+                    text_attention_mask=text_attention_mask,
+                    image_token_len=text_hr_image_token_len,
+                    tau=text_hr_tau,
+                    skip_if_valid_tokens_lt=text_hr_skip_if_valid_tokens_lt,
+                )
+            elif text_hr_loss_weight != 0:
+                raise ValueError("text_hr_loss_weight is non-zero but text_hr_attn_weights is None.")
+
+            text_hr_loss_term = text_hr_loss_weight * text_hr_loss if text_hr_loss is not None else 0.0
             loss = self.rec_weight * (rec_loss + direct_rec_loss) + \
                 self.perceptual_weight * (p_loss + direct_p_loss) + \
                 disc_adaptive_weight * disc_weight * (generator_adv_loss + direct_generator_adv_loss) + \
-                codebook_loss_sum + feature_rec_loss + self.proj_weight * proj_loss + hr_loss_term
+                codebook_loss_sum + feature_rec_loss + self.proj_weight * proj_loss + \
+                hr_loss_term + text_hr_loss_term
 
             if check_nan_loss:
                 if torch.isnan(loss).any():
@@ -502,6 +596,14 @@ class VQLoss(nn.Module):
                         error_info += (
                             f"hr_loss: {hr_loss:.4e}, hr_loss_weight: {hr_loss_weight:.4e}, "
                             f"selected_layer: {selected_layer}, hr_spectrum_uniformity: {hr_spectrum_uniformity:.4f}\n"
+                        )
+                    if text_hr_loss is not None:
+                        error_info += (
+                            f"text_hr_loss: {text_hr_loss:.4e}, text_hr_loss_weight: {text_hr_loss_weight:.4e}, "
+                            f"selected_decoder_layer: {selected_layer}, selected_text_layer: {selected_text_layer}, "
+                            f"text_hr_sigma_mean: {text_hr_stats['sigma_mean']:.4e}, "
+                            f"text_hr_valid_text_tokens_mean: {text_hr_stats['valid_text_tokens_mean']:.2f}, "
+                            f"text_hr_skipped_samples: {text_hr_stats['skipped_samples']}\n"
                         )
                     get_ip_cmd = """hostname -I | awk '{split($0, a, " "); print a[1]}'"""
                     ip_addr = os.popen(get_ip_cmd).read().strip()
@@ -527,6 +629,14 @@ class VQLoss(nn.Module):
                 if hr_loss is not None:
                     log_msg += (f", hr_loss: {hr_loss:.4e}, weighted_hr_loss: {hr_loss_term:.4e}, "
                                 f"selected_layer: {selected_layer}, hr_spectrum_uniformity: {hr_spectrum_uniformity:.4f}")
+                if text_hr_loss is not None:
+                    log_msg += (
+                        f", text_hr_loss: {text_hr_loss:.4e}, weighted_text_hr_loss: {text_hr_loss_term:.4e}, "
+                        f"selected_decoder_layer: {selected_layer}, selected_text_layer: {selected_text_layer}, "
+                        f"text_hr_sigma_mean: {text_hr_stats['sigma_mean']:.4e}, "
+                        f"text_hr_valid_text_tokens_mean: {text_hr_stats['valid_text_tokens_mean']:.2f}, "
+                        f"text_hr_skipped_samples: {text_hr_stats['skipped_samples']}"
+                    )
                 logger.info(log_msg)
 
                 # update to wandb
@@ -552,6 +662,19 @@ class VQLoss(nn.Module):
                         "(Generator)weighted_hr_loss": hr_loss_term.detach(),
                         "(Generator)hr_selected_layer": selected_layer,
                         "(Generator)hr_spectrum_uniformity": hr_spectrum_uniformity.detach(),
+                    })
+                if text_hr_loss is not None:
+                    update_info.update({
+                        "(Generator)text_hr_loss": text_hr_loss.detach(),
+                        "(Generator)weighted_text_hr_loss": text_hr_loss_term.detach(),
+                        "(Generator)text_hr_selected_decoder_layer": selected_layer,
+                        "(Generator)text_hr_selected_text_layer": selected_text_layer,
+                        "(Generator)text_hr_sigma_mean": text_hr_stats["sigma_mean"].detach(),
+                        "(Generator)text_hr_sigma_min": text_hr_stats["sigma_min"].detach(),
+                        "(Generator)text_hr_sigma_max": text_hr_stats["sigma_max"].detach(),
+                        "(Generator)text_hr_valid_text_tokens_mean": text_hr_stats["valid_text_tokens_mean"].detach(),
+                        "(Generator)text_hr_valid_samples": text_hr_stats["valid_samples"],
+                        "(Generator)text_hr_skipped_samples": text_hr_stats["skipped_samples"],
                     })
 
                 # if proj_loss > 0:

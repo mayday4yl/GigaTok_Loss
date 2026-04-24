@@ -1,0 +1,123 @@
+model:
+  model_cls: VQVitModelPlus
+  init_args:
+    codebook_size: 16384
+    codebook_embed_dim: 8
+    codebook_l2_norm: True
+    codebook_show_usage: True
+    commit_loss_beta: 0.25
+    entropy_loss_ratio: 0.0
+
+    encoder_ch_mult: [1, 1, 2, 2, 4]
+    decoder_ch_mult: [1, 1, 2, 2, 4]
+    model_size: null
+    encoder_size: "base"
+    decoder_size: "large"
+    num_latent_tokens: 256
+    z_channels: 256
+    dropout_p: 0.0
+
+    multi_level_query_init: True
+
+    last_level_2d_query_init: False
+    multi_level_2d_query_init: False
+
+    adaptive_gn: True
+    d2s_up: True
+    rot: True
+
+    use_attn: False
+
+    fea_rec_loss_type: "mse"
+    fea_rec_loss_weight: 1.0
+
+    distill_depth: 3
+
+  causal_settings:
+    causal_type: null
+    dynamic_length_train: False
+    dynamic_level_range: null
+    min_level: 0
+
+trainer:
+  global_batch_size: 256
+  lr: 1e-4
+  lr_scheduler: "cosine_v2"
+  end_lr: 1e-5
+
+  optimizer: "AdamW"
+  global_seed: 0
+  warmup: 0
+  weight_decay: 1e-4
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 10.0
+
+  distill_loss: True
+  hr_on: False
+  hr_loss_weight: 0.0
+  hr_random_one_layer: True
+  freeze_encoder: True
+  freeze_quantizer: True
+  freeze_codebook: True
+  freeze_post_quant_conv: True
+
+text_conditioning:
+  enabled: True
+  # Can be a Hugging Face model id or a local directory that contains T5 files.
+  encoder_name: "google/t5-v1_1-xl"
+  cache_dir: null
+  local_files_only: False
+  max_length: 128
+  freeze: True
+  output_hidden_states: True
+  exclude_embedding_output: True
+  text_projection: "linear_layernorm"
+  text_type_embedding: True
+  text_position_embedding: False
+
+text_hr:
+  enabled: True
+  hr_loss_weight: 1.0
+  tau: 1.0
+  image_token_len: 256
+  layer_strategy: "explicit_pairs"
+  # Each pair is [t5_encoder_layer, gigatok_decoder_layer], 0-based.
+  # T5 hidden_states[0] is the embedding output and is excluded in code.
+  layer_pairs:
+    - [8, 8]
+    - [9, 9]
+    - [10, 10]
+    - [11, 11]
+    - [12, 12]
+    - [13, 13]
+    - [14, 14]
+    - [15, 15]
+  random_one_pair_per_step: True
+  attention_source: "post_softmax"
+  matrix: "image_to_text_attention"
+  mask_padding_before_svd: True
+  svd_mode: "per_sample_all_heads_sqrt_norm"
+  skip_if_valid_tokens_lt: 2
+
+loss:
+  loss_cls: VQLoss
+  params:
+    disc_start: 80000
+    disc_weight: 0.5
+    disc_type: "dinodisc"
+    disc_loss: "hinge"
+    disc_dim: 64
+    kw: 4
+    norm: "batch"
+    gen_adv_loss: "hinge"
+    image_size: 256
+    perceptual_weight: 1.0
+    reconstruction_weight: 1.0
+    reconstruction_loss: "l2"
+    codebook_weight: 1.0
+    aux_loss_end: 15000
+    use_direct_rec_loss: True
+    resnet_perceptual: False
+    blur_ds: False
+    lecam: False
