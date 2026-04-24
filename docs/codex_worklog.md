@@ -730,3 +730,25 @@ python scripts/stage1/refresh_textatlas_rendered_text.py \
 - 本地样例测试覆盖 `CleanTextSynth`、`StyledTextSynth`、`TextVisionBlend`、`TextScenesHQ`、`LongWordsSubset-A`，抽取结果符合预期。
 - 已运行 `python3 -m py_compile` 检查相关脚本，语法通过。
 - 已运行 `git diff --check`，无 whitespace error。
+
+# 2026-04-25 TextAtlas rendered-text parser hardening
+
+## 修补内容
+- `LongWordsSubset-A` 的 annotation 模板比初版覆盖面更散，已改成 marker-based parser，覆盖 `plus`、`adding`、`including`、`seeing`、`discern`、`we find`、`with ...`、`, text ...` 等可见文字列表模板。
+- `StyledTextSynth` 增补：
+  - `with text ''...''`
+  - narrative 形式的 `text reads/states/continues`
+  - 新闻标题类的多段双引号
+  - 极少数 blank poster / empty text 标记为 `styled_no_explicit_text`
+- `TextVisionBlend` 中没有独立 `For text elements` 条目的少量样本标记为 `textvision_no_explicit_text`，不伪造文本。
+- Dataset 和 manifest checker 只允许上述 no-explicit-text 状态为空文本；其它空文本仍然报错。
+
+## 服务器验证和产物
+- 已在 ModelArts 对旧 manifest 运行 dry-run：
+  - train `300000` 行，`error_count=0`
+  - val `10000` 行，`error_count=0`
+  - holdout `2500` 行，`error_count=0`
+- 已正式生成：
+  - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/manifest/train_materialized_manifest_v2text.jsonl`
+  - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/manifest/val_materialized_manifest_v2text.jsonl`
+  - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/manifest_holdout_eval/holdout_materialized_manifest_v2text.jsonl`

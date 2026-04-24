@@ -12,6 +12,10 @@ PROMPT_TEXT_PATTERNS = (
     r"showing\s+the\s+text\s*[:：]",
     r"containing\s+the\s+text\s*[:：]",
 )
+ALLOWED_EMPTY_TEXT_STATUSES = {
+    "styled_no_explicit_text",
+    "textvision_no_explicit_text",
+}
 
 
 def looks_like_raw_prompt(text):
@@ -34,11 +38,11 @@ class TextAtlasImageTextDataset(Dataset):
                 if "text" not in row:
                     raise ValueError(f"{manifest_path}:{line_no}: missing text")
                 text = str(row.get("text") or "").strip()
-                if not text:
+                status = str(row.get("text_extraction_status") or "")
+                if not text and status not in ALLOWED_EMPTY_TEXT_STATUSES:
                     raise ValueError(f"{manifest_path}:{line_no}: empty text")
                 if looks_like_raw_prompt(text):
                     raise ValueError(f"{manifest_path}:{line_no}: text looks like raw prompt, not rendered text")
-                status = str(row.get("text_extraction_status") or "")
                 raw_annotation = str(row.get("raw_annotation") or "").strip()
                 if (
                     raw_annotation and row.get("text_source") != "raw_text"

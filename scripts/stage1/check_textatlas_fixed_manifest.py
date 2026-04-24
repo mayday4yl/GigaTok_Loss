@@ -17,6 +17,7 @@ from textatlas_manifest_utils import (
     KNOWN_TEXTATLAS_SUBSETS,
     SOURCE_ONLY_REQUIRED_FIELDS,
     TEXT_SOURCE_BY_SUBSET,
+    is_allowed_empty_text_status,
 )
 
 
@@ -246,7 +247,11 @@ def validate_materialized_split(
             )
         text = str(row.get("text") or "").strip()
         raw_annotation = str(row.get("raw_annotation") or "").strip()
-        require(bool(text), errors, f"{split} row {idx} subset={subset} has empty text")
+        require(
+            bool(text) or is_allowed_empty_text_status(extraction_status),
+            errors,
+            f"{split} row {idx} subset={subset} has empty text",
+        )
         require(
             not (extraction_status.startswith("failed") or "_failed" in extraction_status),
             errors,

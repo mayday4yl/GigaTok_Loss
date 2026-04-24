@@ -75,6 +75,10 @@ PROMPT_INDICATORS = (
     "poster",
     "sign",
 )
+ALLOWED_EMPTY_TEXT_STATUSES = {
+    "styled_no_explicit_text",
+    "textvision_no_explicit_text",
+}
 _PIL_IMAGE = None
 
 
@@ -269,6 +273,10 @@ def strip_text_wrappers(text: str) -> str:
     return text.strip()
 
 
+def is_allowed_empty_text_status(status: str) -> bool:
+    return status in ALLOWED_EMPTY_TEXT_STATUSES
+
+
 def join_extracted_texts(texts: Sequence[str]) -> str:
     output: List[str] = []
     seen = set()
@@ -288,10 +296,14 @@ def join_extracted_texts(texts: Sequence[str]) -> str:
 def parse_the_text_clauses(text: str) -> List[str]:
     clauses: List[str] = []
     patterns = (
-        r"the\s+text\s*[:：]\s*''(.*?)''",
-        r'the\s+text\s*[:：]\s*""(.*?)""',
-        r"the\s+text\s*[:：]\s*'([^']+)'",
-        r'the\s+text\s*[:：]\s*"([^"]+)"',
+        r"(?:the\s+)?text\s*[:：]\s*''(.*?)''",
+        r'(?:the\s+)?text\s*[:：]\s*""(.*?)""',
+        r"(?:the\s+)?text\s*[:：]\s*'([^']+)'",
+        r'(?:the\s+)?text\s*[:：]\s*"([^"]+)"',
+        r"\bwith\s+(?:the\s+)?text\s+''(.*?)''",
+        r'\bwith\s+(?:the\s+)?text\s+""(.*?)""',
+        r"\bwith\s+(?:the\s+)?text\s+'([^']+)'",
+        r'\bwith\s+(?:the\s+)?text\s+"([^"]+)"',
     )
     for pattern in patterns:
         clauses.extend(match.group(1) for match in re.finditer(pattern, text, flags=re.IGNORECASE | re.DOTALL))
@@ -302,23 +314,64 @@ def parse_clean_text_synth(annotation: str) -> Tuple[str, str]:
     marker = re.search(r"displaying\s+the\s+text\s*[:：]\s*", annotation, flags=re.IGNORECASE)
     if marker is None:
         return "", "failed_clean_marker"
-    return strip_text_wrappers(annotation[marker.end():]), "clean_displaying_text"
+    rendered = annotation[marker.end():].strip()
+    text = strip_text_wrappers(rendered)
+    if text:
+        return text, "clean_displaying_text"
+    if rendered:
+        return rendered, "clean_displaying_text"
+    return "", "failed_clean_empty_text"
 
 
 def parse_styled_text_synth(annotation: str) -> Tuple[str, str]:
-    clauses = parse_the_text_clauses(annotation)
+    explicit_clauses = parse_the_text_clauses(annotation)
+    clauses = list(explicit_clauses)
     if not clauses:
         quoted_after_marker = re.findall(
-            r"(?:text\s+reads|that\s+reads|reads|says)\s*[:：]?\s*\"([^\"]+)\"",
+            r"(?:text\s+reads|that\s+reads|reads|says)\s*[:：,]?\s*\"([^\"]+)\"",
             annotation,
             flags=re.IGNORECASE | re.DOTALL,
         )
         for quoted in quoted_after_marker:
             nested = parse_the_text_clauses(quoted)
             clauses.extend(nested if nested else [quoted])
+    if not clauses:
+        clauses.extend(
+            match.group(1)
+            for match in re.finditer(
+                r"\btext\b[^.]{0,160}?\b(?:reads|states|continues)\b\s*[:：,]?\s*\"([^\"]+)\"",
+                annotation,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        )
+    if not clauses:
+        open_quote = re.search(r"\breads\s*[:：]\s*\"(.+)$", annotation, flags=re.IGNORECASE | re.DOTALL)
+        if open_quote is not None:
+            clauses.append(open_quote.group(1))
+    if not clauses:
+        clauses.extend(
+            match.group(1)
+            for match in re.finditer(
+                r"\bwords?\b[^.]{0,160}?\b(?:are|located|shown)?\b[^.]{0,80}?\"([^\"]+)\"",
+                annotation,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+        )
+    if (
+        not explicit_clauses
+        and re.search(r"\b(?:text|words?)\b|\bare\s+in\b|^\"", annotation, flags=re.IGNORECASE)
+    ):
+        clauses.extend(re.findall(r"\"([^\"]+)\"", annotation))
     text = join_extracted_texts(clauses)
     if text:
         return text, "styled_text_clauses"
+    words_marker = re.search(r"\bThe\s+words\s+are\b", annotation, flags=re.IGNORECASE)
+    if words_marker is not None:
+        prefix = strip_text_wrappers(annotation[: words_marker.start()])
+        if prefix:
+            return prefix, "styled_words_prefix"
+    if re.search(r"the\s+text\s*[:：]\s*'{4}", annotation, flags=re.IGNORECASE):
+        return "", "styled_no_explicit_text"
     return "", "failed_styled_parse"
 
 
@@ -333,25 +386,121 @@ def parse_text_vision_blend(annotation: str) -> Tuple[str, str]:
     text = join_extracted_texts(clauses)
     if text:
         return text, "textvision_text_elements"
+    if marker is not None and re.search(r"For text elements[^\n]*:\s*$", section, flags=re.IGNORECASE):
+        return "", "textvision_no_explicit_text"
     return "", "failed_textvision_parse"
 
 
-def parse_long_words_subset(annotation: str) -> Tuple[str, str]:
-    patterns = (
-        r"with\s+text\s+reading\s+(.+?)(?:\.|$)",
-        r"text\s+reading\s+(.+?)(?:\.|$)",
-        r"we\s+note\s+(.+?)\s+visible(?:\.|$)",
-        r"along\s+with\s+visible\s+(.+?)(?:\.|$)",
-        r"\band\s+(.+?)\s+clearly\s+shown(?:\.|$)",
-        r"\band\s+(.+?)\s+text(?:\.|$)",
+def clean_long_words_text(text: str) -> str:
+    text = strip_text_wrappers(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = text.strip(" ,;:.")
+    text = re.sub(
+        r"^(?:the\s+)?(?:text|words?|textual\s+content)\s+"
+        r"(?:(?:present\s+)?(?:is|are)|shown\s+as|shown\s+are)?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
     )
-    for pattern in patterns:
-        match = re.search(pattern, annotation, flags=re.IGNORECASE | re.DOTALL)
-        if match is not None:
-            text = strip_text_wrappers(match.group(1))
-            text = re.sub(r"\s+", " ", text).strip()
-            if text:
-                return text, "longwords_pattern"
+    text = re.sub(
+        r"\s+(?:clearly\s+shown|readable|displayed|included|visible|present|too|shown|"
+        r"appearing|appears|appear\s+together|reading|evident|expressed|inscribed|"
+        r"emerge|emerges|convey|text|textual\s+content|as\s+text|text\s+stands\s+out|text\s+appears|"
+        r"is\s+noted|is\s+present|is\s+shown)\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r",?\s+and\s*$", "", text, flags=re.IGNORECASE)
+    return text.strip(" ,;:")
+
+
+def is_plausible_long_words_text(text: str, *, allow_phrase: bool = False) -> bool:
+    if not text or len(text) > 360:
+        return False
+    if "," in text:
+        return True
+    words = text.split()
+    return allow_phrase and 1 <= len(words) <= 24
+
+
+LONG_WORDS_MARKERS: Tuple[Tuple[str, str, bool], ...] = (
+    ("with text shown as", "longwords_text_marker", True),
+    ("with text that states", "longwords_text_marker", True),
+    ("and text present is", "longwords_text_marker", True),
+    ("and the text is", "longwords_text_marker", True),
+    ("and the text", "longwords_text_marker", True),
+    ("and text is", "longwords_text_marker", True),
+    ("and text", "longwords_text_marker", True),
+    (", text", "longwords_text_marker", True),
+    ("featuring the words", "longwords_words_marker", True),
+    ("words shown are", "longwords_words_marker", True),
+    ("with the words", "longwords_words_marker", True),
+    ("with words", "longwords_words_marker", True),
+    ("plus the text", "longwords_plus_marker", True),
+    ("plus textual", "longwords_plus_marker", True),
+    ("plus", "longwords_plus_marker", True),
+    ("adding", "longwords_adding_marker", True),
+    ("including", "longwords_including_marker", True),
+    ("reading", "longwords_reading_marker", True),
+    ("and we see", "longwords_read_marker", True),
+    ("and we read", "longwords_read_marker", True),
+    ("and we find", "longwords_read_marker", True),
+    ("we find words", "longwords_read_marker", True),
+    ("we find", "longwords_read_marker", True),
+    ("we note", "longwords_visibility_marker", True),
+    ("and identify", "longwords_read_marker", True),
+    ("seeing", "longwords_read_marker", True),
+    ("discern", "longwords_read_marker", True),
+    ("noticing", "longwords_read_marker", True),
+    ("along with visible", "longwords_along_with", True),
+    ("along with", "longwords_along_with", True),
+    ("alongside", "longwords_alongside", True),
+    ("accompanied by", "longwords_accompanied_by", True),
+    ("with printed", "longwords_with_marker", True),
+    ("with visible", "longwords_with_marker", True),
+    ("with textual", "longwords_with_marker", True),
+    ("with accompanying", "longwords_with_marker", True),
+    ("with noticeable words", "longwords_with_marker", True),
+    ("with", "longwords_with_marker", False),
+    ("together with", "longwords_with_marker", True),
+    ("the image also includes", "longwords_including_marker", True),
+    ("the image also shows", "longwords_including_marker", True),
+)
+
+
+def parse_long_words_subset(annotation: str) -> Tuple[str, str]:
+    normalized = re.sub(r"\s+", " ", annotation).strip()
+    lowered = normalized.lower()
+
+    marker_hits: List[Tuple[int, str, bool, str]] = []
+    for marker, status, allow_phrase in LONG_WORDS_MARKERS:
+        start = 0
+        while True:
+            idx = lowered.find(marker, start)
+            if idx < 0:
+                break
+            marker_hits.append((idx, status, allow_phrase, marker))
+            start = idx + len(marker)
+
+    for idx, status, allow_phrase, marker in sorted(marker_hits, key=lambda item: item[0], reverse=True):
+        candidate = clean_long_words_text(normalized[idx + len(marker):])
+        if is_plausible_long_words_text(candidate, allow_phrase=allow_phrase):
+            return candidate, status
+
+    for separator, reverse in ((", and ", False), (" and ", True), (", ", False)):
+        start = 0
+        hits: List[int] = []
+        while True:
+            idx = lowered.find(separator, start)
+            if idx < 0:
+                break
+            hits.append(idx)
+            start = idx + len(separator)
+        for idx in sorted(hits, reverse=reverse):
+            candidate = clean_long_words_text(normalized[idx + len(separator):])
+            if is_plausible_long_words_text(candidate):
+                return candidate, "longwords_comma_list"
 
     quoted = re.findall(r"[\"“”'‘’`]([^\"“”'‘’`]+)[\"“”'‘’`]", annotation)
     text = join_extracted_texts(quoted)
@@ -475,7 +624,7 @@ def materialize_source_record(
 
     subset = str(source_record["subset"])
     text, text_source, raw_annotation, text_extraction_status = get_text_fields(subset, row)
-    if not text:
+    if not text and not is_allowed_empty_text_status(text_extraction_status):
         raise ValueError(
             f"empty rendered text after extraction: subset={subset}, "
             f"text_source={text_source}, status={text_extraction_status}, raw_annotation={raw_annotation!r}"

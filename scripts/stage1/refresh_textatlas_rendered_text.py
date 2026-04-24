@@ -14,7 +14,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from textatlas_manifest_utils import get_text_fields
+from textatlas_manifest_utils import get_text_fields, is_allowed_empty_text_status
 
 
 PROMPT_TEXT_PATTERNS = (
@@ -117,7 +117,7 @@ def refresh_row(row: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     updated["raw_annotation"] = raw_annotation
     updated["text_extraction_status"] = status
 
-    if not text:
+    if not text and not is_allowed_empty_text_status(status):
         errors.append("empty extracted text")
     if status.startswith("failed") or "_failed" in status:
         errors.append(f"failed extraction status={status}")
