@@ -872,3 +872,34 @@ python scripts/stage1/prepare_t5_encoder.py \
 - 未生成新的 `.pt/.pth` checkpoint。
 - 服务器 repo 中有 Python import 产生的 `__pycache__` / `.pyc` 工作区痕迹；不影响训练，但需要保持 git clean 时可以清理。
 - `/tmp/gigatok_pycache` 是手动 `py_compile` 使用的临时 pycache，大小约 `824K`。
+
+# 2026-04-25 DINOv2 distill + text HR smoke
+
+## 已确认
+- ModelArts 已存在 DINOv2 本地缓存：
+  - repo: `/home/ma-user/work/GigaTok_hr/gigatok_persist/cache/torch/hub/facebookresearch_dinov2_main`
+  - weights: `/home/ma-user/work/GigaTok_hr/gigatok_persist/cache/torch/hub/checkpoints/dinov2_vitb14_pretrain.pth`
+- 使用：
+  - `TORCH_HOME=/home/ma-user/work/GigaTok_hr/gigatok_persist/cache/torch`
+  - `DINOV2_REPO_DIR=/home/ma-user/work/GigaTok_hr/gigatok_persist/cache/torch/hub/facebookresearch_dinov2_main`
+- 离线加载 `torch.hub.load(..., "dinov2_vitb14", source="local")` 成功，`embed_dim=768`。
+
+## 完整训练链路 smoke
+- baseline + distill smoke 跑通：
+  - output: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_smoke/baseline_2step_distill`
+  - `distill_loss=True`
+  - 2 steps 完成，最终日志 `Done!`
+- HR + distill smoke 跑通：
+  - output: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_smoke/hr_2step_distill`
+  - `distill_loss=True`
+  - `text_hr.enabled=True`
+  - 2 steps 完成，最终日志 `Done!`
+  - 日志出现 `text_hr_loss`、`weighted_text_hr_loss`、`selected_decoder_layer`、`selected_text_layer`。
+
+## 发现并修补的问题
+- 旧 online validation 使用 `JsonImageDataset`，只返回 image，不返回 text。
+- v2 text-conditioned validation 因此会走 image-only decode，和正式 v2 推理路径不一致。
+- 已在本地修补：
+  - 当 `text_conditioning.enabled=True` 且 `dataset=textatlas_image_text` 时，validation 使用 TextAtlas manifest 读取 `(image, text)`。
+  - `compute_reconstruction_metrics()` 支持用固定的第一个 layer pair 做 deterministic text-conditioned validation。
+- 待服务器连接稳定后同步该修补，并跑 HR + distill + validation smoke。

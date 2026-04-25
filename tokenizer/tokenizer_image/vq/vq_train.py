@@ -176,7 +176,18 @@ def append_csv_row(path, fieldnames, row):
         writer.writerow(row)
 
 
-def compute_reconstruction_metrics(vq_model, val_loader, device, args, causal_type):
+def compute_reconstruction_metrics(
+        vq_model,
+        val_loader,
+        device,
+        args,
+        causal_type,
+        text_tokenizer=None,
+        text_encoder=None,
+        text_layer_pairs=None,
+        text_max_length=None,
+        mixed_precision_dtype=None,
+):
     vq_model.eval()
     mse_sum = torch.tensor(0.0, device=device)
     mae_sum = torch.tensor(0.0, device=device)
@@ -186,13 +197,54 @@ def compute_reconstruction_metrics(vq_model, val_loader, device, args, causal_ty
     ssim_count = torch.tensor(0.0, device=device)
 
     with torch.no_grad():
-        for imgs, _ in val_loader:
+        for imgs, text_batch in val_loader:
             imgs = imgs.to(device, non_blocking=True)
+            selected_decoder_layer = None
+            decoder_text_features = None
+            decoder_text_key_padding_mask = None
+
+            if text_tokenizer is not None:
+                if text_encoder is None or not text_layer_pairs:
+                    raise ValueError("Text-conditioned validation requires text_encoder and text_layer_pairs.")
+                if not isinstance(text_batch, (list, tuple)):
+                    raise TypeError("Text-conditioned validation requires the validation dataset to return text strings.")
+
+                selected_text_layer, selected_decoder_layer = text_layer_pairs[0]
+                text_inputs = text_tokenizer(
+                    [str(text) for text in text_batch],
+                    padding="max_length",
+                    truncation=True,
+                    max_length=text_max_length,
+                    return_tensors="pt",
+                )
+                input_ids = text_inputs["input_ids"].to(device, non_blocking=True)
+                text_attention_mask = text_inputs["attention_mask"].to(device, non_blocking=True)
+                decoder_text_key_padding_mask = ~text_attention_mask.bool()
+                with autocast_context(args.device_backend, args.mixed_precision, dtype=mixed_precision_dtype):
+                    text_outputs = text_encoder(
+                        input_ids=input_ids,
+                        attention_mask=text_attention_mask,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                hidden_states = text_outputs.hidden_states
+                if hidden_states is None:
+                    raise RuntimeError("T5 encoder did not return hidden_states during validation.")
+                hidden_state_index = selected_text_layer + 1
+                if hidden_state_index >= len(hidden_states):
+                    raise ValueError(
+                        f"selected_text_layer={selected_text_layer} maps to hidden_states[{hidden_state_index}], "
+                        f"but T5 returned only {len(hidden_states)} hidden states."
+                    )
+                decoder_text_features = hidden_states[hidden_state_index].detach()
+
             with autocast_context(args.device_backend, args.mixed_precision):
                 outputs = vq_model(
                     imgs,
                     causal_type=causal_type,
-                    selected_decoder_layer=None,
+                    selected_decoder_layer=selected_decoder_layer,
+                    decoder_text_features=decoder_text_features,
+                    decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                 )
             recons = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
             diff = (recons.float() - imgs.float()) * 0.5
@@ -494,11 +546,18 @@ def main(args):
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
             ])
-        val_dataset = JsonImageDataset(
-            args.val_json_path,
-            transform=val_transform,
-            max_images=args.val_max_images,
-        )
+        if text_conditioning_on and args.dataset == "textatlas_image_text":
+            val_args = deepcopy(args)
+            val_args.data_path = args.val_json_path
+            val_args.json_path = args.val_json_path
+            val_args.max_images = args.val_max_images
+            val_dataset = build_dataset(val_args, transform=val_transform)
+        else:
+            val_dataset = JsonImageDataset(
+                args.val_json_path,
+                transform=val_transform,
+                max_images=args.val_max_images,
+            )
         val_sampler = DistributedSampler(
             val_dataset,
             num_replicas=dist.get_world_size(),
@@ -1306,6 +1365,11 @@ def main(args):
                     device=device,
                     args=args,
                     causal_type=causal_type,
+                    text_tokenizer=text_tokenizer if text_conditioning_on else None,
+                    text_encoder=text_encoder if text_conditioning_on else None,
+                    text_layer_pairs=text_layer_pairs if text_conditioning_on else None,
+                    text_max_length=text_max_length if text_conditioning_on else None,
+                    mixed_precision_dtype=ptdtype,
                 )
                 metric_value = val_metrics[args.best_metric]
                 is_best = metric_is_better(metric_value, best_val_metric, args.best_mode)
