@@ -902,4 +902,22 @@ python scripts/stage1/prepare_t5_encoder.py \
 - 已在本地修补：
   - 当 `text_conditioning.enabled=True` 且 `dataset=textatlas_image_text` 时，validation 使用 TextAtlas manifest 读取 `(image, text)`。
   - `compute_reconstruction_metrics()` 支持用固定的第一个 layer pair 做 deterministic text-conditioned validation。
-- 待服务器连接稳定后同步该修补，并跑 HR + distill + validation smoke。
+- 第一次服务器 text-aware validation smoke 暴露 NaN：
+  - 训练路径使用 bf16 autocast，validation 的 VQ forward 未传 `dtype=ptdtype`，在 NPU 上默认落到 fp16。
+  - 已修补 validation VQ forward 使用同样的 bf16 autocast dtype。
+
+## validation / checkpoint 验证
+- HR + distill + text-aware validation smoke 跑通：
+  - output: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_smoke/hr_2step_distill_textval_bf16`
+  - `val_every=1`
+  - `val_max_images=2`
+  - step 1: `Val MSE: 0.027725`, `Val PSNR: 15.5712`
+  - step 2: `Val MSE: 0.034865`, `Val PSNR: 14.5761`
+- checkpoint save smoke 跑通：
+  - output: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_smoke/hr_1step_distill_save_last`
+  - saved: `checkpoints/last.pt`
+  - size: `6.1G`
+- checkpoint load smoke 跑通：
+  - loaded from saved v2 `last.pt`
+  - output: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_smoke/hr_1step_distill_load_last`
+  - 1 step 完成，最终日志 `Done!`

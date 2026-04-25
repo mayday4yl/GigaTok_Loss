@@ -238,7 +238,7 @@ def compute_reconstruction_metrics(
                     )
                 decoder_text_features = hidden_states[hidden_state_index].detach()
 
-            with autocast_context(args.device_backend, args.mixed_precision):
+            with autocast_context(args.device_backend, args.mixed_precision, dtype=mixed_precision_dtype):
                 outputs = vq_model(
                     imgs,
                     causal_type=causal_type,
