@@ -823,3 +823,52 @@ python scripts/stage1/prepare_t5_encoder.py \
 ## 验证
 - 已运行：
   - `PYTHONPYCACHEPREFIX=/tmp/gigatok_pycache python3 -m py_compile utils/model_init.py tokenizer/tokenizer_image/vq/vq_train.py`
+
+# 2026-04-25 ModelArts v2 smoke 结果
+
+## 已跑通
+- baseline smoke：
+  - config: `configs/vq/_smoke_text_baseline_local.yaml`
+  - output: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_smoke/baseline_2step_nodistill`
+  - 2 steps 完成，最终日志 `Done!`
+- HR smoke：
+  - config: `configs/vq/_smoke_text_hr_local.yaml`
+  - output: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_smoke/hr_2step_nodistill`
+  - 2 steps 完成，最终日志 `Done!`
+
+## 关键验证点
+- 本地 T5 encoder 正常加载：
+  - `/home/ma-user/work/GigaTok_hr/gigatok_persist/models/google_t5-v1_1-xl`
+- v2 新增参数从旧 checkpoint 随机初始化：
+  - `text_type_embedding`
+  - `text_projection.*`
+- decoder-only finetune 冻结项生效：
+  - `freeze_encoder=True`
+  - `freeze_quantizer=True`
+  - `freeze_codebook=True`
+  - `freeze_post_quant_conv=True`
+- HR smoke 日志出现：
+  - `text_hr_loss`
+  - `weighted_text_hr_loss`
+  - `selected_decoder_layer`
+  - `selected_text_layer`
+  - `text_hr_valid_text_tokens_mean`
+  - `text_hr_skipped_samples=0`
+
+## smoke 与正式理想实验的差异
+- 当前 smoke 为 2-step 可行性验证，不是正式训练。
+- `max_images=8`、`global_batch_size=1`，仅用于检查代码路径。
+- `distill_loss=False`，绕过 DINOv2 teacher 在线加载；正式实验如需保持完整原设定，需要预缓存 DINOv2 repo/code 或修复本地加载路径。
+- `--no-wandb`，绕过当前环境中 wandb/protobuf 依赖冲突；正式实验可继续 no-wandb 或修复 wandb 环境。
+- `ckpt_every=999999`，没有保存 checkpoint。
+- `val_every=0`，没有跑验证集。
+- 因复用同一个 `sub-exp-dir`，`train_metrics.csv` 中追加了历史 smoke 行；正式实验应使用全新的输出目录或先清空对应 smoke 目录。
+
+## 残留
+- 正常 smoke 产物：
+  - `log.txt`
+  - `metrics/train_metrics.csv`
+  - `metrics/train_val_curves.png`
+- 未生成新的 `.pt/.pth` checkpoint。
+- 服务器 repo 中有 Python import 产生的 `__pycache__` / `.pyc` 工作区痕迹；不影响训练，但需要保持 git clean 时可以清理。
+- `/tmp/gigatok_pycache` 是手动 `py_compile` 使用的临时 pycache，大小约 `824K`。
