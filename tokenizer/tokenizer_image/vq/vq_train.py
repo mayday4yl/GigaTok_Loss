@@ -42,8 +42,12 @@ from utils.resume_log import (
     manage_ckpt_num, get_int_prefix_value, int_prefix_paths, wsd_find_newest_ckpt
 )
 from utils.model_init import load_encoders
-import wandb
 import yaml
+
+try:
+    import wandb
+except Exception:  # noqa: BLE001 - --no-wandb should work even if wandb env is broken.
+    wandb = None
 
 try:
     from transformers import AutoTokenizer, T5EncoderModel

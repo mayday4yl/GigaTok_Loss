@@ -18,10 +18,25 @@ import time
 import shutil
 import json
 
-import wandb
 import torch
 
 from typing import List, Dict
+
+try:
+    import wandb
+except Exception as exc:  # noqa: BLE001 - allow --no-wandb in partially broken envs.
+    wandb = None
+    _WANDB_IMPORT_ERROR = exc
+else:
+    _WANDB_IMPORT_ERROR = None
+
+
+def _require_wandb():
+    if wandb is None:
+        raise RuntimeError(
+            "wandb is not available. Install/fix wandb or run with --no-wandb."
+        ) from _WANDB_IMPORT_ERROR
+    return wandb
 
 
 ###################
@@ -40,6 +55,7 @@ def init_wandb(
     This function will create a cache file to store the logs in 
     {exp_dir}/wandb_cache.json
     """
+    wb = _require_wandb()
 
     # first check for id
     confg_file = os.path.join(exp_dir, "config.json")
@@ -52,7 +68,7 @@ def init_wandb(
             id = data.get("wandb_run_id", None)
     else:
         id = None
-    wandb.init(
+    wb.init(
         # set the wandb project where this run will be logged
         project=project_name,
         # track hyperparameters and run metadata
@@ -95,11 +111,12 @@ def wandb_cache_file_append(
 
 
 def upload_wandb_cache(exp_dir):
+    wb = _require_wandb()
     cache_file_path = os.path.join(exp_dir, "wandb_cache.json")
     with open(cache_file_path, "r") as f:
         cache_data = json.load(f)
     for data in cache_data:
-        wandb.log(data)
+        wb.log(data)
     
     with open(cache_file_path, "w") as f:
         json.dump([], f, indent=4)
@@ -108,12 +125,14 @@ def upload_wandb_cache(exp_dir):
 def update_wandb_log(
     update_dict:dict
 ):
+    wb = _require_wandb()
     assert "iteration" in update_dict, "update_dict must contain 'iteration'" 
     # assert "epoch" in update_dict, "update_dict must contain 'epoch'"
-    wandb.log(update_dict)
+    wb.log(update_dict)
 
 
 def save_wandb_run_id(exp_dir, eval_run=False):
+    wb = _require_wandb()
     confg_file = os.path.join(exp_dir, "config.json")
     if not os.path.exists(confg_file):
         data = {}
@@ -122,14 +141,15 @@ def save_wandb_run_id(exp_dir, eval_run=False):
             data = json.load(f)
     run_id_key = "wandb_run_id_eval" if eval_run else "wandb_run_id"
     if run_id_key in data:
-        assert data[run_id_key] == wandb.run.id, f"{run_id_key} in config.json is not the same as the current run"
-    data[run_id_key] = wandb.run.id
+        assert data[run_id_key] == wb.run.id, f"{run_id_key} in config.json is not the same as the current run"
+    data[run_id_key] = wb.run.id
     if not os.path.exists(confg_file):
         os.makedirs(os.path.dirname(confg_file), exist_ok=True)
     with open(confg_file, "w") as f:
         json.dump(data, f, indent=4)
 
 def save_wandb_project(exp_dir):
+    wb = _require_wandb()
     confg_file = os.path.join(exp_dir, "config.json")
     if not os.path.exists(confg_file):
         data = {}
@@ -138,11 +158,11 @@ def save_wandb_project(exp_dir):
             data = json.load(f)
     if "wandb_project" in data:
         try:
-            assert data["wandb_project"] == wandb.run.project, "wandb_project in config.json is not the same as the current run"
+            assert data["wandb_project"] == wb.run.project, "wandb_project in config.json is not the same as the current run"
         except AssertionError as e:
             print(confg_file)
             raise e
-    data["wandb_project"] = wandb.run.project
+    data["wandb_project"] = wb.run.project
     if not os.path.exists(confg_file):
         os.makedirs(os.path.dirname(confg_file), exist_ok=True)
     with open(confg_file, "w") as f:
