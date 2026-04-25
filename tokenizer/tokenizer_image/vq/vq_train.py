@@ -744,13 +744,21 @@ def main(args):
     ######################################
     pretrain_loaded_flag = False
     skip_model_optimizer_load = args.finetune and text_conditioning_on
+    text_conditioning_missing_keys = []
+    if skip_model_optimizer_load:
+        for name, _ in vq_model.named_parameters():
+            if name == "text_type_embedding" or name.startswith("text_projection."):
+                text_conditioning_missing_keys.append(name)
+        for name, _ in vq_model.named_buffers():
+            if name == "text_type_embedding" or name.startswith("text_projection."):
+                text_conditioning_missing_keys.append(name)
     if args.vq_ckpt:
         checkpoint = torch.load(args.vq_ckpt, map_location="cpu")
-        custom_load(vq_model, checkpoint["model"])
+        custom_load(vq_model, checkpoint["model"], ignore_missing_keys=text_conditioning_missing_keys)
         # vq_model.load_state_dict(checkpoint["model"])
         if args.ema:
             # ema.load_state_dict(checkpoint["ema"])
-            custom_load(ema, checkpoint["ema"])
+            custom_load(ema, checkpoint["ema"], ignore_missing_keys=text_conditioning_missing_keys)
         if skip_model_optimizer_load:
             logger.info("Skipping model optimizer state for text-conditioned finetune.")
         else:
@@ -831,11 +839,11 @@ def main(args):
         # init only when no existing ckpts are found
         init_ckpt = config["model"]["init_ckpt"]
         checkpoint = torch.load(init_ckpt, map_location="cpu")
-        custom_load(vq_model, checkpoint["model"])
+        custom_load(vq_model, checkpoint["model"], ignore_missing_keys=text_conditioning_missing_keys)
         # vq_model.load_state_dict(checkpoint["model"])
         if args.ema:
             # ema.load_state_dict(checkpoint["ema"])
-            custom_load(ema, checkpoint["ema"])
+            custom_load(ema, checkpoint["ema"], ignore_missing_keys=text_conditioning_missing_keys)
         if skip_model_optimizer_load:
             logger.info("Skipping model optimizer state for text-conditioned init checkpoint.")
         else:

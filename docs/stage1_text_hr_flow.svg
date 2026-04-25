@@ -1,0 +1,184 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1080" viewBox="0 0 1600 1080" role="img" aria-labelledby="title desc">
+  <title id="title">Stage-1 Text-Conditioned High-Rank Loss Flow</title>
+  <desc id="desc">Vector flowchart for sample-wise all-head stacked image-to-text high-rank loss in GigaTok stage-1 fine-tuning.</desc>
+  <defs>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M 24 0 L 0 0 0 24" fill="none" stroke="#e6e0ce" stroke-width="1"/>
+    </pattern>
+    <marker id="arrow" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5.5 L 0 11 z" fill="#3d405b"/>
+    </marker>
+    <marker id="arrow-blue" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5.5 L 0 11 z" fill="#2a6f97"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5.5 L 0 11 z" fill="#4f772d"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="11" markerHeight="11" refX="9" refY="5.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M 0 0 L 10 5.5 L 0 11 z" fill="#9d0208"/>
+    </marker>
+    <style>
+      .bg { fill: #fbfaf3; }
+      .grid { fill: url(#grid); opacity: 0.72; }
+      .title { font: 700 30px Arial, Helvetica, sans-serif; fill: #202124; }
+      .subtitle { font: 16px Arial, Helvetica, sans-serif; fill: #4f4f4f; }
+      .box { fill: #ffffff; stroke: #3d405b; stroke-width: 2; rx: 10; }
+      .text-box { fill: #eef7ff; stroke: #2a6f97; }
+      .image-box { fill: #f0f7e8; stroke: #4f772d; }
+      .frozen-proj-box { fill: #e8f5d9; stroke: #2f6f31; stroke-width: 3; rx: 10; }
+      .decoder-box { fill: #f7fff0; stroke: #4f772d; stroke-width: 2; rx: 10; }
+      .attn-box { fill: #fff4dc; stroke: #b7791f; }
+      .hr-box { fill: #fff0f0; stroke: #9d0208; }
+      .badge { fill: #fff0f0; stroke: #9d0208; stroke-width: 1.5; rx: 6; }
+      .note-box { fill: #f5f5f5; stroke: #777777; stroke-width: 1.5; rx: 8; }
+      .label { font: 700 17px Arial, Helvetica, sans-serif; fill: #202124; }
+      .body { font: 14px Arial, Helvetica, sans-serif; fill: #202124; }
+      .small { font: 12.5px Arial, Helvetica, sans-serif; fill: #333333; }
+      .code { font: 13px "SFMono-Regular", Consolas, "Liberation Mono", monospace; fill: #222222; }
+      .muted { fill: #666666; }
+      .arrow { fill: none; stroke: #3d405b; stroke-width: 2.5; marker-end: url(#arrow); }
+      .arrow-blue { fill: none; stroke: #2a6f97; stroke-width: 2.5; marker-end: url(#arrow-blue); }
+      .arrow-green { fill: none; stroke: #4f772d; stroke-width: 2.5; marker-end: url(#arrow-green); }
+      .arrow-red { fill: none; stroke: #9d0208; stroke-width: 2.5; marker-end: url(#arrow-red); }
+      .dash { stroke-dasharray: 8 7; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="1080"/>
+  <rect class="grid" x="0" y="0" width="1600" height="1080"/>
+
+  <text class="title" x="64" y="58">Stage-1 Text-Conditioned High-Rank Loss Flow</text>
+  <text class="subtitle" x="64" y="86">GigaTok B-L dino disc, decoder-only fine-tuning; HR on selected decoder image-to-text cross-attention.</text>
+
+  <!-- Text branch -->
+  <rect class="box text-box" x="64" y="130" width="170" height="74"/>
+  <text class="label" x="90" y="161">Text strings</text>
+  <text class="code" x="90" y="184">B samples</text>
+
+  <rect class="box text-box" x="282" y="130" width="220" height="74"/>
+  <text class="label" x="306" y="158">Frozen T5 tokenizer</text>
+  <text class="code" x="306" y="183">input_ids, mask [B,T]</text>
+
+  <rect class="box text-box" x="550" y="130" width="240" height="74"/>
+  <text class="label" x="577" y="157">Frozen T5 encoder</text>
+  <text class="code" x="577" y="183">google/t5-v1_1-xl</text>
+
+  <rect class="box text-box" x="838" y="112" width="276" height="110"/>
+  <text class="label" x="864" y="143">T5 hidden states</text>
+  <text class="code" x="864" y="168">embedding + 24 layers</text>
+  <text class="code" x="864" y="190">use layer l_t in 8..15</text>
+  <text class="small" x="864" y="211">hidden_states[l_t + 1]</text>
+
+  <rect class="box text-box" x="1162" y="112" width="304" height="110"/>
+  <text class="label" x="1188" y="143">Text projection</text>
+  <text class="code" x="1188" y="168">Linear + LayerNorm</text>
+  <text class="code" x="1188" y="190">2048 -&gt; 1024</text>
+  <text class="small" x="1188" y="211">+ learnable text type embedding</text>
+
+  <rect class="box text-box" x="1162" y="272" width="304" height="88"/>
+  <text class="label" x="1188" y="304">Text memory</text>
+  <text class="code" x="1188" y="329">[B, T, 1024]</text>
+  <text class="small" x="1188" y="350">T is max_length; padding mask kept</text>
+
+  <path class="arrow-blue" d="M 234 167 L 282 167"/>
+  <path class="arrow-blue" d="M 502 167 L 550 167"/>
+  <path class="arrow-blue" d="M 790 167 L 838 167"/>
+  <path class="arrow-blue" d="M 1114 167 L 1162 167"/>
+  <path class="arrow-blue" d="M 1314 222 L 1314 272"/>
+
+  <!-- Image branch -->
+  <rect class="box image-box" x="64" y="332" width="170" height="74"/>
+  <text class="label" x="104" y="363">Image</text>
+  <text class="code" x="104" y="386">256 x 256</text>
+
+  <rect class="box image-box" x="282" y="332" width="220" height="74"/>
+  <text class="label" x="311" y="360">Frozen GigaTok</text>
+  <text class="code" x="311" y="385">encoder</text>
+
+  <rect class="box image-box" x="550" y="332" width="240" height="74"/>
+  <text class="label" x="583" y="360">Frozen quantizer</text>
+  <text class="code" x="583" y="385">codebook frozen</text>
+
+  <rect class="box frozen-proj-box" x="838" y="316" width="276" height="118"/>
+  <text class="label" x="862" y="346">Frozen post-quant projection</text>
+  <rect class="badge" x="862" y="358" width="150" height="24"/>
+  <text class="small" x="879" y="375">OUTSIDE decoder</text>
+  <text class="code" x="862" y="404">post_quant_conv</text>
+  <text class="code" x="862" y="426">codebook dim 8 -&gt; token dim 256</text>
+
+  <rect class="box image-box" x="1162" y="426" width="304" height="88"/>
+  <text class="label" x="1188" y="456">Trainable transformer decoder</text>
+  <text class="code" x="1188" y="480">decoder_embed 256 -&gt; 1024</text>
+  <text class="code" x="1188" y="502">24 layers; selected layer l_d</text>
+  <text class="small" x="1188" y="522">image tokens [B,256,1024]</text>
+
+  <path class="arrow-green" d="M 234 369 L 282 369"/>
+  <path class="arrow-green" d="M 502 369 L 550 369"/>
+  <path class="arrow-green" d="M 790 369 L 838 369"/>
+  <path class="arrow-green" d="M 1114 369 C 1172 369 1220 392 1254 426"/>
+
+  <!-- Layer selection -->
+  <rect class="note-box" x="64" y="238" width="610" height="70"/>
+  <text class="label" x="92" y="263">Layer pair sampling</text>
+  <text class="code" x="92" y="286">one pair per step: (l_t, l_d) sampled from [8,8]..[15,15]</text>
+  <text class="small" x="92" y="304">l_t selects the T5 hidden state; l_d selects the decoder cross-attention layer.</text>
+
+  <!-- Attention -->
+  <rect class="box attn-box" x="570" y="540" width="456" height="148"/>
+  <text class="label" x="600" y="572">Selected decoder layer cross-attention</text>
+  <text class="code" x="600" y="600">query: image queries [B, 256, 1024]</text>
+  <text class="code" x="600" y="624">key/value: concat(image, text)</text>
+  <text class="code" x="600" y="648">key length = 256 + T</text>
+  <text class="code" x="600" y="672">decoder layer l_d post-softmax [B,16,256,256+T]</text>
+
+  <path class="arrow-green" d="M 1254 514 C 1190 574 1095 606 1026 614"/>
+  <path class="arrow-blue" d="M 1314 360 C 1258 448 1140 550 1026 602"/>
+  <path class="arrow dash" d="M 674 273 C 760 340 805 450 816 540"/>
+
+  <!-- HR branch -->
+  <rect class="box hr-box" x="570" y="730" width="456" height="88"/>
+  <text class="label" x="600" y="762">Take text-attention slice only</text>
+  <text class="code" x="600" y="788">attn[:, :, :, 256 : 256 + T]</text>
+  <text class="code" x="600" y="810">shape [B, 16, 256, T]</text>
+  <path class="arrow-red" d="M 798 688 L 798 730"/>
+
+  <rect class="box hr-box" x="64" y="860" width="312" height="124"/>
+  <text class="label" x="92" y="892">Per valid sample b</text>
+  <text class="code" x="92" y="918">remove padded text tokens</text>
+  <text class="code" x="92" y="942">[16, 256, T_valid]</text>
+  <text class="small" x="92" y="966">skip if T_valid &lt; 2</text>
+
+  <rect class="box hr-box" x="436" y="860" width="298" height="124"/>
+  <text class="label" x="464" y="892">Stack heads</text>
+  <text class="code" x="464" y="918">A_b = reshape to</text>
+  <text class="code" x="464" y="942">[16 * 256, T_valid]</text>
+  <text class="code" x="464" y="966">A_b = A_b / sqrt(16)</text>
+
+  <rect class="box hr-box" x="794" y="860" width="322" height="124"/>
+  <text class="label" x="822" y="892">SVD in float32</text>
+  <text class="code" x="822" y="918">sigma = svdvals(A_b.float())</text>
+  <text class="code" x="822" y="942">r = min(16*256, T_valid)</text>
+  <text class="small" x="822" y="966">one SVD per valid sample</text>
+
+  <rect class="box hr-box" x="1176" y="860" width="354" height="124"/>
+  <text class="label" x="1204" y="892">HR loss</text>
+  <text class="code" x="1204" y="918">L_b = mean_i |sigma_i - tau|</text>
+  <text class="code" x="1204" y="942">tau = 1.0 by default</text>
+  <text class="code" x="1204" y="966">L_hr = mean_valid_samples L_b</text>
+
+  <path class="arrow-red" d="M 798 818 C 650 844 452 866 376 922"/>
+  <path class="arrow-red" d="M 376 922 L 436 922"/>
+  <path class="arrow-red" d="M 734 922 L 794 922"/>
+  <path class="arrow-red" d="M 1116 922 L 1176 922"/>
+
+  <rect class="note-box" x="1176" y="710" width="354" height="92"/>
+  <text class="label" x="1204" y="742">Training objective</text>
+  <text class="code" x="1204" y="768">total_loss += lambda_hr * L_hr</text>
+  <text class="small" x="1204" y="790">baseline and HR share data, seed, ckpt, lr, steps</text>
+  <path class="arrow-red dash" d="M 1353 860 L 1353 802"/>
+
+  <!-- Legend -->
+  <rect class="note-box" x="64" y="104" width="500" height="10" opacity="0"/>
+  <rect class="note-box" x="64" y="1014" width="1466" height="42"/>
+  <text class="small" x="90" y="1040">Notation: B=batch size, T=max text length, T_valid=non-padding text tokens, 1024=GigaTok large decoder width, 16=heads, 256=16x16 image query tokens.</text>
+</svg>

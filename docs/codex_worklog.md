@@ -752,3 +752,74 @@ python scripts/stage1/refresh_textatlas_rendered_text.py \
   - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/manifest/train_materialized_manifest_v2text.jsonl`
   - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/manifest/val_materialized_manifest_v2text.jsonl`
   - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/manifest_holdout_eval/holdout_materialized_manifest_v2text.jsonl`
+
+# 2026-04-25 T5 encoder 下载网络排障
+
+## 现象
+- `prepare_t5_encoder.py` 使用 `HF_ENDPOINT=https://huggingface.co` 加 ModelArts proxy 时，`requests/urllib3` 在 CONNECT proxy 阶段 timeout 或返回 `503 Service Unavailable`。
+- `HF_ENDPOINT=https://hf-mirror.com` 且完全 unset proxy 时，服务器直连 `hf-mirror.com` timeout。
+- Ascend toolkit owner warning 与本问题无关。
+
+## 排查结论
+- ModelArts 登录环境会默认注入大小写 proxy 变量，proxy 主机解析到 `192.168.0.33:8083`。
+- `curl -k` 通过 proxy 可以访问 Hugging Face API，并确认 `google/t5-v1_1-xl` 文件列表中 PyTorch 权重为 `pytorch_model.bin`，大小约 `11.4GB`。
+- Python `requests` 通过同一 proxy 访问 `https://hf-mirror.com/google/t5-v1_1-xl/...` 可以返回 `307` 和 repo commit。
+- 当前推荐组合是保留 ModelArts proxy，并设置 `HF_ENDPOINT=https://hf-mirror.com`；不要在 mirror 路径下 unset proxy 后直连。
+
+## 下一步命令
+```bash
+export HTTP_PROXY=http://proxy-notebook.modelarts.com:8083
+export HTTPS_PROXY=http://proxy-notebook.modelarts.com:8083
+export http_proxy=http://proxy-notebook.modelarts.com:8083
+export https_proxy=http://proxy-notebook.modelarts.com:8083
+export HF_ENDPOINT=https://hf-mirror.com
+export HF_HUB_ETAG_TIMEOUT=120
+export HF_HUB_DOWNLOAD_TIMEOUT=600
+
+python scripts/stage1/prepare_t5_encoder.py \
+  --config-yaml configs/vq/VQ_BL256_dino_disc_text_hr_v2.yaml \
+  --cache-dir /home/ma-user/work/GigaTok_hr/gigatok_persist/cache/huggingface
+
+python scripts/stage1/prepare_t5_encoder.py \
+  --config-yaml configs/vq/VQ_BL256_dino_disc_text_hr_v2.yaml \
+  --cache-dir /home/ma-user/work/GigaTok_hr/gigatok_persist/cache/huggingface \
+  --local-files-only
+```
+
+## 追加结论
+- 2026-04-25 11:59 继续使用 `HF_ENDPOINT=https://hf-mirror.com` 加 ModelArts proxy 时，`prepare_t5_encoder.py` 仍在 CONNECT 阶段返回 `503 Service Unavailable`。
+- 后续不再优先反复尝试 `transformers.from_pretrained()` 联网路径。
+- 推荐 fallback：用 `curl -k -L -C -` 逐文件断点下载 `google/t5-v1_1-xl` 到本地目录，再用 `--encoder-name /path/to/local/t5 --local-files-only` 验证，训练 config 也指向同一个本地目录。
+
+# 2026-04-25 Stage-1 text HR 矢量流程图
+
+## 本轮产物
+- 新增 `docs/stage1_text_hr_flow.svg`。
+- 图中记录 v2 text-conditioned HR 主流程：
+  - T5 tokenizer / encoder 冻结。
+  - T5 `hidden_states` 为 embedding output + 24 layer outputs，实际选层使用 `hidden_states[layer + 1]`。
+  - GigaTok large transformer decoder 为 24 层；每个 step 从 `[8,8]..[15,15]` 中随机选 1 个 T5/decoder 中层 layer pair。
+  - T5 原始特征 `[B,T,2048]` 经 `Linear + LayerNorm` 投影到 `[B,T,1024]`，并加 learnable text type embedding。
+  - decoder 选中层 cross-attention 权重为 `[B,16,256,256+T]`，HR loss 只取 text slice `[B,16,256,T]`。
+  - 每个 valid sample 去除 padding text token 后堆叠 heads，构造 `[16*256,T_valid] / sqrt(16)`，做 float32 SVD。
+  - 当前 v2 loss 公式为 `mean_i |sigma_i - tau|`，默认 `tau=1.0`，再对 valid samples 取均值。
+- 修订：去掉重复的 matched-layer 模块，将 layer pair sampling 合并为单一说明框，避免遮挡并明确 `l_t` 选 T5 hidden state、`l_d` 选 decoder cross-attention layer。
+- 修订：将 image branch 中的 `post_quant_conv` 单独标为 frozen post-quant projection，明确它位于 quantizer 和 transformer decoder 之间，负责 `codebook dim 8 -> token dim 256`，不属于 trainable decoder 主体。
+
+# 2026-04-25 v2 text-conditioned checkpoint load 修补
+
+## 现象
+- ModelArts baseline smoke 已成功加载本地 T5 encoder，并进入 GigaTok 模型初始化。
+- 使用旧 `VQ_BL256_dino_disc.pt` 初始化 v2 text-conditioned 模型时报错：
+  - `text_type_embedding`
+  - `text_projection.*`
+- 原因是这些参数是 v2 新增模块，旧 stage-1 checkpoint 中不存在。
+
+## 修补
+- `custom_load()` 新增 `ignore_missing_keys` 可选参数，默认行为不变。
+- 仅在 `args.finetune and text_conditioning_on` 时，允许 v2 新增的 text projection / text type embedding 参数从随机初始化开始训练。
+- 其它 missing keys 仍然报错，避免掩盖 checkpoint 结构不匹配。
+
+## 验证
+- 已运行：
+  - `PYTHONPYCACHEPREFIX=/tmp/gigatok_pycache python3 -m py_compile utils/model_init.py tokenizer/tokenizer_image/vq/vq_train.py`

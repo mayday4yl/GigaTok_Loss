@@ -178,21 +178,31 @@ def load_encoders(enc_type, device, debug_mode=False):
     
     return encoder, encoder_type, architecture
 
-def custom_load(model, state_dict, only_check_missing=True):
+def custom_load(model, state_dict, only_check_missing=True, ignore_missing_keys=None):
     """
     Allow removing the distill_mlp from the state_dict
     """
     if only_check_missing:
+        ignore_missing_keys = set(ignore_missing_keys or [])
         # Load the state_dict with strict=False to ignore unexpected keys
         load_result = model.load_state_dict(state_dict, strict=False)
 
         # Extract missing and unexpected keys
-        missing_keys = load_result.missing_keys
+        ignored_missing_keys = [
+            key for key in load_result.missing_keys
+            if key in ignore_missing_keys
+        ]
+        missing_keys = [
+            key for key in load_result.missing_keys
+            if key not in ignore_missing_keys
+        ]
         unexpected_keys = load_result.unexpected_keys
 
         # Handle missing keys: Raise an error if any keys are missing
         if missing_keys:
             raise KeyError(f"Missing keys in state_dict: {missing_keys}")
+        if ignored_missing_keys:
+            print(f"Warning: Missing keys intentionally initialized from scratch: {ignored_missing_keys}")
 
         # Optionally, handle unexpected keys (e.g., log them)
         if unexpected_keys:
