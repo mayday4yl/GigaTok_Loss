@@ -1015,3 +1015,36 @@ python scripts/stage1/prepare_t5_encoder.py \
 ## 当前判断
 - 代码路径可行，HR loss 确实参与优化。
 - 500 step 仍偏短；后续需要更长 pilot、可视化重建结果，或 OCR/文本识别指标来判断是否提升文字质量。
+
+# 2026-04-26 OCR 文本重建评估
+
+## 目标
+- 将文字内容重建从训练 loss 中解耦出来，作为 validation / test 后处理评估指标。
+- 先不把 OCR 放进训练约束，避免引入不可微、慢速和 OCR 偏置问题。
+
+## 实现
+- 扩展 `scripts/stage1/evaluate_textatlas_reconstruction.py`：
+  - 支持直接从 TextAtlas materialized manifest 读取 `image_path`、`subset`、`text`。
+  - 对 `text_conditioning.enabled=True` 的 v2 config，使用 T5 text feature 做 text-conditioned reconstruction。
+  - 默认使用 deterministic `text_layer_pair_index=0`，即第一个配置 pair，便于 baseline / HR 可比。
+  - 支持 OCR backend：
+    - `pytesseract`
+    - `paddleocr`
+    - `easyocr`
+  - 输出图像重建指标：
+    - `mse`
+    - `mae`
+    - `psnr`
+    - `ssim`
+  - 输出文字重建指标：
+    - `ocr_exact_acc`
+    - `ocr_exact_acc_ci`
+    - `ocr_cer`
+    - `ocr_ned_similarity`
+    - `ocr_edit_distance`
+  - 可保存逐样本 OCR 结果到 `ocr_predictions.jsonl`。
+
+## 检查
+- 本地已通过语法检查：
+  - `python3 -m py_compile scripts/stage1/evaluate_textatlas_reconstruction.py`
+- 本地 Python 没有安装 `torch`，因此完整 import / reconstruction / OCR 需要在 ModelArts 环境验证。
