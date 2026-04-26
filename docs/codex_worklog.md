@@ -965,3 +965,53 @@ python scripts/stage1/prepare_t5_encoder.py \
 - HR loss 已进入总 loss；step 100 的 HR 总 loss 相比 baseline 高约 `0.95`，与 `weighted_text_hr_loss=0.9518` 量级一致。
 - 当前 per-sample SVD + 16 heads stack 没有造成明显速度灾难，100-step pilot 中约 5% 开销。
 - 100 step 只能证明可行性，不能判断最终质量差异；下一步建议跑 500 或 1000 step pilot。
+
+# 2026-04-26 text HR 500-step pilot
+
+## 设置
+- output root: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_pilot_500`
+- checkpoint: `/home/ma-user/work/GigaTok_hr/gigatok_persist/checkpoints/VQ_BL256_dino_disc.pt`
+- train manifest: `train_materialized_manifest_v2text.jsonl`
+- val manifest: `val_materialized_manifest_v2text.jsonl`
+- `iterations=500`
+- `global_batch_size=1`
+- `max_images=5000`
+- `val_every=100`
+- `val_max_images=500`
+- `mixed_precision=bf16`
+- `distill_loss=True`
+- baseline:
+  - output: `baseline_500step_b1_seed0`
+  - `text_conditioning.enabled=True`
+  - `text_hr.enabled=False`
+- HR:
+  - output: `hr_500step_b1_seed0`
+  - `text_conditioning.enabled=True`
+  - `text_hr.enabled=True`
+  - `text_hr.hr_loss_weight=1.0`
+  - `tau=1.0`
+
+## validation
+| step | baseline MSE | baseline PSNR | HR MSE | HR PSNR |
+| --- | ---: | ---: | ---: | ---: |
+| 100 | 0.037492 | 14.2606 | 0.037046 | 14.3126 |
+| 200 | 0.029645 | 15.2804 | 0.028779 | 15.4093 |
+| 300 | 0.025466 | 15.9404 | 0.025169 | 15.9913 |
+| 400 | 0.024867 | 16.0437 | 0.024752 | 16.0639 |
+| 500 | 0.023550 | 16.2800 | 0.023455 | 16.2976 |
+
+## 观察
+- HR 在 500-step pilot 的所有 validation checkpoint 上 MSE/PSNR 均略好于 baseline，但差距很小，不能作为最终质量结论。
+- step 500:
+  - baseline train loss: `2.0098`
+  - HR train loss: `2.9481`
+  - HR `text_hr_loss`: `0.96194`
+  - 二者 train loss 差值约 `0.9383`，与 `weighted_text_hr_loss` 量级一致，说明 HR 项已进入总 loss。
+- 稳定阶段速度：
+  - baseline 大约 `2.0 steps/s`
+  - HR 大约 `1.9-2.0 steps/s`
+  - 当前设置下 HR SVD 开销较小。
+
+## 当前判断
+- 代码路径可行，HR loss 确实参与优化。
+- 500 step 仍偏短；后续需要更长 pilot、可视化重建结果，或 OCR/文本识别指标来判断是否提升文字质量。
