@@ -921,3 +921,47 @@ python scripts/stage1/prepare_t5_encoder.py \
   - loaded from saved v2 `last.pt`
   - output: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_smoke/hr_1step_distill_load_last`
   - 1 step 完成，最终日志 `Done!`
+
+# 2026-04-26 text HR 100-step pilot
+
+## 设置
+- output root: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_pilot_100`
+- checkpoint: `/home/ma-user/work/GigaTok_hr/gigatok_persist/checkpoints/VQ_BL256_dino_disc.pt`
+- train manifest: `train_materialized_manifest_v2text.jsonl`
+- val manifest: `val_materialized_manifest_v2text.jsonl`
+- `iterations=100`
+- `global_batch_size=1`
+- `max_images=1000`
+- `val_every=50`
+- `val_max_images=64`
+- `mixed_precision=bf16`
+- `distill_loss=True`
+- baseline:
+  - `text_conditioning.enabled=True`
+  - `text_hr.enabled=False`
+  - `text_hr.hr_loss_weight=0.0`
+- HR:
+  - `text_conditioning.enabled=True`
+  - `text_hr.enabled=True`
+  - `text_hr.hr_loss_weight=1.0`
+  - `tau=1.0`
+  - 每 step 随机选 1 个 `[T5 layer, decoder layer]` pair。
+
+## 结果
+- baseline 跑通：
+  - output: `baseline_100step_b1_seed0`
+  - step 50: `Val MSE: 0.047492`, `Val PSNR: 13.2338`
+  - step 100: `Val MSE: 0.039176`, `Val PSNR: 14.0698`
+  - 稳定阶段约 `2.0 steps/s`
+- HR 跑通：
+  - output: `hr_100step_b1_seed0`
+  - 日志出现 `text_hr_loss`、`weighted_text_hr_loss`、`selected_decoder_layer`、`selected_text_layer`
+  - `text_hr_skipped_samples=0`
+  - step 50: `Val MSE: 0.048406`, `Val PSNR: 13.1510`
+  - step 100: `Val MSE: 0.039680`, `Val PSNR: 14.0143`
+  - 稳定阶段约 `1.9 steps/s`
+
+## 结论
+- HR loss 已进入总 loss；step 100 的 HR 总 loss 相比 baseline 高约 `0.95`，与 `weighted_text_hr_loss=0.9518` 量级一致。
+- 当前 per-sample SVD + 16 heads stack 没有造成明显速度灾难，100-step pilot 中约 5% 开销。
+- 100 step 只能证明可行性，不能判断最终质量差异；下一步建议跑 500 或 1000 step pilot。
