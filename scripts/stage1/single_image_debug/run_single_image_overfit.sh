@@ -17,6 +17,7 @@ ITERS="${ITERS:-1000}"
 MODE="${MODE:-hr}"
 HR_CONFIG="${HR_CONFIG:-configs/vq/VQ_BL256_dino_disc_text_hr_v2.yaml}"
 BASELINE_CONFIG="${BASELINE_CONFIG:-configs/vq/VQ_BL256_dino_disc_text_baseline_v2.yaml}"
+ORIGINAL_CONFIG="${ORIGINAL_CONFIG:-configs/vq/VQ_BL256_dino_disc_stage1_baseline.yaml}"
 if [[ -z "${CONFIG:-}" ]]; then
   case "$MODE" in
     hr)
@@ -25,8 +26,11 @@ if [[ -z "${CONFIG:-}" ]]; then
     baseline)
       CONFIG="$BASELINE_CONFIG"
       ;;
+    original)
+      CONFIG="$ORIGINAL_CONFIG"
+      ;;
     *)
-      echo "Unsupported MODE=$MODE. Use MODE=hr or MODE=baseline." >&2
+      echo "Unsupported MODE=$MODE. Use MODE=hr, MODE=baseline, or MODE=original." >&2
       exit 1
       ;;
   esac
@@ -49,7 +53,7 @@ fi
 
 if [[ ! -f "$CONFIG" ]]; then
   echo "Config not found: $CONFIG" >&2
-  echo "Pass CONFIG=/path/to/config.yaml, or set MODE=hr / MODE=baseline to use tracked defaults." >&2
+  echo "Pass CONFIG=/path/to/config.yaml, or set MODE=hr / MODE=baseline / MODE=original to use tracked defaults." >&2
   echo "On the server, use CONFIG=configs/vq/_pilot_text_hr_local.yaml if you need the local T5 path." >&2
   exit 1
 fi

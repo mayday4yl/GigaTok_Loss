@@ -1200,3 +1200,52 @@ python scripts/stage1/prepare_t5_encoder.py \
   - 在训练日志中同时记录当前代码的 `tau_loss` 和论文定义的 normalized spectrum loss。
   - 检查 HR loss 是否应该改回 `p = sigma / sum(sigma)` 后的均匀谱约束，而不是直接约束未归一化奇异值接近 `tau=1`。
   - 同时记录被选层的 `text_attention_mass`，防止模型通过降低 text attention mass 绕开 HR 约束。
+
+## 2026-04-27 单图 original baseline 修正
+
+## 背景
+- 前一轮单图对比里的 `baseline` 是 text baseline：
+  - 有 T5 text encoder。
+  - 有 `text_projection`。
+  - 有 decoder text cross-attention。
+  - 只是不启用 HR loss。
+- 这不能代表原生 GigaTok tokenizer。
+
+## 修改
+- `scripts/stage1/single_image_debug/run_single_image_overfit.sh`
+  - 新增 `MODE=original`。
+  - 默认配置为 `configs/vq/VQ_BL256_dino_disc_stage1_baseline.yaml`。
+  - 该配置不包含 `text_conditioning` 和 `text_hr`，因此不加 T5、不加 text projection、不加 decoder text cross-attention、不加 HR。
+- `scripts/stage1/single_image_debug/README.md`
+  - 明确三条线：
+    - `MODE=original`: 原生 tokenizer baseline。
+    - `MODE=baseline`: text baseline，只不开 HR。
+    - `MODE=hr`: text + HR。
+  - 说明 original 没有 text cross-attention，不能用当前 SVD 诊断脚本看 text attention 谱，只比较重建日志和图像。
+
+## original baseline 运行命令
+```bash
+MODE=original TAG=dense ITERS=1000 ASCEND_RT_VISIBLE_DEVICES=0 \
+  bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
+
+MODE=original TAG=medium ITERS=1000 ASCEND_RT_VISIBLE_DEVICES=0 \
+  bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
+
+MODE=original TAG=sparse ITERS=1000 ASCEND_RT_VISIBLE_DEVICES=0 \
+  bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
+```
+
+## 指标
+- original baseline 看：
+  - `rec_loss`
+  - `direct_rec_loss`
+  - `feature_rec_loss`
+  - `Val MSE`
+  - `Val MAE`
+  - `Val PSNR`
+- original baseline 不看：
+  - `text_hr_loss`
+  - `text_hr_sigma_mean`
+  - `text_attention_mass`
+  - text attention SVD
+- 原因：original baseline 没有 text 分支，也没有 decoder text cross-attention。
