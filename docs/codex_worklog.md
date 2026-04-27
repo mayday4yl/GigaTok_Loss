@@ -1249,3 +1249,28 @@ MODE=baseline TAG=sparse ITERS=1000 ASCEND_RT_VISIBLE_DEVICES=0 \
   - `text_attention_mass`
   - text attention SVD
 - 原因：baseline 没有 text 分支，也没有 decoder text cross-attention。
+
+## 2026-04-27 修复原生 baseline 单图验证集读取
+
+## 背景
+- 服务器运行 `MODE=baseline TAG=sparse ITERS=1000` 时失败：
+  - `TypeError: unhashable type: 'slice'`
+  - 位置在 `JsonImageDataset.__init__` 的 `image_paths[:max_images]`。
+- 原因：
+  - 原生 baseline 的 `text_conditioning.enabled=False`。
+  - 旧逻辑在 validation 分支退回到 `JsonImageDataset`。
+  - `JsonImageDataset` 只支持 JSON 数组图片路径，不支持 TextAtlas materialized JSONL。
+  - 单图 manifest 是 TextAtlas JSONL，因此 validation 初始化失败。
+
+## 修改
+- `tokenizer/tokenizer_image/vq/vq_train.py`
+  - 对 `args.dataset == "textatlas_image_text"`，无论是否启用 text conditioning，validation 都使用 `build_dataset(...)` 读取 JSONL。
+  - 对 `textatlas_image_text`，无论是否启用 text conditioning，训练和验证 transform 都使用 resize+pad 到 `256x256`。
+
+## 影响
+- `MODE=baseline` 仍然是原生 GigaTok tokenizer：
+  - 不加载 T5。
+  - 不创建 text projection。
+  - 不使用 decoder text cross-attention。
+  - 不计算 HR loss。
+- 但数据读取和预处理与 HR 单图实验保持一致，适合做严格单图对照。

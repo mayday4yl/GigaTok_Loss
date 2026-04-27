@@ -500,7 +500,8 @@ def main(args):
 
 
     # Setup data:
-    if text_conditioning_on:
+    textatlas_jsonl_on = args.dataset == "textatlas_image_text"
+    if text_conditioning_on or textatlas_jsonl_on:
         transform = transforms.Compose([
             transforms.Lambda(lambda pil_image: resize_pad_arr(pil_image, args.image_size)),
             transforms.ToTensor(),
@@ -534,7 +535,7 @@ def main(args):
     val_loader = None
     val_sampler = None
     if args.val_json_path is not None:
-        if text_conditioning_on:
+        if text_conditioning_on or textatlas_jsonl_on:
             val_transform = transforms.Compose([
                 transforms.Lambda(lambda pil_image: resize_pad_arr(pil_image, args.image_size)),
                 transforms.ToTensor(),
@@ -546,7 +547,7 @@ def main(args):
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
             ])
-        if text_conditioning_on and args.dataset == "textatlas_image_text":
+        if args.dataset == "textatlas_image_text":
             val_args = deepcopy(args)
             val_args.data_path = args.val_json_path
             val_args.json_path = args.val_json_path
