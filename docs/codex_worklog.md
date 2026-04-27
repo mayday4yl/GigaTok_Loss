@@ -1362,3 +1362,27 @@ git diff --name-status upstream/master...HEAD
   - dense token 数已足够，不再是 7-token 误选样本。
   - 训练层的重建最好，但 text attention mass 极低，说明 decoder 主要仍走 image/code 路径。
   - 当前 v2 tau HR loss 没有把 image-to-text attention 推成高秩，反而在后期表现为 text attention 奇异值整体变小。
+
+## 2026-04-27 给师姐看的原版 GigaTok 行号说明
+
+## 背景
+- 需要给师姐看当前代码相对官方原版 GigaTok 的主要修改点，并标注每个修改点在当前分支中的具体行号范围。
+- 对比口径继续使用：
+  - `upstream=https://github.com/SilentView/GigaTok.git`
+  - `upstream/master`
+  - merge-base: `baf3de042034318aa762c28db4d14231efce8b0c`
+
+## 修改
+- 新增 `docs/original_gigatok_line_review.md`。
+- 文档按模块列出当前分支行号：
+  - decoder cross-attention 返回 post-softmax attention。
+  - VQ tokenizer 接入 frozen T5 text feature。
+  - image-to-text attention SVD / HR loss。
+  - stage-1 训练主线接入。
+  - HR 与原生 baseline config。
+  - TextAtlas 数据读取。
+  - 单图 overfit 与逐层诊断脚本。
+  - NPU / validation / checkpoint 兼容相关工程改动。
+
+## 影响
+- 仅增加说明文档，不改变训练代码、模型结构或实验配置。
