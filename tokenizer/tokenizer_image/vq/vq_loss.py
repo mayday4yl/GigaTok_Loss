@@ -148,6 +148,56 @@ def high_rank_attention_loss(attn_weights, eps=1e-6):
     return hr_loss, spectrum_uniformity
 
 
+def _frobenius_normalize_attention_matrix(matrix, eps=1e-8):
+    """Normalize one 2D attention matrix by its raw Frobenius norm."""
+    matrix = matrix.float()
+    fro_norm = torch.norm(matrix, p="fro")
+    return matrix / (fro_norm + eps), fro_norm
+
+
+def _sigma_mean_mse_loss(sigma):
+    """Penalize variance across Frobenius-normalized singular values."""
+    return (sigma - sigma.mean()).pow(2).mean()
+
+
+def _gram_scaled_identity_loss(matrix_normed):
+    """Scaled Gram loss after Frobenius normalization.
+
+    Since ||A||_F=1, trace(A.T @ A)=1, so the identity target is scaled by
+    the valid text-token count instead of using an unscaled identity matrix.
+    """
+    valid_token_count = matrix_normed.shape[1]
+    gram = matrix_normed.transpose(0, 1).matmul(matrix_normed)
+    target = torch.eye(valid_token_count, device=matrix_normed.device, dtype=matrix_normed.dtype)
+    target = target / max(1, valid_token_count)
+    return (gram - target).pow(2).mean()
+
+
+def _log_participation_ratio_loss(sigma, eps=1e-8):
+    """Negative log participation ratio, matching the advisor's formula."""
+    rank_score = sigma.sum().pow(2) / (sigma.pow(2).sum() + eps)
+    return -torch.log(rank_score + eps)
+
+
+def _singular_energy_stats(sigma, eps=1e-8):
+    energy = sigma.pow(2)
+    p = energy / (energy.sum() + eps)
+    p_for_log = p.clamp_min(eps)
+    effective_rank = (-(p_for_log * p_for_log.log()).sum()).exp()
+    participation_rank = sigma.sum().pow(2) / (energy.sum() + eps)
+    participation_rank_ratio = participation_rank / max(1, sigma.numel())
+    topk = min(5, p.numel())
+    energy_top5 = torch.topk(p, topk).values.sum() if topk > 0 else sigma.new_zeros(())
+    return {
+        "energy": p,
+        "effective_rank": effective_rank,
+        "participation_rank": participation_rank,
+        "participation_rank_ratio": participation_rank_ratio,
+        "energy_top1": p.max(),
+        "energy_top5": energy_top5,
+    }
+
+
 def high_rank_image_text_attention_loss(
         attn_weights,
         text_attention_mask,
@@ -186,7 +236,9 @@ def high_rank_image_text_attention_loss(
     # per sample before SVD.
     text_attn = attn_weights[:, :, :, image_token_len:image_token_len + text_token_len]
     svd_mode = str(svd_mode)
-    frobenius_modes = {"frobenius_uniform", "frobenius_energy_uniform"}
+    frobenius_uniform_modes = {"frobenius_uniform", "frobenius_energy_uniform", "energy_uniform_mse"}
+    advisor_modes = {"sigma_mean_mse", "gram_scaled_identity", "log_participation_ratio"}
+    frobenius_modes = frobenius_uniform_modes | advisor_modes
     legacy_modes = {"legacy_tau", "raw_tau", "per_sample_all_heads_sqrt_norm"}
     if svd_mode not in frobenius_modes and svd_mode not in legacy_modes:
         raise ValueError(
@@ -195,6 +247,9 @@ def high_rank_image_text_attention_loss(
         )
 
     losses = []
+    current_sigma_means = []
+    current_sigma_mins = []
+    current_sigma_maxs = []
     raw_sigma_means = []
     raw_sigma_mins = []
     raw_sigma_maxs = []
@@ -202,9 +257,12 @@ def high_rank_image_text_attention_loss(
     normed_sigma_mins = []
     normed_sigma_maxs = []
     fro_norms = []
+    participation_ranks = []
+    participation_rank_ratios = []
     effective_ranks = []
     energy_top1s = []
     energy_top5s = []
+    gram_losses = []
     valid_token_counts = []
     skipped_samples = 0
 
@@ -216,42 +274,49 @@ def high_rank_image_text_attention_loss(
             continue
 
         matrix = text_attn[batch_idx, :, :, valid_mask]
-        matrix = matrix.reshape(num_heads * num_queries, valid_token_count) / math.sqrt(num_heads)
+        raw_matrix = matrix.reshape(num_heads * num_queries, valid_token_count).float()
         # Text-HR v2: SVD is computed in float32 for stability even under bf16 training.
-        matrix = matrix.float()
-        raw_sigma = torch.linalg.svdvals(matrix)
+        raw_sigma = torch.linalg.svdvals(raw_matrix)
+        matrix_normed, fro_norm = _frobenius_normalize_attention_matrix(raw_matrix, eps=eps)
+        normed_sigma = torch.linalg.svdvals(matrix_normed)
+        gram_loss = _gram_scaled_identity_loss(matrix_normed)
 
-        fro_norm = torch.norm(matrix, p="fro")
         if svd_mode in frobenius_modes:
-            # Fix the total matrix energy before SVD. The loss then only
-            # penalizes singular-value energy concentration, not attention scale.
-            matrix_for_svd = matrix / (fro_norm + eps)
-            sigma = torch.linalg.svdvals(matrix_for_svd)
-            sigma_energy = sigma.pow(2)
-            p = sigma_energy / (sigma_energy.sum() + eps)
-            target = sigma.new_tensor(1.0 / max(1, sigma.numel()))
-            losses.append((p - target).pow(2).mean())
+            sigma = normed_sigma
+            if svd_mode in frobenius_uniform_modes:
+                sigma_energy = sigma.pow(2)
+                p = sigma_energy / (sigma_energy.sum() + eps)
+                target = sigma.new_tensor(1.0 / max(1, sigma.numel()))
+                losses.append((p - target).pow(2).mean())
+            elif svd_mode == "sigma_mean_mse":
+                losses.append(_sigma_mean_mse_loss(sigma))
+            elif svd_mode == "gram_scaled_identity":
+                losses.append(gram_loss)
+            elif svd_mode == "log_participation_ratio":
+                losses.append(_log_participation_ratio_loss(sigma, eps=eps))
         else:
-            sigma = raw_sigma
-            sigma_energy = sigma.pow(2)
-            p = sigma_energy / (sigma_energy.sum() + eps)
+            legacy_matrix = raw_matrix / math.sqrt(num_heads)
+            sigma = torch.linalg.svdvals(legacy_matrix)
             losses.append(torch.abs(sigma - sigma.new_tensor(tau)).mean())
 
-        p_detached = p.detach().clamp_min(eps)
-        entropy = -(p_detached * p_detached.log()).sum()
-        effective_rank = entropy.exp()
-        top5 = p.detach()[: min(5, p.numel())].sum()
+        energy_stats = _singular_energy_stats(sigma, eps=eps)
 
+        current_sigma_means.append(sigma.detach().mean())
+        current_sigma_mins.append(sigma.detach().min())
+        current_sigma_maxs.append(sigma.detach().max())
         raw_sigma_means.append(raw_sigma.detach().mean())
         raw_sigma_mins.append(raw_sigma.detach().min())
         raw_sigma_maxs.append(raw_sigma.detach().max())
-        normed_sigma_means.append(sigma.detach().mean())
-        normed_sigma_mins.append(sigma.detach().min())
-        normed_sigma_maxs.append(sigma.detach().max())
+        normed_sigma_means.append(normed_sigma.detach().mean())
+        normed_sigma_mins.append(normed_sigma.detach().min())
+        normed_sigma_maxs.append(normed_sigma.detach().max())
         fro_norms.append(fro_norm.detach())
-        effective_ranks.append(effective_rank)
-        energy_top1s.append(p.detach()[0])
-        energy_top5s.append(top5)
+        participation_ranks.append(energy_stats["participation_rank"].detach())
+        participation_rank_ratios.append(energy_stats["participation_rank_ratio"].detach())
+        effective_ranks.append(energy_stats["effective_rank"].detach())
+        energy_top1s.append(energy_stats["energy_top1"].detach())
+        energy_top5s.append(energy_stats["energy_top5"].detach())
+        gram_losses.append(gram_loss.detach())
         valid_token_counts.append(valid_token_count)
 
     if not losses:
@@ -260,13 +325,19 @@ def high_rank_image_text_attention_loss(
             "sigma_mean": zero.detach(),
             "sigma_min": zero.detach(),
             "sigma_max": zero.detach(),
+            "raw_sigma_mean": zero.detach(),
+            "raw_sigma_min": zero.detach(),
+            "raw_sigma_max": zero.detach(),
             "normed_sigma_mean": zero.detach(),
             "normed_sigma_min": zero.detach(),
             "normed_sigma_max": zero.detach(),
             "fro_norm_mean": zero.detach(),
+            "participation_rank_mean": zero.detach(),
+            "participation_rank_ratio_mean": zero.detach(),
             "effective_rank_mean": zero.detach(),
             "energy_top1_mean": zero.detach(),
             "energy_top5_mean": zero.detach(),
+            "gram_loss_mean": zero.detach(),
             "valid_text_tokens_mean": zero.detach(),
             "valid_samples": 0,
             "skipped_samples": skipped_samples,
@@ -276,18 +347,25 @@ def high_rank_image_text_attention_loss(
     hr_loss = torch.stack(losses).mean()
     valid_tokens = torch.tensor(valid_token_counts, device=attn_weights.device, dtype=torch.float32)
     stats = {
-        # raw sigma stats keep exposing whether image-to-text attention mass is collapsing.
-        "sigma_mean": torch.stack(raw_sigma_means).mean(),
-        "sigma_min": torch.stack(raw_sigma_mins).mean(),
-        "sigma_max": torch.stack(raw_sigma_maxs).mean(),
-        # normed sigma stats are the actual spectrum used by frobenius_uniform.
+        # sigma_* follows the current mode's actual loss sigma.
+        "sigma_mean": torch.stack(current_sigma_means).mean(),
+        "sigma_min": torch.stack(current_sigma_mins).mean(),
+        "sigma_max": torch.stack(current_sigma_maxs).mean(),
+        # raw sigma stats expose whether image-to-text attention mass is collapsing.
+        "raw_sigma_mean": torch.stack(raw_sigma_means).mean(),
+        "raw_sigma_min": torch.stack(raw_sigma_mins).mean(),
+        "raw_sigma_max": torch.stack(raw_sigma_maxs).mean(),
+        # normed sigma stats expose the Frobenius-normalized spectrum.
         "normed_sigma_mean": torch.stack(normed_sigma_means).mean(),
         "normed_sigma_min": torch.stack(normed_sigma_mins).mean(),
         "normed_sigma_max": torch.stack(normed_sigma_maxs).mean(),
         "fro_norm_mean": torch.stack(fro_norms).mean(),
+        "participation_rank_mean": torch.stack(participation_ranks).mean(),
+        "participation_rank_ratio_mean": torch.stack(participation_rank_ratios).mean(),
         "effective_rank_mean": torch.stack(effective_ranks).mean(),
         "energy_top1_mean": torch.stack(energy_top1s).mean(),
         "energy_top5_mean": torch.stack(energy_top5s).mean(),
+        "gram_loss_mean": torch.stack(gram_losses).mean(),
         "valid_text_tokens_mean": valid_tokens.mean(),
         "valid_samples": len(losses),
         "skipped_samples": skipped_samples,
@@ -680,9 +758,13 @@ class VQLoss(nn.Module):
                             f"selected_decoder_layer: {selected_layer}, selected_text_layer: {selected_text_layer}, "
                             f"text_hr_svd_mode: {text_hr_svd_mode}, "
                             f"text_hr_sigma_mean: {text_hr_stats['sigma_mean']:.4e}, "
+                            f"text_hr_raw_sigma_mean: {text_hr_stats['raw_sigma_mean']:.4e}, "
                             f"text_hr_normed_sigma_mean: {text_hr_stats['normed_sigma_mean']:.4e}, "
                             f"text_hr_fro_norm_mean: {text_hr_stats['fro_norm_mean']:.4e}, "
+                            f"text_hr_participation_rank_mean: {text_hr_stats['participation_rank_mean']:.2f}, "
+                            f"text_hr_participation_rank_ratio_mean: {text_hr_stats['participation_rank_ratio_mean']:.4f}, "
                             f"text_hr_effective_rank_mean: {text_hr_stats['effective_rank_mean']:.2f}, "
+                            f"text_hr_gram_loss_mean: {text_hr_stats['gram_loss_mean']:.4e}, "
                             f"text_hr_valid_text_tokens_mean: {text_hr_stats['valid_text_tokens_mean']:.2f}, "
                             f"text_hr_skipped_samples: {text_hr_stats['skipped_samples']}\n"
                         )
@@ -716,10 +798,14 @@ class VQLoss(nn.Module):
                         f"selected_decoder_layer: {selected_layer}, selected_text_layer: {selected_text_layer}, "
                         f"text_hr_svd_mode: {text_hr_svd_mode}, "
                         f"text_hr_sigma_mean: {text_hr_stats['sigma_mean']:.4e}, "
+                        f"text_hr_raw_sigma_mean: {text_hr_stats['raw_sigma_mean']:.4e}, "
                         f"text_hr_normed_sigma_mean: {text_hr_stats['normed_sigma_mean']:.4e}, "
                         f"text_hr_fro_norm_mean: {text_hr_stats['fro_norm_mean']:.4e}, "
+                        f"text_hr_participation_rank_mean: {text_hr_stats['participation_rank_mean']:.2f}, "
+                        f"text_hr_participation_rank_ratio_mean: {text_hr_stats['participation_rank_ratio_mean']:.4f}, "
                         f"text_hr_effective_rank_mean: {text_hr_stats['effective_rank_mean']:.2f}, "
                         f"text_hr_energy_top1_mean: {text_hr_stats['energy_top1_mean']:.4f}, "
+                        f"text_hr_gram_loss_mean: {text_hr_stats['gram_loss_mean']:.4e}, "
                         f"text_hr_valid_text_tokens_mean: {text_hr_stats['valid_text_tokens_mean']:.2f}, "
                         f"text_hr_skipped_samples: {text_hr_stats['skipped_samples']}"
                     )
@@ -758,13 +844,19 @@ class VQLoss(nn.Module):
                         "(Generator)text_hr_sigma_mean": text_hr_stats["sigma_mean"].detach(),
                         "(Generator)text_hr_sigma_min": text_hr_stats["sigma_min"].detach(),
                         "(Generator)text_hr_sigma_max": text_hr_stats["sigma_max"].detach(),
+                        "(Generator)text_hr_raw_sigma_mean": text_hr_stats["raw_sigma_mean"].detach(),
+                        "(Generator)text_hr_raw_sigma_min": text_hr_stats["raw_sigma_min"].detach(),
+                        "(Generator)text_hr_raw_sigma_max": text_hr_stats["raw_sigma_max"].detach(),
                         "(Generator)text_hr_normed_sigma_mean": text_hr_stats["normed_sigma_mean"].detach(),
                         "(Generator)text_hr_normed_sigma_min": text_hr_stats["normed_sigma_min"].detach(),
                         "(Generator)text_hr_normed_sigma_max": text_hr_stats["normed_sigma_max"].detach(),
                         "(Generator)text_hr_fro_norm_mean": text_hr_stats["fro_norm_mean"].detach(),
+                        "(Generator)text_hr_participation_rank_mean": text_hr_stats["participation_rank_mean"].detach(),
+                        "(Generator)text_hr_participation_rank_ratio_mean": text_hr_stats["participation_rank_ratio_mean"].detach(),
                         "(Generator)text_hr_effective_rank_mean": text_hr_stats["effective_rank_mean"].detach(),
                         "(Generator)text_hr_energy_top1_mean": text_hr_stats["energy_top1_mean"].detach(),
                         "(Generator)text_hr_energy_top5_mean": text_hr_stats["energy_top5_mean"].detach(),
+                        "(Generator)text_hr_gram_loss_mean": text_hr_stats["gram_loss_mean"].detach(),
                         "(Generator)text_hr_valid_text_tokens_mean": text_hr_stats["valid_text_tokens_mean"].detach(),
                         "(Generator)text_hr_valid_samples": text_hr_stats["valid_samples"],
                         "(Generator)text_hr_skipped_samples": text_hr_stats["skipped_samples"],

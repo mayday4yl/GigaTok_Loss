@@ -1460,3 +1460,72 @@ git diff --name-status upstream/master...HEAD
   - `frobenius_effective_rank` 是否上升。
   - `frobenius_energy_top1_ratio` 是否下降。
   - `frobenius_norm` 是否仍明显塌缩；若塌缩，说明 attention-to-text mass 仍需要额外约束。
+
+## 2026-04-27 新增师姐三种 Frobenius Text-HR loss
+
+## 背景
+- 旧 tau loss 直接让 raw singular values 接近 1，不适合 post-softmax attention。
+- 单图诊断已经显示模型会压低 image-to-text attention mass，导致 raw singular values 远离 1 甚至接近 0。
+- 这次按师姐建议，把新方法统一建立在 SVD 前 Frobenius norm 归一化上。
+
+## 共同前置
+- 对 selected decoder layer 的 post-softmax image-to-text attention slice 构造矩阵：
+  - `A = text_attn[batch_idx, :, :, valid_mask]`
+  - `A = A.reshape(num_heads * num_queries, valid_token_count).float()`
+- 新方法统一做：
+  - `A_norm = A / (torch.norm(A, p="fro") + eps)`
+  - `sigma = torch.linalg.svdvals(A_norm)`
+- `fro_norm` 日志记录归一化前 raw `A` 的 Frobenius norm，用来观察 text attention mass 是否继续塌缩。
+- legacy tau 模式继续保留原有 `/ sqrt(num_heads)` 口径，方便复现旧实验。
+
+## 三种方法
+- `sigma_mean_mse`：
+  - `loss = mean((sigma - mean(sigma))^2)`
+- `gram_scaled_identity`：
+  - `G = A_norm.T @ A_norm`
+  - `target = I / T_valid`
+  - `loss = mean((G - target)^2)`
+  - 这是 Frobenius 归一化前提下对师姐 `A.T @ A -> I` 的尺度修正版；因为 `trace(G)=1`，所以不用未缩放的 `I`。
+- `log_participation_ratio`：
+  - `rank_score = (sum(sigma)^2) / (sum(sigma^2) + eps)`
+  - `loss = -log(rank_score + eps)`
+  - 严格按师姐图中公式，不额外加 `log(r)` 平移，因此 loss 可以为负。
+
+## 修改
+- 扩展 `high_rank_image_text_attention_loss` 的 `svd_mode`，新增：
+  - `sigma_mean_mse`
+  - `gram_scaled_identity`
+  - `log_participation_ratio`
+- 新增公共 helper，训练和单图诊断共用同一套公式。
+- 训练日志新增：
+  - `text_hr_raw_sigma_*`
+  - `text_hr_normed_sigma_*`
+  - `text_hr_participation_rank_mean`
+  - `text_hr_participation_rank_ratio_mean`
+  - `text_hr_gram_loss_mean`
+- 单图诊断 `per_layer_metrics.csv` 新增：
+  - `sigma_mean_mse_loss`
+  - `gram_scaled_identity_loss`
+  - `log_participation_ratio_loss`
+  - `participation_rank`
+  - `participation_rank_ratio`
+  - `energy_top1_ratio`
+- 新增 3 个 probe config：
+  - `configs/vq/VQ_BL256_dino_disc_text_hr_probe_sigma_mean_v2.yaml`
+  - `configs/vq/VQ_BL256_dino_disc_text_hr_probe_gram_identity_v2.yaml`
+  - `configs/vq/VQ_BL256_dino_disc_text_hr_probe_log_rank_v2.yaml`
+
+## 建议验证
+- 先 smoke 师姐图中的 log-rank 方法：
+  ```bash
+  MODE=hr TAG=dense ITERS=2 \
+  CONFIG=configs/vq/VQ_BL256_dino_disc_text_hr_probe_log_rank_v2.yaml \
+  ASCEND_RT_VISIBLE_DEVICES=0 \
+  bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
+  ```
+- smoke 通过后，对 dense / medium / sparse 分别跑三个 probe config。
+- 对比：
+  - `text_hr_loss`
+  - `text_hr_participation_rank_ratio_mean`
+  - `text_hr_energy_top1_mean`
+  - `text_hr_fro_norm_mean`

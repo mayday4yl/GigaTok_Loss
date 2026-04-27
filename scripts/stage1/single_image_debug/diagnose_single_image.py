@@ -34,6 +34,13 @@ from scripts.stage1.evaluate_textatlas_reconstruction import (  # noqa: E402
     tensor_to_uint8,
     write_json,
 )
+from tokenizer.tokenizer_image.vq.vq_loss import (  # noqa: E402
+    _frobenius_normalize_attention_matrix,
+    _gram_scaled_identity_loss,
+    _log_participation_ratio_loss,
+    _sigma_mean_mse_loss,
+    _singular_energy_stats,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -130,16 +137,6 @@ def normalized_spectrum_loss(sigma: torch.Tensor, eps: float = 1e-6) -> Tuple[to
     return loss, p, effective_rank
 
 
-def energy_spectrum_loss(sigma: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    energy = sigma.pow(2)
-    p = energy / (energy.sum() + eps)
-    r = sigma.numel()
-    loss = (p - (1.0 / max(1, r))).pow(2).mean()
-    entropy = -(p.clamp_min(eps) * p.clamp_min(eps).log()).sum()
-    effective_rank = entropy.exp()
-    return loss, p, effective_rank
-
-
 def rank_at_energy(p: torch.Tensor, threshold: float) -> int:
     if p.numel() == 0:
         return 0
@@ -171,11 +168,12 @@ def attention_svd_metrics(
     text_attn = attn[:, :, :, image_token_len:image_token_len + text_token_len]
     valid_text_attn = text_attn[0, :, :, valid_mask]
     text_mass = valid_text_attn.sum(dim=-1)
-    matrix = valid_text_attn.reshape(num_heads * num_queries, valid_text_tokens) / math.sqrt(num_heads)
-    matrix = matrix.float()
-    fro_norm = torch.norm(matrix, p="fro")
+    matrix = valid_text_attn.reshape(num_heads * num_queries, valid_text_tokens).float()
+    legacy_matrix = matrix / math.sqrt(num_heads)
+    matrix_normed, fro_norm = _frobenius_normalize_attention_matrix(matrix, eps=1e-8)
     sigma = torch.linalg.svdvals(matrix)
-    sigma_fro = torch.linalg.svdvals(matrix / (fro_norm + 1e-8))
+    legacy_sigma = torch.linalg.svdvals(legacy_matrix)
+    sigma_fro = torch.linalg.svdvals(matrix_normed)
     sigma_sorted = sigma.detach().cpu()
     sigma_fro_sorted = sigma_fro.detach().cpu()
     if out_npy is not None:
@@ -184,15 +182,18 @@ def attention_svd_metrics(
         np.save(out_npy.with_name(f"{out_npy.stem}_frobenius{out_npy.suffix}"), sigma_fro_sorted.numpy())
 
     norm_loss, p, effective_rank = normalized_spectrum_loss(sigma)
-    raw_energy_loss, raw_energy_p, raw_energy_effective_rank = energy_spectrum_loss(sigma)
-    fro_loss, fro_p, fro_effective_rank = energy_spectrum_loss(sigma_fro)
-    current_loss = torch.abs(sigma - sigma.new_tensor(tau)).mean()
-    top1_ratio = p[0] if p.numel() else sigma.new_tensor(0.0)
-    top5_ratio = p[: min(5, p.numel())].sum() if p.numel() else sigma.new_tensor(0.0)
-    raw_energy_top1 = raw_energy_p[0] if raw_energy_p.numel() else sigma.new_tensor(0.0)
-    raw_energy_top5 = raw_energy_p[: min(5, raw_energy_p.numel())].sum() if raw_energy_p.numel() else sigma.new_tensor(0.0)
-    fro_energy_top1 = fro_p[0] if fro_p.numel() else sigma.new_tensor(0.0)
-    fro_energy_top5 = fro_p[: min(5, fro_p.numel())].sum() if fro_p.numel() else sigma.new_tensor(0.0)
+    raw_energy_stats = _singular_energy_stats(sigma, eps=1e-8)
+    fro_energy_stats = _singular_energy_stats(sigma_fro, eps=1e-8)
+    raw_energy_p = raw_energy_stats["energy"]
+    fro_p = fro_energy_stats["energy"]
+    raw_energy_loss = (raw_energy_p - sigma.new_tensor(1.0 / max(1, raw_energy_p.numel()))).pow(2).mean()
+    fro_loss = (fro_p - sigma_fro.new_tensor(1.0 / max(1, fro_p.numel()))).pow(2).mean()
+    current_loss = torch.abs(legacy_sigma - legacy_sigma.new_tensor(tau)).mean()
+    top1_ratio = p.max() if p.numel() else sigma.new_tensor(0.0)
+    top5_ratio = torch.topk(p, min(5, p.numel())).values.sum() if p.numel() else sigma.new_tensor(0.0)
+    sigma_mean_mse_loss = _sigma_mean_mse_loss(sigma_fro)
+    gram_scaled_identity_loss = _gram_scaled_identity_loss(matrix_normed)
+    log_participation_ratio_loss = _log_participation_ratio_loss(sigma_fro, eps=1e-8)
 
     return {
         "num_heads": float(num_heads),
@@ -209,27 +210,38 @@ def attention_svd_metrics(
         "sigma_top1": float(sigma[0].item()),
         "sigma_top1_ratio": float(top1_ratio.item()),
         "sigma_top5_ratio": float(top5_ratio.item()),
-        "effective_rank": float(effective_rank.item()),
+        "sum_normalized_effective_rank": float(effective_rank.item()),
         "rank90": float(rank_at_energy(p, 0.90)),
         "rank95": float(rank_at_energy(p, 0.95)),
-        "raw_energy_top1_ratio": float(raw_energy_top1.item()),
-        "raw_energy_top5_ratio": float(raw_energy_top5.item()),
-        "raw_energy_effective_rank": float(raw_energy_effective_rank.item()),
+        "raw_energy_top1_ratio": float(raw_energy_stats["energy_top1"].item()),
+        "raw_energy_top5_ratio": float(raw_energy_stats["energy_top5"].item()),
+        "raw_energy_effective_rank": float(raw_energy_stats["effective_rank"].item()),
         "raw_energy_rank90": float(rank_at_energy(raw_energy_p, 0.90)),
         "raw_energy_rank95": float(rank_at_energy(raw_energy_p, 0.95)),
         "raw_energy_uniform_loss": float(raw_energy_loss.item()),
         "frobenius_norm": float(fro_norm.item()),
+        "normed_sigma_mean": float(sigma_fro.mean().item()),
+        "normed_sigma_std": float(sigma_fro.std(unbiased=False).item()),
+        "normed_sigma_min": float(sigma_fro.min().item()),
+        "normed_sigma_max": float(sigma_fro.max().item()),
         "frobenius_sigma_mean": float(sigma_fro.mean().item()),
         "frobenius_sigma_std": float(sigma_fro.std(unbiased=False).item()),
         "frobenius_sigma_min": float(sigma_fro.min().item()),
         "frobenius_sigma_max": float(sigma_fro.max().item()),
         "frobenius_sigma_top1": float(sigma_fro[0].item()),
-        "frobenius_energy_top1_ratio": float(fro_energy_top1.item()),
-        "frobenius_energy_top5_ratio": float(fro_energy_top5.item()),
-        "frobenius_effective_rank": float(fro_effective_rank.item()),
+        "frobenius_energy_top1_ratio": float(fro_energy_stats["energy_top1"].item()),
+        "frobenius_energy_top5_ratio": float(fro_energy_stats["energy_top5"].item()),
+        "frobenius_effective_rank": float(fro_energy_stats["effective_rank"].item()),
         "frobenius_rank90": float(rank_at_energy(fro_p, 0.90)),
         "frobenius_rank95": float(rank_at_energy(fro_p, 0.95)),
         "frobenius_uniform_loss": float(fro_loss.item()),
+        "participation_rank": float(fro_energy_stats["participation_rank"].item()),
+        "participation_rank_ratio": float(fro_energy_stats["participation_rank_ratio"].item()),
+        "effective_rank": float(fro_energy_stats["effective_rank"].item()),
+        "energy_top1_ratio": float(fro_energy_stats["energy_top1"].item()),
+        "sigma_mean_mse_loss": float(sigma_mean_mse_loss.item()),
+        "gram_scaled_identity_loss": float(gram_scaled_identity_loss.item()),
+        "log_participation_ratio_loss": float(log_participation_ratio_loss.item()),
         "current_code_tau_loss": float(current_loss.item()),
         "normalized_spectrum_loss": float(norm_loss.item()),
     }
@@ -427,7 +439,8 @@ def main() -> None:
                 f"sigma_top1_ratio={metrics['sigma_top1_ratio']:.4f} "
                 f"tau_loss={metrics['current_code_tau_loss']:.4f} "
                 f"frob_loss={metrics['frobenius_uniform_loss']:.6f} "
-                f"frob_erank={metrics['frobenius_effective_rank']:.2f}"
+                f"log_pr_loss={metrics['log_participation_ratio_loss']:.4f} "
+                f"part_ratio={metrics['participation_rank_ratio']:.4f}"
             )
 
     write_csv(args.output_dir / "per_layer_metrics.csv", rows)
