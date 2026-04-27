@@ -1147,3 +1147,56 @@ python scripts/stage1/prepare_t5_encoder.py \
 ### 诊断脚本修正
 - `diagnose_single_image.py` 中 `model.encode(image, return_code=False)` 返回的 `diff` 在当前模型里可能是 list。
 - 增加 `scalar_mean()`，递归汇总 tensor/list/dict 形式的辅助 loss，避免诊断 summary 写入时报错。
+
+## 2026-04-27 medium / sparse 单图验证结果
+
+### 运行样本
+- medium: `TextScenesHQ:train:2803`
+  - manifest: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_single_debug/manifests/medium.jsonl`
+  - 图像: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/images/train/TextScenesHQ/0000002803.png`
+  - 文本: `performancebehave standard Loperation Mode business funclion perform procedure practice operate Manner affair working act Method shutterstock.com151811543`
+  - T5 valid tokens: 30
+- sparse: `LongWordsSubset-A:train:3149`
+  - manifest: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_single_debug/manifests/sparse.jsonl`
+  - 图像: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/images/train/LongWordsSubset-A/0000003149.png`
+  - 文本: `read TDT, DETHE, TASSE, IN, SIP, EVERY, SYMPHONY words`
+  - T5 valid tokens: 26
+
+### 单图 overfit 终点
+- dense:
+  - HR: `Val MSE=0.000076`, `Val MAE=0.005945`, `Val PSNR=41.2188`, `text_hr_loss=0.9890`, `text_hr_sigma_mean=0.01097`
+  - baseline: `Val MSE=0.000065`, `Val MAE=0.005311`, `Val PSNR=41.8767`
+- medium:
+  - HR: `Val MSE=0.000124`, `Val MAE=0.006862`, `Val PSNR=39.0490`, `text_hr_loss=0.9965`, `text_hr_sigma_mean=0.00355`
+  - baseline: `Val MSE=0.000121`, `Val MAE=0.006790`, `Val PSNR=39.1773`
+- sparse:
+  - HR: `Val MSE=0.000081`, `Val MAE=0.006054`, `Val PSNR=40.8910`, `text_hr_loss=0.9958`, `text_hr_sigma_mean=0.00419`
+  - baseline: `Val MSE=0.000071`, `Val MAE=0.005656`, `Val PSNR=41.4754`
+
+### 逐层诊断汇总
+- 统计口径:
+  - `all_psnr`: 全 24 个 decoder layer 的诊断重建 PSNR 平均。
+  - `mid_*`: 当前 HR 实际训练层 8-15 的平均。
+- dense:
+  - HR: `all_psnr=43.5802`, `mid_psnr=43.6929`, `mid_text_mass=0.002355`, `mid_tau_loss=0.991517`, `mid_norm_loss=0.028420`, `mid_eff_rank=3.9874`, `mid_sigma_mean=0.008483`
+  - baseline: `all_psnr=43.7233`, `mid_psnr=43.8281`, `mid_text_mass=0.002440`, `mid_tau_loss=0.991372`, `mid_norm_loss=0.030773`, `mid_eff_rank=3.8841`, `mid_sigma_mean=0.008629`
+- medium:
+  - HR: `all_psnr=38.9960`, `mid_psnr=39.3435`, `mid_text_mass=0.015595`, `mid_tau_loss=1.006255`, `mid_norm_loss=0.009909`, `mid_eff_rank=8.3071`, `mid_sigma_mean=0.022276`
+  - baseline: `all_psnr=39.2355`, `mid_psnr=39.4534`, `mid_text_mass=0.016286`, `mid_tau_loss=1.007053`, `mid_norm_loss=0.009828`, `mid_eff_rank=8.4986`, `mid_sigma_mean=0.022796`
+- sparse:
+  - HR: `all_psnr=43.1849`, `mid_psnr=43.3017`, `mid_text_mass=0.008067`, `mid_tau_loss=1.001221`, `mid_norm_loss=0.012869`, `mid_eff_rank=6.2981`, `mid_sigma_mean=0.017622`
+  - baseline: `all_psnr=43.8528`, `mid_psnr=43.9312`, `mid_text_mass=0.003596`, `mid_tau_loss=0.996961`, `mid_norm_loss=0.010407`, `mid_eff_rank=6.8000`, `mid_sigma_mean=0.003039`
+
+### 当前判断
+- 三张单图都能 overfit 到较低重建误差，说明当前数据读取、T5 本地加载、decoder-only finetune、checkpoint 兼容加载、validation 和图像保存主链路没有明显阻塞问题。
+- HR 版本在三张图的最终重建 PSNR 都没有超过 baseline，且差距方向一致为 baseline 略好。
+- HR loss 在训练末期仍接近 `1.0`，没有出现“被优化项持续下降”的现象。
+- 当前实际训练层 8-15 的 `text_mass` 普遍偏低，`sigma_mean` 很小；这解释了为什么当前 `abs(sigma - tau)` 形式的 HR loss 会长期接近 `tau=1`。
+- HR 与 baseline 在 8-15 层的 `tau_loss`、`effective_rank`、`normalized_spectrum_loss` 差别很小，说明当前 HR 分支虽然被计算和反传，但没有稳定改变被约束层的 attention 谱。
+
+### 下一步建议
+- 不建议直接扩大训练步数来证明 HR 有效；单图已经显示 HR 约束本身没有明显下降。
+- 下一步应做最小代码级核查：
+  - 在训练日志中同时记录当前代码的 `tau_loss` 和论文定义的 normalized spectrum loss。
+  - 检查 HR loss 是否应该改回 `p = sigma / sum(sigma)` 后的均匀谱约束，而不是直接约束未归一化奇异值接近 `tau=1`。
+  - 同时记录被选层的 `text_attention_mass`，防止模型通过降低 text attention mass 绕开 HR 约束。
