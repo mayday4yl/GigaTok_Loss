@@ -90,6 +90,24 @@ def tensor_stats(prefix: str, tensor: torch.Tensor) -> Dict[str, float]:
     }
 
 
+def scalar_mean(value: Any) -> float:
+    """把 tensor/list/dict 形式的辅助 loss 汇总成一个诊断标量。"""
+    if torch.is_tensor(value):
+        return float(value.detach().float().mean().item())
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, Mapping):
+        values = [scalar_mean(item) for item in value.values()]
+    elif isinstance(value, (list, tuple)):
+        values = [scalar_mean(item) for item in value]
+    else:
+        return float("nan")
+    values = [item for item in values if math.isfinite(item)]
+    if not values:
+        return float("nan")
+    return float(sum(values) / len(values))
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -344,7 +362,7 @@ def main() -> None:
                 "ckpt": str(args.ckpt),
                 "config": str(args.config),
                 "tau": tau,
-                "vq_diff": float(diff.detach().float().mean().item()) if torch.is_tensor(diff) else float(diff),
+                "vq_diff": scalar_mean(diff),
                 "feature_rec_mse": float(F.mse_loss(encoder_spatial.float(), rec_spatial.float()).item()),
                 "recon_path": str(recon_path),
                 "diff_path": str(diff_path),

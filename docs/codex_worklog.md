@@ -1097,3 +1097,53 @@ python scripts/stage1/prepare_t5_encoder.py \
   - `MODE=hr` 和 `MODE=baseline` 的同图 overfit 命令。
   - 向师姐汇报“每一层”时使用 `--layer-mode all_decoder`。
 - `diagnose_single_image.py` 的 `--layer-mode` 默认值已改为 `all_decoder`，避免误只诊断 8-15 配置层。
+
+## 2026-04-27 dense 单图验证结果
+
+### 运行样本
+- dense: `CleanTextSynth:train:2731`
+- manifest: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_single_debug/manifests/dense.jsonl`
+- 图像: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/images/train/CleanTextSynth/0000002731.png`
+- 文本: `In August of the same year`
+- T5 valid tokens: 7
+
+### 单图 overfit
+- HR:
+  - 输出目录: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_single_debug/dense_hr_1img_1000step`
+  - 1000 step train: `rec_loss=0.0003`, `direct_rec_loss=0.0003`, `feature_rec_loss=0.0034`
+  - 1000 step val: `MSE=0.000076`, `MAE=0.005945`, `PSNR=41.2188`
+  - HR 相关: `text_hr_loss=0.9890`, `text_hr_sigma_mean=0.01097`
+- baseline:
+  - 输出目录: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_single_debug/dense_baseline_1img_1000step`
+  - 1000 step train: `rec_loss=0.0003`, `direct_rec_loss=0.0002`, `feature_rec_loss=0.0040`
+  - 1000 step val: `MSE=0.000065`, `MAE=0.005311`, `PSNR=41.8767`
+- 结论:
+  - 单图重建路径能 overfit，说明 decoder-only finetune、T5 条件输入、checkpoint 加载和 validation 主链路没有明显阻塞 bug。
+  - dense 单图上，HR 没有带来更好的重建 PSNR；baseline 略高。
+  - HR loss 本身没有明显下降，后期仍接近 `1.0`，需要重点检查当前 HR 目标和实际优化方向。
+
+### 逐层诊断
+- 诊断输出:
+  - pretrain: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_single_debug/diagnostics/dense_pretrain_hrconfig`
+  - HR step 100: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_single_debug/diagnostics/dense_hr_step0100`
+  - HR step 500: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_single_debug/diagnostics/dense_hr_step0500`
+  - HR last: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_single_debug/diagnostics/dense_hr_last`
+  - baseline last: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_single_debug/diagnostics/dense_baseline_last`
+- 全 24 层平均:
+  - pretrain: `PSNR=21.01`, `text_mass=0.0178`, `tau_loss=0.9163`, `effective_rank=4.51`
+  - HR step 100: `PSNR=24.57`, `text_mass=0.0308`, `tau_loss=0.9088`, `effective_rank=3.71`
+  - HR step 500: `PSNR=40.83`, `text_mass=0.0173`, `tau_loss=0.8968`, `effective_rank=4.09`
+  - HR last: `PSNR=43.58`, `text_mass=0.0117`, `tau_loss=0.9358`, `effective_rank=4.23`
+  - baseline last: `PSNR=43.72`, `text_mass=0.0113`, `tau_loss=0.9466`, `effective_rank=4.29`
+- 当前 HR 实际训练层 8-15 平均:
+  - HR step 500: `text_mass=0.00323`, `tau_loss=0.9835`, `sigma_mean=0.0165`
+  - HR last: `text_mass=0.00236`, `tau_loss=0.9915`, `sigma_mean=0.00848`
+  - baseline last: `text_mass=0.00244`, `tau_loss=0.9914`, `sigma_mean=0.00863`
+- 结论:
+  - 8-15 层中，HR last 与 baseline last 的 `text_mass`、`tau_loss`、`sigma_mean` 几乎相同。
+  - 这说明当前 HR 项虽然被计算和记录，但在这张 dense 单图上没有把被选层的 text cross-attention 谱推向预期目标。
+  - 更可疑的是训练层的 text attention mass 在后期接近 0，导致 SVD 奇异值整体很小，`abs(sigma - tau)` 形式的 loss 长期接近 `tau=1`。
+
+### 诊断脚本修正
+- `diagnose_single_image.py` 中 `model.encode(image, return_code=False)` 返回的 `diff` 在当前模型里可能是 list。
+- 增加 `scalar_mean()`，递归汇总 tensor/list/dict 形式的辅助 loss，避免诊断 summary 写入时报错。
