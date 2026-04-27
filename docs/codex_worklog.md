@@ -1048,3 +1048,52 @@ python scripts/stage1/prepare_t5_encoder.py \
 - 本地已通过语法检查：
   - `python3 -m py_compile scripts/stage1/evaluate_textatlas_reconstruction.py`
 - 本地 Python 没有安装 `torch`，因此完整 import / reconstruction / OCR 需要在 ModelArts 环境验证。
+
+# 2026-04-27 单图过拟合诊断工具
+
+## 目标
+- 将单图测试相关代码集中到独立目录，避免继续把临时诊断逻辑散落到主训练脚本。
+- 用 dense / medium / sparse 三张 train 样本做单图 overfit，验证当前 text-HR 结构是否能在单样本上降 loss。
+- 对单图 checkpoint 做逐层 decoder cross-attention SVD 和特征统计，排查 HR 分支是否真正生效。
+
+## 新增目录
+- `scripts/stage1/single_image_debug/`
+
+## 新增文件
+- `README.md`
+  - 记录单图 manifest 生成、单图 overfit、逐层诊断命令。
+- `make_single_image_manifests.py`
+  - 从当前 train manifest 抽取三张指定样本。
+  - 默认目标：
+    - dense: `CleanTextSynth:train:2731`
+    - medium: `TextScenesHQ:train:2803`
+    - sparse: `LongWordsSubset-A:train:3149`
+- `run_single_image_overfit.sh`
+  - 单图 HR overfit 启动脚本。
+  - 默认输出到 `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_single_debug`。
+- `diagnose_single_image.py`
+  - 加载指定 checkpoint，对单图逐层 forward。
+  - 输出 `per_layer_metrics.csv`、`summary.json`、重建图、diff 图和每层 SVD 奇异值。
+  - 诊断指标包括当前代码使用的 `tau` 版本 HR loss，以及 normalized spectrum loss 作为参考指标。
+
+## 检查
+- 本地已通过语法检查：
+  - `python3 -m py_compile scripts/stage1/single_image_debug/make_single_image_manifests.py scripts/stage1/single_image_debug/diagnose_single_image.py`
+  - `bash -n scripts/stage1/single_image_debug/run_single_image_overfit.sh`
+- 本地没有 ModelArts NPU / torch-npu 环境，完整运行需要在服务器验证。
+
+## 2026-04-27 自查修正
+- 修复 `diagnose_single_image.py` 中的 encoder feature 读取：
+  - 原先 `model.encode(image)` 会按默认 `return_code=True` 返回 `(quant, emb_loss, info)`。
+  - 现在显式使用 `model.encode(image, return_code=False)`，与训练 forward 一致，第三项才是 `encoder_spatial`。
+- 为 `diagnose_single_image.py` 增加 `--seed`，默认 `0`：
+  - 诊断原始 VQ checkpoint 时，`text_projection` / `text_type_embedding` 缺失并会重新初始化。
+  - 固定 seed 可以让这部分初始化可复现。
+- 修复 `run_single_image_overfit.sh` 默认 config：
+  - HR 默认使用仓库内 `configs/vq/VQ_BL256_dino_disc_text_hr_v2.yaml`。
+  - baseline 默认使用仓库内 `configs/vq/VQ_BL256_dino_disc_text_baseline_v2.yaml`。
+  - 仍支持在服务器通过 `CONFIG=configs/vq/_pilot_text_hr_local.yaml` 使用本地 T5 配置。
+- `README.md` 已补充：
+  - `MODE=hr` 和 `MODE=baseline` 的同图 overfit 命令。
+  - 向师姐汇报“每一层”时使用 `--layer-mode all_decoder`。
+- `diagnose_single_image.py` 的 `--layer-mode` 默认值已改为 `all_decoder`，避免误只诊断 8-15 配置层。
