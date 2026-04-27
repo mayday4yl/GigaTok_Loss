@@ -130,6 +130,16 @@ def normalized_spectrum_loss(sigma: torch.Tensor, eps: float = 1e-6) -> Tuple[to
     return loss, p, effective_rank
 
 
+def energy_spectrum_loss(sigma: torch.Tensor, eps: float = 1e-8) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    energy = sigma.pow(2)
+    p = energy / (energy.sum() + eps)
+    r = sigma.numel()
+    loss = (p - (1.0 / max(1, r))).pow(2).mean()
+    entropy = -(p.clamp_min(eps) * p.clamp_min(eps).log()).sum()
+    effective_rank = entropy.exp()
+    return loss, p, effective_rank
+
+
 def rank_at_energy(p: torch.Tensor, threshold: float) -> int:
     if p.numel() == 0:
         return 0
@@ -162,16 +172,27 @@ def attention_svd_metrics(
     valid_text_attn = text_attn[0, :, :, valid_mask]
     text_mass = valid_text_attn.sum(dim=-1)
     matrix = valid_text_attn.reshape(num_heads * num_queries, valid_text_tokens) / math.sqrt(num_heads)
-    sigma = torch.linalg.svdvals(matrix.float())
+    matrix = matrix.float()
+    fro_norm = torch.norm(matrix, p="fro")
+    sigma = torch.linalg.svdvals(matrix)
+    sigma_fro = torch.linalg.svdvals(matrix / (fro_norm + 1e-8))
     sigma_sorted = sigma.detach().cpu()
+    sigma_fro_sorted = sigma_fro.detach().cpu()
     if out_npy is not None:
         out_npy.parent.mkdir(parents=True, exist_ok=True)
         np.save(out_npy, sigma_sorted.numpy())
+        np.save(out_npy.with_name(f"{out_npy.stem}_frobenius{out_npy.suffix}"), sigma_fro_sorted.numpy())
 
     norm_loss, p, effective_rank = normalized_spectrum_loss(sigma)
+    raw_energy_loss, raw_energy_p, raw_energy_effective_rank = energy_spectrum_loss(sigma)
+    fro_loss, fro_p, fro_effective_rank = energy_spectrum_loss(sigma_fro)
     current_loss = torch.abs(sigma - sigma.new_tensor(tau)).mean()
     top1_ratio = p[0] if p.numel() else sigma.new_tensor(0.0)
     top5_ratio = p[: min(5, p.numel())].sum() if p.numel() else sigma.new_tensor(0.0)
+    raw_energy_top1 = raw_energy_p[0] if raw_energy_p.numel() else sigma.new_tensor(0.0)
+    raw_energy_top5 = raw_energy_p[: min(5, raw_energy_p.numel())].sum() if raw_energy_p.numel() else sigma.new_tensor(0.0)
+    fro_energy_top1 = fro_p[0] if fro_p.numel() else sigma.new_tensor(0.0)
+    fro_energy_top5 = fro_p[: min(5, fro_p.numel())].sum() if fro_p.numel() else sigma.new_tensor(0.0)
 
     return {
         "num_heads": float(num_heads),
@@ -191,6 +212,24 @@ def attention_svd_metrics(
         "effective_rank": float(effective_rank.item()),
         "rank90": float(rank_at_energy(p, 0.90)),
         "rank95": float(rank_at_energy(p, 0.95)),
+        "raw_energy_top1_ratio": float(raw_energy_top1.item()),
+        "raw_energy_top5_ratio": float(raw_energy_top5.item()),
+        "raw_energy_effective_rank": float(raw_energy_effective_rank.item()),
+        "raw_energy_rank90": float(rank_at_energy(raw_energy_p, 0.90)),
+        "raw_energy_rank95": float(rank_at_energy(raw_energy_p, 0.95)),
+        "raw_energy_uniform_loss": float(raw_energy_loss.item()),
+        "frobenius_norm": float(fro_norm.item()),
+        "frobenius_sigma_mean": float(sigma_fro.mean().item()),
+        "frobenius_sigma_std": float(sigma_fro.std(unbiased=False).item()),
+        "frobenius_sigma_min": float(sigma_fro.min().item()),
+        "frobenius_sigma_max": float(sigma_fro.max().item()),
+        "frobenius_sigma_top1": float(sigma_fro[0].item()),
+        "frobenius_energy_top1_ratio": float(fro_energy_top1.item()),
+        "frobenius_energy_top5_ratio": float(fro_energy_top5.item()),
+        "frobenius_effective_rank": float(fro_effective_rank.item()),
+        "frobenius_rank90": float(rank_at_energy(fro_p, 0.90)),
+        "frobenius_rank95": float(rank_at_energy(fro_p, 0.95)),
+        "frobenius_uniform_loss": float(fro_loss.item()),
         "current_code_tau_loss": float(current_loss.item()),
         "normalized_spectrum_loss": float(norm_loss.item()),
     }
@@ -386,7 +425,9 @@ def main() -> None:
                 f"mse={metrics['mse']:.6f} psnr={metrics['psnr']:.3f} "
                 f"text_mass={metrics['text_attention_mass_mean']:.4f} "
                 f"sigma_top1_ratio={metrics['sigma_top1_ratio']:.4f} "
-                f"tau_loss={metrics['current_code_tau_loss']:.4f}"
+                f"tau_loss={metrics['current_code_tau_loss']:.4f} "
+                f"frob_loss={metrics['frobenius_uniform_loss']:.6f} "
+                f"frob_erank={metrics['frobenius_effective_rank']:.2f}"
             )
 
     write_csv(args.output_dir / "per_layer_metrics.csv", rows)

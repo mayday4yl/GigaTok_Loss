@@ -153,7 +153,9 @@ def high_rank_image_text_attention_loss(
         text_attention_mask,
         image_token_len=256,
         tau=1.0,
-        skip_if_valid_tokens_lt=2):
+        skip_if_valid_tokens_lt=2,
+        svd_mode="frobenius_uniform",
+        eps=1e-8):
     """Text-HR v2: compute HR loss on the image-query to valid-text-key slice.
 
     attn_weights is the selected decoder layer post-softmax cross-attention
@@ -183,10 +185,26 @@ def high_rank_image_text_attention_loss(
     # Text-HR v2: keep only the text-key slice; padding tokens are removed
     # per sample before SVD.
     text_attn = attn_weights[:, :, :, image_token_len:image_token_len + text_token_len]
+    svd_mode = str(svd_mode)
+    frobenius_modes = {"frobenius_uniform", "frobenius_energy_uniform"}
+    legacy_modes = {"legacy_tau", "raw_tau", "per_sample_all_heads_sqrt_norm"}
+    if svd_mode not in frobenius_modes and svd_mode not in legacy_modes:
+        raise ValueError(
+            f"Unknown text_hr svd_mode={svd_mode}. "
+            f"Expected one of {sorted(frobenius_modes | legacy_modes)}."
+        )
+
     losses = []
-    sigma_means = []
-    sigma_mins = []
-    sigma_maxs = []
+    raw_sigma_means = []
+    raw_sigma_mins = []
+    raw_sigma_maxs = []
+    normed_sigma_means = []
+    normed_sigma_mins = []
+    normed_sigma_maxs = []
+    fro_norms = []
+    effective_ranks = []
+    energy_top1s = []
+    energy_top5s = []
     valid_token_counts = []
     skipped_samples = 0
 
@@ -200,11 +218,40 @@ def high_rank_image_text_attention_loss(
         matrix = text_attn[batch_idx, :, :, valid_mask]
         matrix = matrix.reshape(num_heads * num_queries, valid_token_count) / math.sqrt(num_heads)
         # Text-HR v2: SVD is computed in float32 for stability even under bf16 training.
-        sigma = torch.linalg.svdvals(matrix.float())
-        losses.append(torch.abs(sigma - sigma.new_tensor(tau)).mean())
-        sigma_means.append(sigma.detach().mean())
-        sigma_mins.append(sigma.detach().min())
-        sigma_maxs.append(sigma.detach().max())
+        matrix = matrix.float()
+        raw_sigma = torch.linalg.svdvals(matrix)
+
+        fro_norm = torch.norm(matrix, p="fro")
+        if svd_mode in frobenius_modes:
+            # Fix the total matrix energy before SVD. The loss then only
+            # penalizes singular-value energy concentration, not attention scale.
+            matrix_for_svd = matrix / (fro_norm + eps)
+            sigma = torch.linalg.svdvals(matrix_for_svd)
+            sigma_energy = sigma.pow(2)
+            p = sigma_energy / (sigma_energy.sum() + eps)
+            target = sigma.new_tensor(1.0 / max(1, sigma.numel()))
+            losses.append((p - target).pow(2).mean())
+        else:
+            sigma = raw_sigma
+            sigma_energy = sigma.pow(2)
+            p = sigma_energy / (sigma_energy.sum() + eps)
+            losses.append(torch.abs(sigma - sigma.new_tensor(tau)).mean())
+
+        p_detached = p.detach().clamp_min(eps)
+        entropy = -(p_detached * p_detached.log()).sum()
+        effective_rank = entropy.exp()
+        top5 = p.detach()[: min(5, p.numel())].sum()
+
+        raw_sigma_means.append(raw_sigma.detach().mean())
+        raw_sigma_mins.append(raw_sigma.detach().min())
+        raw_sigma_maxs.append(raw_sigma.detach().max())
+        normed_sigma_means.append(sigma.detach().mean())
+        normed_sigma_mins.append(sigma.detach().min())
+        normed_sigma_maxs.append(sigma.detach().max())
+        fro_norms.append(fro_norm.detach())
+        effective_ranks.append(effective_rank)
+        energy_top1s.append(p.detach()[0])
+        energy_top5s.append(top5)
         valid_token_counts.append(valid_token_count)
 
     if not losses:
@@ -213,6 +260,13 @@ def high_rank_image_text_attention_loss(
             "sigma_mean": zero.detach(),
             "sigma_min": zero.detach(),
             "sigma_max": zero.detach(),
+            "normed_sigma_mean": zero.detach(),
+            "normed_sigma_min": zero.detach(),
+            "normed_sigma_max": zero.detach(),
+            "fro_norm_mean": zero.detach(),
+            "effective_rank_mean": zero.detach(),
+            "energy_top1_mean": zero.detach(),
+            "energy_top5_mean": zero.detach(),
             "valid_text_tokens_mean": zero.detach(),
             "valid_samples": 0,
             "skipped_samples": skipped_samples,
@@ -222,9 +276,18 @@ def high_rank_image_text_attention_loss(
     hr_loss = torch.stack(losses).mean()
     valid_tokens = torch.tensor(valid_token_counts, device=attn_weights.device, dtype=torch.float32)
     stats = {
-        "sigma_mean": torch.stack(sigma_means).mean(),
-        "sigma_min": torch.stack(sigma_mins).mean(),
-        "sigma_max": torch.stack(sigma_maxs).mean(),
+        # raw sigma stats keep exposing whether image-to-text attention mass is collapsing.
+        "sigma_mean": torch.stack(raw_sigma_means).mean(),
+        "sigma_min": torch.stack(raw_sigma_mins).mean(),
+        "sigma_max": torch.stack(raw_sigma_maxs).mean(),
+        # normed sigma stats are the actual spectrum used by frobenius_uniform.
+        "normed_sigma_mean": torch.stack(normed_sigma_means).mean(),
+        "normed_sigma_min": torch.stack(normed_sigma_mins).mean(),
+        "normed_sigma_max": torch.stack(normed_sigma_maxs).mean(),
+        "fro_norm_mean": torch.stack(fro_norms).mean(),
+        "effective_rank_mean": torch.stack(effective_ranks).mean(),
+        "energy_top1_mean": torch.stack(energy_top1s).mean(),
+        "energy_top5_mean": torch.stack(energy_top5s).mean(),
         "valid_text_tokens_mean": valid_tokens.mean(),
         "valid_samples": len(losses),
         "skipped_samples": skipped_samples,
@@ -431,7 +494,8 @@ class VQLoss(nn.Module):
                 hr_attn_weights=None, hr_loss_weight=0.0, selected_layer=None, hr_eps=1e-6,
                 text_hr_attn_weights=None, text_attention_mask=None, text_hr_loss_weight=0.0,
                 selected_text_layer=None, text_hr_tau=1.0,
-                text_hr_skip_if_valid_tokens_lt=2, text_hr_image_token_len=256
+                text_hr_skip_if_valid_tokens_lt=2, text_hr_image_token_len=256,
+                text_hr_svd_mode="frobenius_uniform", text_hr_eps=1e-8
                 ):
         assert len(inter_loss_set) == 2
         assert isinstance(all_reconstructions, list)
@@ -574,6 +638,8 @@ class VQLoss(nn.Module):
                     image_token_len=text_hr_image_token_len,
                     tau=text_hr_tau,
                     skip_if_valid_tokens_lt=text_hr_skip_if_valid_tokens_lt,
+                    svd_mode=text_hr_svd_mode,
+                    eps=text_hr_eps,
                 )
             elif text_hr_loss_weight != 0:
                 raise ValueError("text_hr_loss_weight is non-zero but text_hr_attn_weights is None.")
@@ -612,7 +678,11 @@ class VQLoss(nn.Module):
                         error_info += (
                             f"text_hr_loss: {text_hr_loss:.4e}, text_hr_loss_weight: {text_hr_loss_weight:.4e}, "
                             f"selected_decoder_layer: {selected_layer}, selected_text_layer: {selected_text_layer}, "
+                            f"text_hr_svd_mode: {text_hr_svd_mode}, "
                             f"text_hr_sigma_mean: {text_hr_stats['sigma_mean']:.4e}, "
+                            f"text_hr_normed_sigma_mean: {text_hr_stats['normed_sigma_mean']:.4e}, "
+                            f"text_hr_fro_norm_mean: {text_hr_stats['fro_norm_mean']:.4e}, "
+                            f"text_hr_effective_rank_mean: {text_hr_stats['effective_rank_mean']:.2f}, "
                             f"text_hr_valid_text_tokens_mean: {text_hr_stats['valid_text_tokens_mean']:.2f}, "
                             f"text_hr_skipped_samples: {text_hr_stats['skipped_samples']}\n"
                         )
@@ -644,7 +714,12 @@ class VQLoss(nn.Module):
                     log_msg += (
                         f", text_hr_loss: {text_hr_loss:.4e}, weighted_text_hr_loss: {text_hr_loss_term:.4e}, "
                         f"selected_decoder_layer: {selected_layer}, selected_text_layer: {selected_text_layer}, "
+                        f"text_hr_svd_mode: {text_hr_svd_mode}, "
                         f"text_hr_sigma_mean: {text_hr_stats['sigma_mean']:.4e}, "
+                        f"text_hr_normed_sigma_mean: {text_hr_stats['normed_sigma_mean']:.4e}, "
+                        f"text_hr_fro_norm_mean: {text_hr_stats['fro_norm_mean']:.4e}, "
+                        f"text_hr_effective_rank_mean: {text_hr_stats['effective_rank_mean']:.2f}, "
+                        f"text_hr_energy_top1_mean: {text_hr_stats['energy_top1_mean']:.4f}, "
                         f"text_hr_valid_text_tokens_mean: {text_hr_stats['valid_text_tokens_mean']:.2f}, "
                         f"text_hr_skipped_samples: {text_hr_stats['skipped_samples']}"
                     )
@@ -683,6 +758,13 @@ class VQLoss(nn.Module):
                         "(Generator)text_hr_sigma_mean": text_hr_stats["sigma_mean"].detach(),
                         "(Generator)text_hr_sigma_min": text_hr_stats["sigma_min"].detach(),
                         "(Generator)text_hr_sigma_max": text_hr_stats["sigma_max"].detach(),
+                        "(Generator)text_hr_normed_sigma_mean": text_hr_stats["normed_sigma_mean"].detach(),
+                        "(Generator)text_hr_normed_sigma_min": text_hr_stats["normed_sigma_min"].detach(),
+                        "(Generator)text_hr_normed_sigma_max": text_hr_stats["normed_sigma_max"].detach(),
+                        "(Generator)text_hr_fro_norm_mean": text_hr_stats["fro_norm_mean"].detach(),
+                        "(Generator)text_hr_effective_rank_mean": text_hr_stats["effective_rank_mean"].detach(),
+                        "(Generator)text_hr_energy_top1_mean": text_hr_stats["energy_top1_mean"].detach(),
+                        "(Generator)text_hr_energy_top5_mean": text_hr_stats["energy_top5_mean"].detach(),
                         "(Generator)text_hr_valid_text_tokens_mean": text_hr_stats["valid_text_tokens_mean"].detach(),
                         "(Generator)text_hr_valid_samples": text_hr_stats["valid_samples"],
                         "(Generator)text_hr_skipped_samples": text_hr_stats["skipped_samples"],

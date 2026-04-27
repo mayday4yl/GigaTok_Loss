@@ -83,6 +83,10 @@ CONFIG=configs/vq/_pilot_text_hr_local.yaml MODE=hr TAG=dense bash scripts/stage
 - HR 模式额外看：
   - `text_hr_loss`
   - `text_hr_sigma_mean`
+  - `text_hr_normed_sigma_mean`
+  - `text_hr_fro_norm_mean`
+  - `text_hr_effective_rank_mean`
+  - `text_hr_energy_top1_mean`
   - `selected_decoder_layer`
   - `selected_text_layer`
 
@@ -131,6 +135,14 @@ python scripts/stage1/single_image_debug/diagnose_single_image.py \
 - `recon_layerXX.png`
 - `diff_layerXX.png`
 - `singular_values_layerXX.npy`
+- `singular_values_layerXX_textXX_frobenius.npy`
+
+重点看 `per_layer_metrics.csv` 里的：
+- `frobenius_uniform_loss`: 当前新版 HR loss 的诊断值。
+- `frobenius_effective_rank`: Frobenius 归一化后基于奇异值能量的有效秩。
+- `frobenius_energy_top1_ratio`: 最大奇异方向占据的能量比例，越低越不塌缩。
+- `frobenius_norm`: SVD 前 raw attention 矩阵的 Frobenius norm，用来确认 attention-to-text 总能量是否被压小。
+- `current_code_tau_loss`: 旧版 `abs(sigma - tau)` 诊断值，仅保留作兼容对照。
 
 `layer-mode=config_pairs` 只诊断训练配置里的 layer pairs，例如 8-15。若只想快速检查训练真正使用的层，可以这样跑：
 

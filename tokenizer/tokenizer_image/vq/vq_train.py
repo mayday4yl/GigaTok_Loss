@@ -448,6 +448,8 @@ def main(args):
         raise ValueError("v1 hr_on and v2 text_hr.enabled cannot be enabled at the same time.")
     text_hr_loss_weight = float(text_hr_cfg.get("hr_loss_weight", 0.0)) if text_hr_on else 0.0
     text_hr_tau = float(text_hr_cfg.get("tau", 1.0))
+    text_hr_svd_mode = str(text_hr_cfg.get("svd_mode", "frobenius_uniform"))
+    text_hr_eps = float(text_hr_cfg.get("eps", 1e-8))
     text_hr_skip_if_valid_tokens_lt = int(text_hr_cfg.get("skip_if_valid_tokens_lt", 2))
     text_max_length = int(text_conditioning_cfg.get("max_length", 128))
     freeze_encoder = config["trainer"].get("freeze_encoder", False)
@@ -1273,6 +1275,8 @@ def main(args):
                                    text_hr_loss_weight=text_hr_loss_weight if text_hr_on else 0.0,
                                    selected_text_layer=selected_text_layer,
                                    text_hr_tau=text_hr_tau,
+                                   text_hr_svd_mode=text_hr_svd_mode,
+                                   text_hr_eps=text_hr_eps,
                                    text_hr_skip_if_valid_tokens_lt=text_hr_skip_if_valid_tokens_lt,
                                    text_hr_image_token_len=text_hr_image_token_len,
                                    )

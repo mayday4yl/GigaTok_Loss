@@ -83,6 +83,8 @@ text_conditioning:
 text_hr:
   enabled: True
   hr_loss_weight: 1.0
+  # tau is only used by legacy_tau mode. The default mode below fixes
+  # attention-matrix energy before SVD and regularizes spectrum energy.
   tau: 1.0
   image_token_len: 256
   layer_strategy: "explicit_pairs"
@@ -101,7 +103,8 @@ text_hr:
   attention_source: "post_softmax"
   matrix: "image_to_text_attention"
   mask_padding_before_svd: True
-  svd_mode: "per_sample_all_heads_sqrt_norm"
+  svd_mode: "frobenius_uniform"
+  eps: 1e-8
   skip_if_valid_tokens_lt: 2
 
 loss:

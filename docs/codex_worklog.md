@@ -1431,3 +1431,32 @@ git diff --name-status upstream/master...HEAD
   - `text_attention_mass_mean`
   - `effective_rank`
 - 训练后用 `diagnose_single_image.py` 对比 pretrain 和 HR-only last 的奇异值谱。
+
+## 2026-04-27 修正 Text-HR SVD loss 的归一化口径
+
+## 背景
+- 单图诊断发现旧版 `abs(sigma - tau)` 会鼓励模型把 image-to-text attention 的整体能量压低，从而让 raw singular values 远离 1 甚至接近 0。
+- 师姐建议在 SVD 前先对 attention 矩阵做 Frobenius norm 归一化，固定矩阵总能量后再看奇异值分布。
+
+## 修改
+- `high_rank_image_text_attention_loss` 新增 `svd_mode="frobenius_uniform"`：
+  - 对 `[heads * image_tokens, valid_text_tokens]` 矩阵先做 Frobenius norm 归一化。
+  - 对归一化矩阵做 float32 SVD。
+  - 用奇异值平方能量分布 `sigma^2 / sum(sigma^2)` 对齐均匀分布，避免通过压低 attention scale 降 loss。
+- 保留旧 `legacy_tau` / `per_sample_all_heads_sqrt_norm` 模式用于复现实验。
+- 训练日志新增：
+  - `text_hr_normed_sigma_mean`
+  - `text_hr_fro_norm_mean`
+  - `text_hr_effective_rank_mean`
+  - `text_hr_energy_top1_mean`
+- `VQ_BL256_dino_disc_text_hr_v2.yaml` 和 `VQ_BL256_dino_disc_text_hr_only_v2.yaml` 默认切到 `svd_mode: "frobenius_uniform"`。
+- 单图诊断脚本同时保存 raw singular values 和 Frobenius-normalized singular values，并输出 `frobenius_uniform_loss` / `frobenius_effective_rank` / `frobenius_energy_top1_ratio`。
+
+## 建议验证
+- 先重新跑 HR-only 单图 2 step smoke，确认 `Train Loss` 约等于 `weighted_text_hr_loss`。
+- 再分别对 dense / medium / sparse 跑 HR-only 1000 step。
+- 对训练前后 checkpoint 跑 `diagnose_single_image.py`，重点看：
+  - `frobenius_uniform_loss` 是否下降。
+  - `frobenius_effective_rank` 是否上升。
+  - `frobenius_energy_top1_ratio` 是否下降。
+  - `frobenius_norm` 是否仍明显塌缩；若塌缩，说明 attention-to-text mass 仍需要额外约束。
