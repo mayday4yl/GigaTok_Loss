@@ -1386,3 +1386,23 @@ git diff --name-status upstream/master...HEAD
 
 ## 影响
 - 仅增加说明文档，不改变训练代码、模型结构或实验配置。
+
+## 2026-04-27 更新仓库首页 README
+
+## 背景
+- 原根目录 `README.md` 仍是官方 GigaTok 发布页，不利于从 GitHub 分支首页快速理解当前 Text-HR stage-1 pilot。
+- 需要让 `codex/text-hr-decoder` 分支主页直接展示当前最新做法、训练命令和诊断入口。
+
+## 修改
+- 将根目录 `README.md` 改为当前分支说明：
+  - Text-HR v2 方法概述。
+  - 核心代码文件和 config。
+  - TextAtlas 数据口径。
+  - 服务器环境变量。
+  - 4 卡 baseline / 4 卡 HR 训练命令。
+  - 单图 overfit 与逐层诊断命令。
+  - 当前已知结论和后续优先事项。
+  - 给师姐看的最小材料列表。
+
+## 影响
+- 仅修改文档，不改变训练代码、模型结构或实验配置。
