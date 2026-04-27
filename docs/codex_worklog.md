@@ -1295,6 +1295,34 @@ MODE=baseline TAG=sparse ITERS=1000 ASCEND_RT_VISIBLE_DEVICES=0 \
 ## 影响
 - 仅增加注释和导览文档，不改变训练逻辑、模型结构、loss 公式或默认参数。
 
+## 2026-04-27 补充原版 GigaTok 对比导览
+
+## 背景
+- 需要明确当前主要修改是相对于官方原版 GigaTok，而不是相对于中间实验分支。
+- 本地已有官方 remote：
+  - `upstream=https://github.com/SilentView/GigaTok.git`
+  - `upstream/master=baf3de042034318aa762c28db4d14231efce8b0c`
+
+## 修改
+- 新增 `docs/original_gigatok_diff_map.md`。
+- 该文档以 `upstream/master...HEAD` 为口径，整理：
+  - 核心 Text-HR v2 方法改动。
+  - TextAtlas 数据接入。
+  - NPU / validation / checkpoint 兼容。
+  - 单图 overfit 与逐层诊断工具。
+  - 给师姐看的最小文件列表。
+
+## 统计口径
+```bash
+git diff --stat upstream/master...HEAD
+git diff --name-status upstream/master...HEAD
+```
+
+当前总量约：
+```text
+44 files changed, 9432 insertions(+), 114 deletions(-)
+```
+
 ## 2026-04-27 dense HR 单图重跑结果复查
 
 ## 背景
