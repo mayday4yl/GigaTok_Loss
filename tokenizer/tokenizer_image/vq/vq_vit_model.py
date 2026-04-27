@@ -359,6 +359,8 @@ class VQVitModelPlus(nn.Module):
             text_feature_dim,
             text_projection="linear_layernorm",
             text_type_embedding=True):
+        # Text-HR v2: build the small trainable bridge from frozen T5 hidden states
+        # to the GigaTok transformer decoder width.
         decoder_width = self.s1to2decoder.width
         if text_projection == "linear":
             self.text_projection = nn.Linear(text_feature_dim, decoder_width)
@@ -387,6 +389,8 @@ class VQVitModelPlus(nn.Module):
             self.text_type_embedding = None
 
     def project_text_memory(self, decoder_text_features):
+        # Text-HR v2: decoder_text_features are selected T5 layer features [B, T, d_t5].
+        # This projects them to decoder memory tokens [B, T, d_dec].
         if decoder_text_features is None:
             return None
         if self.text_projection is None:
@@ -486,6 +490,8 @@ class VQVitModelPlus(nn.Module):
         text_memory = self.project_text_memory(decoder_text_features)
         if text_memory is not None and selected_decoder_layer is None:
             raise ValueError("decoder_text_features requires selected_decoder_layer for text injection.")
+        # Text-HR v2: only the selected decoder layer receives text_memory and
+        # returns its post-softmax cross-attention weights for the HR loss.
         if ret_inner_feat:
             if selected_decoder_layer is not None:
                 rec_spatial, inner_feat, decoder_cross_attn = self.s1to2decoder(
@@ -541,6 +547,8 @@ class VQVitModelPlus(nn.Module):
             decoder_text_features=None,
             decoder_text_key_padding_mask=None,
             ):
+        # Text-HR v2: selected_decoder_layer / decoder_text_features keep the
+        # original image-only path unchanged when they are None.
         quant, diff, spatial = self.encode(
                                     input, 
                                     return_code=False, 
@@ -1491,4 +1499,3 @@ def compute_cosinesim_loss(feat1, feat2, dim):
     cos_sim = F.cosine_similarity(feat1, feat2, dim=dim)
     loss = 1 - cos_sim
     return torch.mean(loss)  
-

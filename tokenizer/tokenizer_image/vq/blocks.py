@@ -643,6 +643,8 @@ class TransformerDecoderLayer(nn.Module):
                      pos: Optional[Tensor] = None,
                      query_pos: Optional[Tensor] = None,
                      return_cross_attn_weights: bool = False):
+        # Text-HR v2: return_cross_attn_weights is only enabled for the chosen
+        # decoder layer. PyTorch returns post-softmax attention weights.
         
         if self.query_rope:
             tgt2 = self.self_attn(
@@ -691,6 +693,7 @@ class TransformerDecoderLayer(nn.Module):
                     pos: Optional[Tensor] = None,
                     query_pos: Optional[Tensor] = None,
                     return_cross_attn_weights: bool = False):
+        # Text-HR v2: same hook as forward_post for pre-norm decoder blocks.
         tgt2 = self.norm1(tgt)
         if self.query_rope:
             tgt2 = self.self_attn(

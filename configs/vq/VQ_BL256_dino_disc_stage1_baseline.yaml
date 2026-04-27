@@ -65,6 +65,8 @@ trainer:
   freeze_quantizer: True
   freeze_codebook: True
 
+# Native GigaTok baseline: no text_conditioning block and no text_hr block.
+# Keep this config as the image-only reference for HR comparisons.
 
 loss:
   loss_cls: VQLoss

@@ -436,6 +436,8 @@ def main(args):
     hr_on = config["trainer"].get("hr_on", False)
     hr_loss_weight = float(config["trainer"].get("hr_loss_weight", 0.0))
     hr_random_one_layer = config["trainer"].get("hr_random_one_layer", True)
+    # Text-HR v2: separate config blocks make the text-conditioned path optional.
+    # If both switches are off, the original GigaTok stage-1 path is used.
     text_conditioning_cfg = config.get("text_conditioning", {})
     text_hr_cfg = config.get("text_hr", {})
     text_conditioning_on = bool(text_conditioning_cfg.get("enabled", False))
@@ -659,6 +661,8 @@ def main(args):
     text_encoder_num_layers = None
     text_feature_dim = None
     if text_conditioning_on:
+        # Text-HR v2: T5 is frozen and only provides hidden states for decoder
+        # cross-attention; gradients do not update T5.
         if AutoTokenizer is None or T5EncoderModel is None:
             raise ImportError("text_conditioning.enabled=True requires transformers with T5EncoderModel.")
         text_encoder_name = text_conditioning_cfg.get("encoder_name", "google/t5-v1_1-xl")
@@ -687,6 +691,8 @@ def main(args):
  
     vq_model = load_model_from_config(config)
     if text_conditioning_on:
+        # Text-HR v2: add the lightweight projection parameters after loading
+        # the base model definition, before checkpoint compatibility loading.
         vq_model.configure_text_conditioning(
             text_feature_dim=text_feature_dim,
             text_projection=text_conditioning_cfg.get("text_projection", "linear_layernorm"),
@@ -1117,6 +1123,8 @@ def main(args):
 
             if text_conditioning_on:
                 pair_rng = random.Random(train_steps + 1 + args.global_seed)
+                # Text-HR v2: randomly choose one [T5 layer, decoder layer] pair
+                # per training step, matching the current experimental design.
                 if text_hr_cfg.get("random_one_pair_per_step", True):
                     selected_text_layer, selected_decoder_layer = text_layer_pairs[
                         pair_rng.randrange(len(text_layer_pairs))
@@ -1156,6 +1164,8 @@ def main(args):
                         f"selected_text_layer={selected_text_layer} maps to hidden_states[{hidden_state_index}], "
                         f"but T5 returned only {len(hidden_states)} hidden states."
                     )
+                # Text-HR v2: this hidden state is projected inside VQVitModelPlus
+                # and injected only into selected_decoder_layer.
                 decoder_text_features = hidden_states[hidden_state_index].detach()
             elif hr_on:
                 if hr_random_one_layer:
@@ -1256,6 +1266,8 @@ def main(args):
                                    hr_attn_weights=hr_attn_weights if hr_on else None,
                                    hr_loss_weight=hr_loss_weight if hr_on else 0.0,
                                    selected_layer=selected_decoder_layer,
+                                   # Text-HR v2: pass the selected layer attention
+                                   # and text mask into VQLoss for image-to-text SVD.
                                    text_hr_attn_weights=hr_attn_weights if text_hr_on else None,
                                    text_attention_mask=text_attention_mask if text_hr_on else None,
                                    text_hr_loss_weight=text_hr_loss_weight if text_hr_on else 0.0,

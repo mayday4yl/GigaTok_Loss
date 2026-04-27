@@ -62,6 +62,8 @@ trainer:
   freeze_codebook: True
   freeze_post_quant_conv: True
 
+# Text-HR v2: enable frozen T5 features as extra memory for one selected
+# GigaTok transformer decoder cross-attention layer.
 text_conditioning:
   enabled: True
   # Can be a Hugging Face model id or a local directory that contains T5 files.
@@ -76,6 +78,8 @@ text_conditioning:
   text_type_embedding: True
   text_position_embedding: False
 
+# Text-HR v2: compute the HR/SVD regularizer on the selected layer's
+# post-softmax image-to-text attention matrix.
 text_hr:
   enabled: True
   hr_loss_weight: 1.0

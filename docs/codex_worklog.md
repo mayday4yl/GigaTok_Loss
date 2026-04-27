@@ -1274,3 +1274,63 @@ MODE=baseline TAG=sparse ITERS=1000 ASCEND_RT_VISIBLE_DEVICES=0 \
   - 不使用 decoder text cross-attention。
   - 不计算 HR loss。
 - 但数据读取和预处理与 HR 单图实验保持一致，适合做严格单图对照。
+
+## 2026-04-27 标注 Text-HR v2 主要改动位置
+
+## 背景
+- 为了方便师姐快速审阅当前分支相对原生 GigaTok 的改动，需要在代码里标注关键改动点。
+
+## 修改
+- 新增 `docs/text_hr_code_map.md`：
+  - 汇总 config、模型、loss、训练、单图诊断各自的改动入口。
+  - 说明可以在代码里搜索 `Text-HR v2` 快速定位。
+- 在核心代码添加轻量注释标记：
+  - `tokenizer/tokenizer_image/vq/vq_vit_model.py`
+  - `tokenizer/tokenizer_image/vq/blocks.py`
+  - `tokenizer/tokenizer_image/vq/vq_loss.py`
+  - `tokenizer/tokenizer_image/vq/vq_train.py`
+  - `configs/vq/VQ_BL256_dino_disc_text_hr_v2.yaml`
+  - `configs/vq/VQ_BL256_dino_disc_stage1_baseline.yaml`
+
+## 影响
+- 仅增加注释和导览文档，不改变训练逻辑、模型结构、loss 公式或默认参数。
+
+## 2026-04-27 dense HR 单图重跑结果复查
+
+## 背景
+- 之前 dense 样本选错，实际只有 7 个 T5 token，不能代表 dense text。
+- 服务器已重新生成并训练 dense HR：
+  - run: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_single_debug/dense_hr_1img_1000step`
+  - manifest: `CleanTextSynth:train:2713`
+  - text chars: 408
+  - valid T5 tokens: 82
+- 新训练 checkpoint:
+  - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_single_debug/dense_hr_1img_1000step/checkpoints/last.pt`
+
+## 训练结果
+- dense HR 1000 step 可以 overfit：
+  - Val MSE: `0.064851 -> 0.000164`
+  - Val PSNR: `11.88 -> 37.84`
+  - Train Loss: `82.44 -> 0.5199`
+- 但 HR 分支没有明显学动：
+  - `text_hr_loss` 首次约 `0.9703`，末尾约 `0.9990`
+  - `text_hr_sigma_mean` 首次约 `0.0297`，末尾约 `0.0010`
+  - `text_hr_valid_text_tokens_mean=82`
+  - `text_hr_skipped_samples=0`
+
+## 新逐层诊断
+- 已对新 `last.pt` 重新跑逐层诊断：
+  - output: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_single_debug/diagnostics/dense_hr_last_rerun_1719`
+  - config: `configs/vq/_pilot_text_hr_local.yaml`
+  - layer mode: `all_decoder`
+- 训练实际使用层 `8-15` 的聚合：
+  - mean MSE: `1.496e-4`
+  - mean PSNR: `38.25`
+  - mean `text_attention_mass_mean`: `0.00393`
+  - mean `sigma_top1_ratio`: `0.424`
+  - mean `effective_rank`: `16.34 / 82`
+  - mean `current_code_tau_loss`: `0.99917`
+- 结论：
+  - dense token 数已足够，不再是 7-token 误选样本。
+  - 训练层的重建最好，但 text attention mass 极低，说明 decoder 主要仍走 image/code 路径。
+  - 当前 v2 tau HR loss 没有把 image-to-text attention 推成高秩，反而在后期表现为 text attention 奇异值整体变小。

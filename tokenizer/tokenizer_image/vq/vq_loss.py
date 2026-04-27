@@ -154,6 +154,12 @@ def high_rank_image_text_attention_loss(
         image_token_len=256,
         tau=1.0,
         skip_if_valid_tokens_lt=2):
+    """Text-HR v2: compute HR loss on the image-query to valid-text-key slice.
+
+    attn_weights is the selected decoder layer post-softmax cross-attention
+    [B, H, Q, K]. The first image_token_len keys are image tokens, and the
+    following text_attention_mask.shape[1] keys are padded T5 text tokens.
+    """
     if attn_weights.dim() != 4:
         raise ValueError(f"Expected attention shape [B, H, Q, K], got {attn_weights.shape}")
     if text_attention_mask is None:
@@ -174,6 +180,8 @@ def high_rank_image_text_attention_loss(
             f"({image_token_len} + {text_token_len})."
         )
 
+    # Text-HR v2: keep only the text-key slice; padding tokens are removed
+    # per sample before SVD.
     text_attn = attn_weights[:, :, :, image_token_len:image_token_len + text_token_len]
     losses = []
     sigma_means = []
@@ -191,6 +199,7 @@ def high_rank_image_text_attention_loss(
 
         matrix = text_attn[batch_idx, :, :, valid_mask]
         matrix = matrix.reshape(num_heads * num_queries, valid_token_count) / math.sqrt(num_heads)
+        # Text-HR v2: SVD is computed in float32 for stability even under bf16 training.
         sigma = torch.linalg.svdvals(matrix.float())
         losses.append(torch.abs(sigma - sigma.new_tensor(tau)).mean())
         sigma_means.append(sigma.detach().mean())
@@ -557,6 +566,8 @@ class VQLoss(nn.Module):
             text_hr_loss = None
             text_hr_stats = {}
             if text_hr_attn_weights is not None:
+                # Text-HR v2: this is the only new loss term for the text-guided
+                # experiment; it is logged separately from reconstruction losses.
                 text_hr_loss, text_hr_stats = high_rank_image_text_attention_loss(
                     text_hr_attn_weights,
                     text_attention_mask=text_attention_mask,
