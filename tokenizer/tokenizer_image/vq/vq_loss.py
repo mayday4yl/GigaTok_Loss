@@ -553,7 +553,7 @@ class VQLoss(nn.Module):
                     proj_loss += mean_flat(-(z_j * z_tilde_j).sum(dim=-1))
                 proj_loss /= bsz
             
-            codebook_loss_sum = sum(codebook_loss[:-1]) # the last one is codebook usage
+            codebook_loss_sum = self.codebook_weight * sum(codebook_loss[:-1]) # the last one is codebook usage
 
             hr_loss = None
             hr_spectrum_uniformity = None

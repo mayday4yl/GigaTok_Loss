@@ -1406,3 +1406,28 @@ git diff --name-status upstream/master...HEAD
 
 ## 影响
 - 仅修改文档，不改变训练代码、模型结构或实验配置。
+
+## 2026-04-27 新增 HR-only probe 配置
+
+## 背景
+- 需要验证如果去掉 reconstruction / perceptual / codebook / distill 等非 HR 目标，只优化 Text-HR loss，`text_hr_loss` 是否能单独降下去。
+- 这个实验用于判断当前 HR loss 和 attention 分支本身是否可优化，不作为主实验配置。
+
+## 修改
+- 修正 `tokenizer/tokenizer_image/vq/vq_loss.py` 中 `codebook_weight` 未参与总 loss 的问题：
+  - 现有主配置 `codebook_weight=1.0`，行为不变。
+  - 新 HR-only 配置可设置 `codebook_weight=0.0`，确保 codebook / commit / entropy 项不进入总 loss。
+- 新增 `configs/vq/VQ_BL256_dino_disc_text_hr_only_v2.yaml`：
+  - 保留 frozen T5 text conditioning 和 Text-HR。
+  - 关闭 reconstruction / perceptual / codebook / feature distill / projection / GAN loss。
+  - 保持 decoder-only finetune 和随机选择 8-15 层 pair。
+
+## 建议验证
+- 先跑 2 step smoke，确认日志中的 `Train Loss` 基本等于 `weighted_text_hr_loss`。
+- 再跑 dense 单图 1000 step，观察：
+  - `text_hr_loss`
+  - `weighted_text_hr_loss`
+  - `text_hr_sigma_mean`
+  - `text_attention_mass_mean`
+  - `effective_rank`
+- 训练后用 `diagnose_single_image.py` 对比 pretrain 和 HR-only last 的奇异值谱。
