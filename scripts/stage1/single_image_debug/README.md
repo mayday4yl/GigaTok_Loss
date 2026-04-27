@@ -42,20 +42,10 @@ ASCEND_RT_VISIBLE_DEVICES=0 \
 bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 ```
 
-再跑同一张图的 text baseline，用来判断 HR 有没有额外引入问题。注意：这个 baseline 仍然有 text conditioning，只是不开 HR loss：
+再跑同一张图的 baseline。这个 baseline 是原生 GigaTok tokenizer，不加 T5、不加 text projection、不加 decoder text cross-attention、不加 HR：
 
 ```bash
 MODE=baseline \
-TAG=dense \
-ITERS=1000 \
-ASCEND_RT_VISIBLE_DEVICES=0 \
-bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
-```
-
-再跑同一张图的 original baseline。这个模式不加 T5、不加 text projection、不加 decoder text cross-attention、不加 HR，用来代表原生 GigaTok tokenizer：
-
-```bash
-MODE=original \
 TAG=dense \
 ITERS=1000 \
 ASCEND_RT_VISIBLE_DEVICES=0 \
@@ -67,23 +57,21 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 ```bash
 MODE=hr TAG=medium ITERS=1000 ASCEND_RT_VISIBLE_DEVICES=0 bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 MODE=hr TAG=sparse ITERS=1000 ASCEND_RT_VISIBLE_DEVICES=0 bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
-MODE=original TAG=medium ITERS=1000 ASCEND_RT_VISIBLE_DEVICES=0 bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
-MODE=original TAG=sparse ITERS=1000 ASCEND_RT_VISIBLE_DEVICES=0 bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
+MODE=baseline TAG=medium ITERS=1000 ASCEND_RT_VISIBLE_DEVICES=0 bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
+MODE=baseline TAG=sparse ITERS=1000 ASCEND_RT_VISIBLE_DEVICES=0 bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 ```
 
 默认 config 使用仓库内文件：
 - HR: `configs/vq/VQ_BL256_dino_disc_text_hr_v2.yaml`
-- text baseline: `configs/vq/VQ_BL256_dino_disc_text_baseline_v2.yaml`
-- original baseline: `configs/vq/VQ_BL256_dino_disc_stage1_baseline.yaml`
+- baseline: `configs/vq/VQ_BL256_dino_disc_stage1_baseline.yaml`
 
-如果服务器只能使用本地 T5 路径，显式传入服务器上的 local config：
+如果服务器只能使用本地 T5 路径，HR 显式传入服务器上的 local config：
 
 ```bash
 CONFIG=configs/vq/_pilot_text_hr_local.yaml MODE=hr TAG=dense bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
-CONFIG=configs/vq/_pilot_text_baseline_local.yaml MODE=baseline TAG=dense bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 ```
 
-`MODE=original` 不依赖 T5，所以通常不需要服务器 local T5 config。
+`MODE=baseline` 不依赖 T5，所以不要传 `_pilot_text_baseline_local.yaml`，否则会重新变成 text baseline。
 
 重点看训练日志里的：
 - `rec_loss`
@@ -100,7 +88,7 @@ CONFIG=configs/vq/_pilot_text_baseline_local.yaml MODE=baseline TAG=dense bash s
 
 ## 3. 逐层 SVD 和特征诊断
 
-这个诊断脚本只适用于 `MODE=hr` 和 `MODE=baseline`，因为它需要 decoder text cross-attention。`MODE=original` 没有 text cross-attention，不能做 text attention SVD；original 只比较重建日志和保存图像即可。
+这个诊断脚本只适用于 `MODE=hr`，因为它需要 decoder text cross-attention。当前 `MODE=baseline` 是原生 tokenizer，没有 text cross-attention，不能做 text attention SVD；baseline 只比较重建日志和保存图像即可。
 
 对训练前 checkpoint 诊断。脚本默认扫 24 个 decoder layer；这里显式写出 `--layer-mode all_decoder`，避免和只看配置层的快速检查混淆：
 
