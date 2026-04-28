@@ -635,6 +635,28 @@ class TransformerDecoderLayer(nn.Module):
             return apply_rotary_emb(tensor, pos, bs_first=False)
         return tensor if pos is None else tensor + pos
 
+    @staticmethod
+    def _apply_adaln(norm_out, gamma=None, beta=None):
+        if gamma is None and beta is None:
+            return norm_out
+        if gamma is None or beta is None:
+            raise ValueError("AdaLN modulation requires both gamma and beta.")
+        assert gamma.dim() == 3 and beta.dim() == 3, \
+            f"AdaLN gamma/beta must be [1, B, C], got {gamma.shape}, {beta.shape}"
+        assert gamma.shape[0] == 1 and beta.shape[0] == 1, \
+            f"AdaLN gamma/beta first dim must be 1, got {gamma.shape}, {beta.shape}"
+        assert gamma.shape[1] == norm_out.shape[1] and beta.shape[1] == norm_out.shape[1], (
+            f"AdaLN batch dim mismatch: norm_out={norm_out.shape}, "
+            f"gamma={gamma.shape}, beta={beta.shape}"
+        )
+        assert gamma.shape[2] == norm_out.shape[2] and beta.shape[2] == norm_out.shape[2], (
+            f"AdaLN channel dim mismatch: norm_out={norm_out.shape}, "
+            f"gamma={gamma.shape}, beta={beta.shape}"
+        )
+        gamma = gamma.to(device=norm_out.device, dtype=norm_out.dtype)
+        beta = beta.to(device=norm_out.device, dtype=norm_out.dtype)
+        return norm_out * (1.0 + gamma) + beta
+
     def forward_post(self, tgt, memory,
                      tgt_mask: Optional[Tensor] = None,
                      memory_mask: Optional[Tensor] = None,
@@ -642,7 +664,13 @@ class TransformerDecoderLayer(nn.Module):
                      memory_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
                      query_pos: Optional[Tensor] = None,
-                     return_cross_attn_weights: bool = False):
+                     return_cross_attn_weights: bool = False,
+                     adaln_self_gamma=None,
+                     adaln_self_beta=None,
+                     adaln_cross_gamma=None,
+                     adaln_cross_beta=None,
+                     adaln_ffn_gamma=None,
+                     adaln_ffn_beta=None):
         # Text-HR v2: return_cross_attn_weights is only enabled for the chosen
         # decoder layer. PyTorch returns post-softmax attention weights.
         
@@ -661,6 +689,7 @@ class TransformerDecoderLayer(nn.Module):
                                 key_padding_mask=tgt_key_padding_mask)[0]
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
+        tgt = self._apply_adaln(tgt, adaln_self_gamma, adaln_self_beta)
 
         cross_attn_weights = None
         if self.use_qk_norm or self.use_flash_attn:
@@ -678,9 +707,11 @@ class TransformerDecoderLayer(nn.Module):
                                     average_attn_weights=False)
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
+        tgt = self._apply_adaln(tgt, adaln_cross_gamma, adaln_cross_beta)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
+        tgt = self._apply_adaln(tgt, adaln_ffn_gamma, adaln_ffn_beta)
         if return_cross_attn_weights:
             return tgt, cross_attn_weights
         return tgt
@@ -692,9 +723,16 @@ class TransformerDecoderLayer(nn.Module):
                     memory_key_padding_mask: Optional[Tensor] = None,
                     pos: Optional[Tensor] = None,
                     query_pos: Optional[Tensor] = None,
-                    return_cross_attn_weights: bool = False):
+                    return_cross_attn_weights: bool = False,
+                    adaln_self_gamma=None,
+                    adaln_self_beta=None,
+                    adaln_cross_gamma=None,
+                    adaln_cross_beta=None,
+                    adaln_ffn_gamma=None,
+                    adaln_ffn_beta=None):
         # Text-HR v2: same hook as forward_post for pre-norm decoder blocks.
         tgt2 = self.norm1(tgt)
+        tgt2 = self._apply_adaln(tgt2, adaln_self_gamma, adaln_self_beta)
         if self.query_rope:
             tgt2 = self.self_attn(
                 tgt2,
@@ -729,6 +767,7 @@ class TransformerDecoderLayer(nn.Module):
             print(tgt)
         tgt = tgt + self.dropout1(tgt2)
         tgt2 = self.norm2(tgt)
+        tgt2 = self._apply_adaln(tgt2, adaln_cross_gamma, adaln_cross_beta)
         cross_attn_weights = None
         if self.use_qk_norm or self.use_flash_attn:
             if return_cross_attn_weights:
@@ -746,6 +785,7 @@ class TransformerDecoderLayer(nn.Module):
  
         tgt = tgt + self.dropout2(tgt2)
         tgt2 = self.norm3(tgt)
+        tgt2 = self._apply_adaln(tgt2, adaln_ffn_gamma, adaln_ffn_beta)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
         tgt = tgt + self.dropout3(tgt2)
         if return_cross_attn_weights:
@@ -759,14 +799,32 @@ class TransformerDecoderLayer(nn.Module):
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
                 query_pos: Optional[Tensor] = None,
-                return_cross_attn_weights: bool = False):
+                return_cross_attn_weights: bool = False,
+                adaln_self_gamma=None,
+                adaln_self_beta=None,
+                adaln_cross_gamma=None,
+                adaln_cross_beta=None,
+                adaln_ffn_gamma=None,
+                adaln_ffn_beta=None):
         if self.normalize_before:
             return self.forward_pre(tgt, memory, tgt_mask, memory_mask,
                                     tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos,
-                                    return_cross_attn_weights=return_cross_attn_weights)
+                                    return_cross_attn_weights=return_cross_attn_weights,
+                                    adaln_self_gamma=adaln_self_gamma,
+                                    adaln_self_beta=adaln_self_beta,
+                                    adaln_cross_gamma=adaln_cross_gamma,
+                                    adaln_cross_beta=adaln_cross_beta,
+                                    adaln_ffn_gamma=adaln_ffn_gamma,
+                                    adaln_ffn_beta=adaln_ffn_beta)
         return self.forward_post(tgt, memory, tgt_mask, memory_mask,
                                  tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos,
-                                 return_cross_attn_weights=return_cross_attn_weights)
+                                 return_cross_attn_weights=return_cross_attn_weights,
+                                 adaln_self_gamma=adaln_self_gamma,
+                                 adaln_self_beta=adaln_self_beta,
+                                 adaln_cross_gamma=adaln_cross_gamma,
+                                 adaln_cross_beta=adaln_cross_beta,
+                                 adaln_ffn_gamma=adaln_ffn_gamma,
+                                 adaln_ffn_beta=adaln_ffn_beta)
 
 
 class TransformerLayer(nn.Module):
@@ -1585,6 +1643,7 @@ class ViTDecoder(nn.Module):
             visual_memory_mask_ratio=0.0,
             residual_text_by_layer=None,
             residual_gate=None,
+            adaln_params_by_layer=None,
             return_text_recon_stats=False,
             ):
         assert selected_decoder_layer is None or not return_feat, \
@@ -1703,6 +1762,39 @@ class ViTDecoder(nn.Module):
                 residual_lnd_by_layer[layer_idx] = residual_text.to(
                     device=x.device, dtype=x.dtype).unsqueeze(0)
 
+        adaln_lnd_by_layer = None
+        if adaln_params_by_layer is not None:
+            if not isinstance(adaln_params_by_layer, dict):
+                raise TypeError("adaln_params_by_layer must be a dict")
+            adaln_lnd_by_layer = {}
+            required_keys = {
+                "adaln_self_gamma",
+                "adaln_self_beta",
+                "adaln_cross_gamma",
+                "adaln_cross_beta",
+                "adaln_ffn_gamma",
+                "adaln_ffn_beta",
+            }
+            for layer_idx, layer_params in adaln_params_by_layer.items():
+                layer_idx = int(layer_idx)
+                if set(layer_params.keys()) != required_keys:
+                    raise ValueError(
+                        f"adaln_params_by_layer[{layer_idx}] keys={sorted(layer_params.keys())}, "
+                        f"expected={sorted(required_keys)}"
+                    )
+                converted = {}
+                for name, tensor in layer_params.items():
+                    assert tensor.dim() == 3, \
+                        f"{name} for layer {layer_idx} must be [1, B, C], got {tensor.shape}"
+                    assert tensor.shape[0] == 1, \
+                        f"{name} for layer {layer_idx} first dim must be 1, got {tensor.shape}"
+                    assert tensor.shape[1] == bs, \
+                        f"{name} for layer {layer_idx} batch={tensor.shape[1]} does not match decoder batch={bs}"
+                    assert tensor.shape[2] == self.width, \
+                        f"{name} for layer {layer_idx} width={tensor.shape[2]} does not match decoder width={self.width}"
+                    converted[name] = tensor.to(device=x.device, dtype=x.dtype)
+                adaln_lnd_by_layer[layer_idx] = converted
+
         visual_memory_mask_actual_ratio = x.new_zeros(())
         visual_memory_mask = None
         if visual_memory_mask_enabled:
@@ -1731,6 +1823,7 @@ class ViTDecoder(nn.Module):
         selected_cross_attn_weights = None
         for i in range(self.num_layers):
             return_cross_attn_weights = selected_decoder_layer == i
+            adaln_kwargs = adaln_lnd_by_layer.get(i, {}) if adaln_lnd_by_layer is not None else {}
             layer_memory = x
             layer_pos_embed = pos_embed
             layer_memory_key_padding_mask = None
@@ -1778,11 +1871,13 @@ class ViTDecoder(nn.Module):
                 latent_tokens, selected_cross_attn_weights = self.transformer[i](
                     latent_tokens, layer_memory, pos=layer_pos_embed, query_pos=query_pos,
                     memory_key_padding_mask=layer_memory_key_padding_mask,
-                    return_cross_attn_weights=True)
+                    return_cross_attn_weights=True,
+                    **adaln_kwargs)
             else:
                 latent_tokens = self.transformer[i](
                     latent_tokens, layer_memory, pos=layer_pos_embed, query_pos=query_pos,
-                    memory_key_padding_mask=layer_memory_key_padding_mask)
+                    memory_key_padding_mask=layer_memory_key_padding_mask,
+                    **adaln_kwargs)
             if residual_lnd_by_layer is not None and i in residual_lnd_by_layer:
                 residual = residual_lnd_by_layer[i]
                 assert residual.shape[1] == latent_tokens.shape[1], (

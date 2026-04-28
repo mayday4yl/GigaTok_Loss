@@ -1986,3 +1986,45 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 ## 下一步
 - Commit 2 已完成并通过 checkpoint load smoke / eval forward smoke / 2-step server smoke。
 - 下一 commit 才开始 `adaln`，不要把 AdaLN 混入当前 commit。
+
+## 2026-04-29 Commit 3：AdaLN 文本重建模式
+
+## 实现范围
+- 只实现剩余方法中的第三个 mode：`text_recon_conditioning.mode=adaln`。
+- 不改 `residual_head` / `residual_pooled_layer` 行为。
+- `adaln` 默认不接 HR，配置要求 `text_hr.enabled=False`。
+- `adaln` 要求 `visual_memory_mask.enabled=False`。
+- 旧 selected-layer Text-HR、matched native、`concat_memory`、`concat_memory_visual_mask`、`residual_head`、`residual_pooled_layer` 路径保持兼容。
+
+## 方法细节
+- 在 `TransformerDecoderLayer` 内部调制三个已有 LayerNorm 输出：
+  - self-attn 前/后的 `norm1`
+  - cross-attn 前/后的 `norm2`
+  - FFN 前/后的 `norm3`
+- `adaln_* = None` 时 `_apply_adaln(...)` 直接返回原 `norm_out`，保持旧行为。
+- 每个 norm 后执行：
+  - `norm_out = norm_out * (1 + gamma) + beta`
+  - gamma/beta 转到 `norm_out` 的 dtype/device。
+- 每层一个 MLP：`adaln_mlps["8"] ... adaln_mlps["15"]`。
+- 每层使用 `text_recon_conditioning.layer_pairs` 对应的 T5 layer：
+  - `T5 hidden -> text_projection -> masked_mean_text -> adaln_mlp -> [B, 6 * width]`
+  - 拆成 `self_gamma/self_beta/cross_gamma/cross_beta/ffn_gamma/ffn_beta`
+  - reshape 为 `[1,B,C]`，并 assert batch 维匹配当前 `[L,B,C]` layout。
+- `adaln_mlp` 最后一层 zero-init，初始 gamma/beta 为 0，保证等价原模型。
+
+## 新增配置
+- `configs/vq/VQ_BL256_dino_disc_text_recon_adaln_v1.yaml`
+  - `text_conditioning.enabled=True`
+  - `text_conditioning.text_type_embedding=False`
+  - `text_recon_conditioning.mode=adaln`
+  - `text_recon_conditioning.layers=[8,9,10,11,12,13,14,15]`
+  - `text_recon_conditioning.layer_pairs=[[8,8],...,[15,15]]`
+  - `text_recon_conditioning.visual_memory_mask.enabled=False`
+  - `text_recon_conditioning.adaln.enabled=True`
+  - `text_recon_conditioning.adaln.zero_init_last=True`
+  - `text_hr.enabled=False`
+
+## 本地检查
+- `python3 -m py_compile tokenizer/tokenizer_image/vq/vq_vit_model.py tokenizer/tokenizer_image/vq/blocks.py tokenizer/tokenizer_image/vq/vq_train.py tokenizer/tokenizer_image/vq/vq_loss.py scripts/stage1/evaluate_textatlas_reconstruction.py`：通过。
+- YAML parse：使用 Ruby `YAML.load_file` 读取 `VQ_BL256_dino_disc_text_recon_adaln_v1.yaml`，通过，mode=`adaln`，layers=`[8,9,10,11,12,13,14,15]`，`text_hr.enabled=False`。
+- 本机 Python 环境没有 `torch`，eval forward smoke / checkpoint load smoke / AdaLN zero-init equivalence smoke 需要在 ModelArts/PyTorch 环境跑。

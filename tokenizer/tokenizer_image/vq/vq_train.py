@@ -508,10 +508,11 @@ def main(args):
             "concat_memory_visual_mask",
             "residual_head",
             "residual_pooled_layer",
+            "adaln",
         }:
             raise NotImplementedError(
                 "Only text_recon_conditioning.mode=concat_memory, concat_memory_visual_mask, "
-                "residual_head, or residual_pooled_layer is implemented in the current commit."
+                "residual_head, residual_pooled_layer, or adaln is implemented in the current commit."
             )
         if text_recon_mode != "concat_memory_visual_mask" and visual_memory_mask_enabled:
             raise ValueError(
@@ -523,7 +524,7 @@ def main(args):
                 "text_recon_conditioning.visual_memory_mask.enabled must be true for "
                 "mode=concat_memory_visual_mask."
             )
-        if text_recon_mode in {"residual_head", "residual_pooled_layer"} and text_hr_on:
+        if text_recon_mode in {"residual_head", "residual_pooled_layer", "adaln"} and text_hr_on:
             raise ValueError(
                 f"text_recon_conditioning.mode={text_recon_mode} requires text_hr.enabled=false."
             )
@@ -535,10 +536,13 @@ def main(args):
                     f"text_recon_conditioning.visual_memory_mask.ratio must be in [0, 1), "
                     f"got {visual_memory_mask_ratio}"
                 )
-        for block_name in ("residual", "adaln"):
+        for block_name in ("residual",):
             block_cfg = text_recon_cfg.get(block_name, {})
             if isinstance(block_cfg, dict) and bool(block_cfg.get("enabled", False)):
                 raise NotImplementedError(f"text_recon_conditioning.{block_name} is planned but not implemented.")
+        adaln_cfg = text_recon_cfg.get("adaln", {})
+        if text_recon_mode != "adaln" and isinstance(adaln_cfg, dict) and bool(adaln_cfg.get("enabled", False)):
+            raise NotImplementedError("text_recon_conditioning.adaln is only implemented for mode=adaln.")
     text_hr_loss_weight = float(text_hr_cfg.get("hr_loss_weight", 0.0)) if text_hr_on else 0.0
     text_hr_tau = float(text_hr_cfg.get("tau", 1.0))
     text_hr_svd_mode = str(text_hr_cfg.get("svd_mode", "frobenius_uniform"))
@@ -791,7 +795,14 @@ def main(args):
         text_gate_cfg = text_recon_cfg.get("text_gate", {}) if text_recon_on else {}
         residual_head_cfg = text_recon_cfg.get("residual_head", {}) if text_recon_on else {}
         residual_pooled_cfg = text_recon_cfg.get("residual_pooled_layer", {}) if text_recon_on else {}
+        adaln_cfg = text_recon_cfg.get("adaln", {}) if text_recon_on else {}
         concat_memory_mode = text_recon_mode in {"concat_memory", "concat_memory_visual_mask"}
+        adaln_layers = None
+        if text_recon_on and text_recon_mode == "adaln":
+            adaln_layers = parse_text_recon_layers(
+                text_recon_cfg,
+                decoder_num_layers=int(vq_model.s1to2decoder.num_layers),
+            )
         vq_model.configure_text_conditioning(
             text_feature_dim=text_feature_dim,
             text_projection=text_conditioning_cfg.get("text_projection", "linear_layernorm"),
@@ -805,6 +816,9 @@ def main(args):
             residual_head_mlp_hidden_mult=float(residual_head_cfg.get("mlp_hidden_mult", 4.0)),
             residual_gate_init=float(residual_pooled_cfg.get("gate_init", 1e-3)),
             residual_mlp_hidden_mult=float(residual_pooled_cfg.get("mlp_hidden_mult", 4.0)),
+            adaln_layers=adaln_layers,
+            adaln_mlp_hidden_mult=float(adaln_cfg.get("mlp_hidden_mult", 4.0)),
+            adaln_zero_init_last=bool(adaln_cfg.get("zero_init_last", True)),
         )
 
     # create and load model
@@ -926,7 +940,8 @@ def main(args):
                     or name in {"residual_gate"} \
                     or name.startswith("text_projection.") \
                     or name.startswith("residual_head_mlp.") \
-                    or name.startswith("residual_text_mlp."):
+                    or name.startswith("residual_text_mlp.") \
+                    or name.startswith("adaln_mlps."):
                 text_conditioning_missing_keys.append(name)
         for name, _ in vq_model.named_buffers():
             if name in {"text_type_embedding", "visual_type_embedding", "text_gate_logit", "visual_mask_token"} \
@@ -934,7 +949,8 @@ def main(args):
                     or name in {"residual_gate"} \
                     or name.startswith("text_projection.") \
                     or name.startswith("residual_head_mlp.") \
-                    or name.startswith("residual_text_mlp."):
+                    or name.startswith("residual_text_mlp.") \
+                    or name.startswith("adaln_mlps."):
                 text_conditioning_missing_keys.append(name)
     if args.vq_ckpt:
         checkpoint = torch.load(args.vq_ckpt, map_location="cpu")

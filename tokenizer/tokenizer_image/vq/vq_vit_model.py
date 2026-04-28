@@ -295,6 +295,7 @@ class VQVitModelPlus(nn.Module):
         self.residual_head_gate = None
         self.residual_text_mlp = None
         self.residual_gate = None
+        self.adaln_mlps = None
         
         self.freeze_but_2d_decoder_flag = False
 
@@ -375,7 +376,10 @@ class VQVitModelPlus(nn.Module):
             residual_head_gate_init=1e-3,
             residual_head_mlp_hidden_mult=4.0,
             residual_gate_init=1e-3,
-            residual_mlp_hidden_mult=4.0):
+            residual_mlp_hidden_mult=4.0,
+            adaln_layers=None,
+            adaln_mlp_hidden_mult=4.0,
+            adaln_zero_init_last=True):
         # Text-HR v2: build the small trainable bridge from frozen T5 hidden states
         # to the GigaTok transformer decoder width.
         decoder_width = self.s1to2decoder.width
@@ -449,6 +453,26 @@ class VQVitModelPlus(nn.Module):
         else:
             self.residual_text_mlp = None
             self.residual_gate = None
+
+        if text_recon_mode == "adaln":
+            if not adaln_layers:
+                raise ValueError("text_recon_conditioning.mode=adaln requires non-empty adaln_layers.")
+            hidden_dim = int(decoder_width * float(adaln_mlp_hidden_mult))
+            self.adaln_mlps = nn.ModuleDict()
+            for layer_idx in adaln_layers:
+                layer_key = str(int(layer_idx))
+                mlp = nn.Sequential(
+                    nn.Linear(decoder_width, hidden_dim),
+                    nn.SiLU(),
+                    nn.Linear(hidden_dim, 6 * decoder_width),
+                )
+                mlp.apply(self._init_weights)
+                if adaln_zero_init_last:
+                    nn.init.zeros_(mlp[-1].weight)
+                    nn.init.zeros_(mlp[-1].bias)
+                self.adaln_mlps[layer_key] = mlp
+        else:
+            self.adaln_mlps = None
 
     def project_text_memory(self, decoder_text_features):
         # Text-HR v2: decoder_text_features are selected T5 layer features [B, T, d_t5].
@@ -577,6 +601,59 @@ class VQVitModelPlus(nn.Module):
             "residual_norm_mean": torch.stack(residual_norms).mean(),
         }
         return residual_text_by_layer, stats
+
+    def project_adaln_params_by_layer(
+            self,
+            decoder_text_features_by_layer: Optional[Mapping[int, torch.Tensor]],
+            decoder_text_key_padding_mask=None):
+        if not decoder_text_features_by_layer:
+            return None, {}
+        if self.adaln_mlps is None:
+            return None, {}
+        if self.text_projection is None:
+            raise RuntimeError("Text conditioning is enabled, but text_projection is not configured.")
+
+        adaln_params_by_layer: Dict[int, Dict[str, torch.Tensor]] = {}
+        stat_values = {
+            "adaln_self_gamma_norm_mean": [],
+            "adaln_self_beta_norm_mean": [],
+            "adaln_cross_gamma_norm_mean": [],
+            "adaln_cross_beta_norm_mean": [],
+            "adaln_ffn_gamma_norm_mean": [],
+            "adaln_ffn_beta_norm_mean": [],
+        }
+        chunk_names = [
+            "self_gamma",
+            "self_beta",
+            "cross_gamma",
+            "cross_beta",
+            "ffn_gamma",
+            "ffn_beta",
+        ]
+        for decoder_layer, decoder_text_features in decoder_text_features_by_layer.items():
+            decoder_layer = int(decoder_layer)
+            layer_key = str(decoder_layer)
+            if layer_key not in self.adaln_mlps:
+                raise ValueError(f"AdaLN MLP for decoder layer {decoder_layer} is not configured.")
+            text_memory = self.project_text_memory_for_pooling(decoder_text_features)
+            pooled_text = self.masked_mean_text(text_memory, decoder_text_key_padding_mask)
+            adaln_out = self.adaln_mlps[layer_key](pooled_text)
+            chunks = adaln_out.chunk(6, dim=-1)
+            layer_params = {}
+            for chunk_name, chunk in zip(chunk_names, chunks):
+                param_name = f"adaln_{chunk_name}"
+                layer_params[param_name] = chunk.unsqueeze(0)
+                stat_values[f"adaln_{chunk_name}_norm_mean"].append(
+                    chunk.float().norm(dim=-1).mean()
+                )
+            adaln_params_by_layer[decoder_layer] = layer_params
+
+        stats = {
+            name: torch.stack(values).mean()
+            for name, values in stat_values.items()
+            if values
+        }
+        return adaln_params_by_layer, stats
 
     @staticmethod
     def _merge_text_recon_stats(text_stats, decoder_stats):
@@ -730,19 +807,27 @@ class VQVitModelPlus(nn.Module):
         text_memory = self.project_text_memory(decoder_text_features)
         if text_memory is not None and selected_decoder_layer is None:
             raise ValueError("decoder_text_features requires selected_decoder_layer for text injection.")
-        residual_text_by_layer, residual_text_stats = self.project_residual_text_by_layer(
+        adaln_params_by_layer, adaln_stats = self.project_adaln_params_by_layer(
             decoder_text_features_by_layer,
             decoder_text_key_padding_mask=decoder_text_key_padding_mask,
         )
-        if residual_text_by_layer is None:
-            text_memory_by_layer, text_stats = self.project_text_memory_by_layer(
-                decoder_text_features_by_layer,
-                selected_decoder_layer=selected_decoder_layer,
-            )
-            residual_gate = None
+        if adaln_params_by_layer is not None:
+            text_memory_by_layer, text_stats = None, adaln_stats
+            residual_text_by_layer, residual_gate = None, None
         else:
-            text_memory_by_layer, text_stats = None, residual_text_stats
-            residual_gate = self.residual_gate
+            residual_text_by_layer, residual_text_stats = self.project_residual_text_by_layer(
+                decoder_text_features_by_layer,
+                decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+            )
+            if residual_text_by_layer is None:
+                text_memory_by_layer, text_stats = self.project_text_memory_by_layer(
+                    decoder_text_features_by_layer,
+                    selected_decoder_layer=selected_decoder_layer,
+                )
+                residual_gate = None
+            else:
+                text_memory_by_layer, text_stats = None, residual_text_stats
+                residual_gate = self.residual_gate
         # Text-HR v2: only the selected decoder layer receives text_memory and
         # returns its post-softmax cross-attention weights for the HR loss.
         if ret_inner_feat:
@@ -761,6 +846,7 @@ class VQVitModelPlus(nn.Module):
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
                     residual_text_by_layer=residual_text_by_layer,
                     residual_gate=residual_gate,
+                    adaln_params_by_layer=adaln_params_by_layer,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -780,6 +866,7 @@ class VQVitModelPlus(nn.Module):
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
                     residual_text_by_layer=residual_text_by_layer,
                     residual_gate=residual_gate,
+                    adaln_params_by_layer=adaln_params_by_layer,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -827,6 +914,7 @@ class VQVitModelPlus(nn.Module):
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
                     residual_text_by_layer=residual_text_by_layer,
                     residual_gate=residual_gate,
+                    adaln_params_by_layer=adaln_params_by_layer,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -845,6 +933,7 @@ class VQVitModelPlus(nn.Module):
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
                     residual_text_by_layer=residual_text_by_layer,
                     residual_gate=residual_gate,
+                    adaln_params_by_layer=adaln_params_by_layer,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:

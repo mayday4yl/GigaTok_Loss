@@ -49,6 +49,7 @@ TEXT_CONDITIONING_MISSING_NAMES = {
 TEXT_CONDITIONING_MISSING_PREFIXES = TEXT_CONDITIONING_MISSING_PREFIXES + (
     "residual_head_mlp.",
     "residual_text_mlp.",
+    "adaln_mlps.",
 )
 
 
@@ -303,10 +304,10 @@ def validate_text_recon_config(config: Mapping[str, Any]) -> None:
     mode = str(text_recon_cfg.get("mode", "concat_memory"))
     visual_memory_mask_cfg = text_recon_cfg.get("visual_memory_mask", {})
     visual_memory_mask_enabled = bool(visual_memory_mask_cfg.get("enabled", False))
-    if mode not in {"concat_memory", "concat_memory_visual_mask", "residual_head", "residual_pooled_layer"}:
+    if mode not in {"concat_memory", "concat_memory_visual_mask", "residual_head", "residual_pooled_layer", "adaln"}:
         raise NotImplementedError(
             "Only text_recon_conditioning.mode=concat_memory, concat_memory_visual_mask, "
-            "residual_head, or residual_pooled_layer is implemented in the current commit."
+            "residual_head, residual_pooled_layer, or adaln is implemented in the current commit."
         )
     if mode != "concat_memory_visual_mask" and visual_memory_mask_enabled:
         raise ValueError(
@@ -317,7 +318,7 @@ def validate_text_recon_config(config: Mapping[str, Any]) -> None:
         raise ValueError(
             "text_recon_conditioning.visual_memory_mask.enabled must be true for mode=concat_memory_visual_mask."
         )
-    if mode in {"residual_head", "residual_pooled_layer"} and bool(config.get("text_hr", {}).get("enabled", False)):
+    if mode in {"residual_head", "residual_pooled_layer", "adaln"} and bool(config.get("text_hr", {}).get("enabled", False)):
         raise ValueError(f"text_recon_conditioning.mode={mode} requires text_hr.enabled=false.")
     if visual_memory_mask_enabled:
         if str(visual_memory_mask_cfg.get("mode", "learned_mask_token")) != "learned_mask_token":
@@ -327,10 +328,13 @@ def validate_text_recon_config(config: Mapping[str, Any]) -> None:
             raise ValueError(f"text_recon_conditioning.visual_memory_mask.ratio must be in [0, 1), got {ratio}")
     if mode != "residual_head" and not text_recon_cfg.get("layers", None) and not text_recon_cfg.get("layer_pairs", None):
         raise ValueError("text_recon_conditioning.enabled=True requires non-empty layers or layer_pairs.")
-    for block_name in ("residual", "adaln"):
+    for block_name in ("residual",):
         block_cfg = text_recon_cfg.get(block_name, {})
         if isinstance(block_cfg, Mapping) and bool(block_cfg.get("enabled", False)):
             raise NotImplementedError(f"text_recon_conditioning.{block_name} is planned but not implemented.")
+    adaln_cfg = text_recon_cfg.get("adaln", {})
+    if mode != "adaln" and isinstance(adaln_cfg, Mapping) and bool(adaln_cfg.get("enabled", False)):
+        raise NotImplementedError("text_recon_conditioning.adaln is only implemented for mode=adaln.")
 
 
 class TextContext:
@@ -382,7 +386,14 @@ def load_tokenizer_model(
         text_gate_cfg = text_recon_cfg.get("text_gate", {}) if text_recon_on else {}
         residual_head_cfg = text_recon_cfg.get("residual_head", {}) if text_recon_on else {}
         residual_pooled_cfg = text_recon_cfg.get("residual_pooled_layer", {}) if text_recon_on else {}
+        adaln_cfg = text_recon_cfg.get("adaln", {}) if text_recon_on else {}
         concat_memory_mode = text_recon_mode in {"concat_memory", "concat_memory_visual_mask"}
+        adaln_layers = None
+        if text_recon_on and text_recon_mode == "adaln":
+            raw_layers = text_recon_cfg.get("layers", None)
+            if not raw_layers:
+                raw_layers = [pair[1] for pair in text_recon_cfg.get("layer_pairs", [])]
+            adaln_layers = [int(layer_idx) for layer_idx in raw_layers]
         model.configure_text_conditioning(
             text_feature_dim=text_feature_dim,
             text_projection=config.get("text_conditioning", {}).get("text_projection", "linear_layernorm"),
@@ -396,6 +407,9 @@ def load_tokenizer_model(
             residual_head_mlp_hidden_mult=float(residual_head_cfg.get("mlp_hidden_mult", 4.0)),
             residual_gate_init=float(residual_pooled_cfg.get("gate_init", 1e-3)),
             residual_mlp_hidden_mult=float(residual_pooled_cfg.get("mlp_hidden_mult", 4.0)),
+            adaln_layers=adaln_layers,
+            adaln_mlp_hidden_mult=float(adaln_cfg.get("mlp_hidden_mult", 4.0)),
+            adaln_zero_init_last=bool(adaln_cfg.get("zero_init_last", True)),
         )
 
     checkpoint = torch.load(ckpt_path, map_location="cpu")
