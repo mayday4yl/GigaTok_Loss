@@ -290,6 +290,7 @@ class VQVitModelPlus(nn.Module):
         self.text_type_embedding = None
         self.visual_type_embedding = None
         self.text_gate_logit = None
+        self.visual_mask_token = None
         
         self.freeze_but_2d_decoder_flag = False
 
@@ -364,7 +365,8 @@ class VQVitModelPlus(nn.Module):
             text_type_embedding=True,
             visual_type_embedding=False,
             text_gate_enabled=False,
-            text_gate_init=1.0):
+            text_gate_init=1.0,
+            visual_memory_mask_enabled=False):
         # Text-HR v2: build the small trainable bridge from frozen T5 hidden states
         # to the GigaTok transformer decoder width.
         decoder_width = self.s1to2decoder.width
@@ -406,6 +408,11 @@ class VQVitModelPlus(nn.Module):
             self.text_gate_logit = nn.Parameter(torch.tensor(math.log(init / (1.0 - init))))
         else:
             self.text_gate_logit = None
+
+        if visual_memory_mask_enabled:
+            self.visual_mask_token = nn.Parameter(torch.zeros(1, 1, decoder_width))
+        else:
+            self.visual_mask_token = None
 
     def project_text_memory(self, decoder_text_features):
         # Text-HR v2: decoder_text_features are selected T5 layer features [B, T, d_t5].
@@ -575,6 +582,8 @@ class VQVitModelPlus(nn.Module):
             decoder_text_features_by_layer=None,
             decoder_text_key_padding_mask=None,
             text_injection_layers=None,
+            visual_memory_mask_enabled=False,
+            visual_memory_mask_ratio=0.0,
             return_text_recon_stats=False,
             ):
         quant = self.post_quant_conv(quant)
@@ -598,6 +607,9 @@ class VQVitModelPlus(nn.Module):
                     text_key_padding_mask=decoder_text_key_padding_mask,
                     text_injection_layers=text_injection_layers,
                     visual_type_embedding=self.visual_type_embedding,
+                    visual_mask_token=self.visual_mask_token,
+                    visual_memory_mask_enabled=visual_memory_mask_enabled,
+                    visual_memory_mask_ratio=visual_memory_mask_ratio,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -612,6 +624,9 @@ class VQVitModelPlus(nn.Module):
                     text_key_padding_mask=decoder_text_key_padding_mask,
                     text_injection_layers=text_injection_layers,
                     visual_type_embedding=self.visual_type_embedding,
+                    visual_mask_token=self.visual_mask_token,
+                    visual_memory_mask_enabled=visual_memory_mask_enabled,
+                    visual_memory_mask_ratio=visual_memory_mask_ratio,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -646,6 +661,9 @@ class VQVitModelPlus(nn.Module):
                     text_key_padding_mask=decoder_text_key_padding_mask,
                     text_injection_layers=text_injection_layers,
                     visual_type_embedding=self.visual_type_embedding,
+                    visual_mask_token=self.visual_mask_token,
+                    visual_memory_mask_enabled=visual_memory_mask_enabled,
+                    visual_memory_mask_ratio=visual_memory_mask_ratio,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -659,6 +677,9 @@ class VQVitModelPlus(nn.Module):
                     text_key_padding_mask=decoder_text_key_padding_mask,
                     text_injection_layers=text_injection_layers,
                     visual_type_embedding=self.visual_type_embedding,
+                    visual_mask_token=self.visual_mask_token,
+                    visual_memory_mask_enabled=visual_memory_mask_enabled,
+                    visual_memory_mask_ratio=visual_memory_mask_ratio,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -700,6 +721,8 @@ class VQVitModelPlus(nn.Module):
             decoder_text_features_by_layer=None,
             decoder_text_key_padding_mask=None,
             text_injection_layers=None,
+            visual_memory_mask_enabled=False,
+            visual_memory_mask_ratio=0.0,
             return_text_recon_stats=False,
             ):
         # Text-HR v2: selected_decoder_layer / decoder_text_features keep the
@@ -726,6 +749,8 @@ class VQVitModelPlus(nn.Module):
                         decoder_text_features_by_layer=decoder_text_features_by_layer,
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                         text_injection_layers=text_injection_layers,
+                        visual_memory_mask_enabled=visual_memory_mask_enabled,
+                        visual_memory_mask_ratio=visual_memory_mask_ratio,
                         return_text_recon_stats=return_text_recon_stats,
                     )
                     if return_text_recon_stats:
@@ -738,6 +763,8 @@ class VQVitModelPlus(nn.Module):
                         decoder_text_features_by_layer=decoder_text_features_by_layer,
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                         text_injection_layers=text_injection_layers,
+                        visual_memory_mask_enabled=visual_memory_mask_enabled,
+                        visual_memory_mask_ratio=visual_memory_mask_ratio,
                         return_text_recon_stats=return_text_recon_stats,
                     )
                     if return_text_recon_stats:
@@ -755,6 +782,8 @@ class VQVitModelPlus(nn.Module):
                         decoder_text_features_by_layer=decoder_text_features_by_layer,
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                         text_injection_layers=text_injection_layers,
+                        visual_memory_mask_enabled=visual_memory_mask_enabled,
+                        visual_memory_mask_ratio=visual_memory_mask_ratio,
                         return_text_recon_stats=return_text_recon_stats,
                     )
                     if return_text_recon_stats:
@@ -768,6 +797,8 @@ class VQVitModelPlus(nn.Module):
                         decoder_text_features_by_layer=decoder_text_features_by_layer,
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                         text_injection_layers=text_injection_layers,
+                        visual_memory_mask_enabled=visual_memory_mask_enabled,
+                        visual_memory_mask_ratio=visual_memory_mask_ratio,
                         return_text_recon_stats=return_text_recon_stats,
                     )
                     if return_text_recon_stats:
@@ -784,6 +815,8 @@ class VQVitModelPlus(nn.Module):
                     decoder_text_features_by_layer=decoder_text_features_by_layer,
                     decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                     text_injection_layers=text_injection_layers,
+                    visual_memory_mask_enabled=visual_memory_mask_enabled,
+                    visual_memory_mask_ratio=visual_memory_mask_ratio,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -796,6 +829,8 @@ class VQVitModelPlus(nn.Module):
                     decoder_text_features_by_layer=decoder_text_features_by_layer,
                     decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                     text_injection_layers=text_injection_layers,
+                    visual_memory_mask_enabled=visual_memory_mask_enabled,
+                    visual_memory_mask_ratio=visual_memory_mask_ratio,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:

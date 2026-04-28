@@ -1580,6 +1580,9 @@ class ViTDecoder(nn.Module):
             text_key_padding_mask=None,
             text_injection_layers=None,
             visual_type_embedding=None,
+            visual_mask_token=None,
+            visual_memory_mask_enabled=False,
+            visual_memory_mask_ratio=0.0,
             return_text_recon_stats=False,
             ):
         assert selected_decoder_layer is None or not return_feat, \
@@ -1680,6 +1683,20 @@ class ViTDecoder(nn.Module):
         else:
             text_injection_layer_set = set()
 
+        visual_memory_mask_actual_ratio = x.new_zeros(())
+        visual_memory_mask = None
+        if visual_memory_mask_enabled:
+            ratio = float(visual_memory_mask_ratio)
+            if ratio < 0.0 or ratio >= 1.0:
+                raise ValueError(f"visual_memory_mask_ratio must be in [0, 1), got {visual_memory_mask_ratio}")
+            if self.training and ratio > 0.0:
+                if visual_mask_token is None:
+                    raise RuntimeError("visual_mask_token is required when visual memory mask is enabled.")
+                visual_memory_mask = (
+                    torch.rand((selected_latent_tokens, bs, 1), device=x.device) < ratio
+                )
+                visual_memory_mask_actual_ratio = visual_memory_mask.float().mean()
+
         text_recon_stats = {}
         if (text_memory_lnd is not None or text_memory_lnd_by_layer is not None) and return_text_recon_stats:
             visual_memory_for_norm = x
@@ -1687,6 +1704,9 @@ class ViTDecoder(nn.Module):
                 visual_memory_for_norm = visual_memory_for_norm + visual_type_embedding.to(
                     device=x.device, dtype=x.dtype)
             text_recon_stats["visual_memory_norm_mean"] = visual_memory_for_norm.float().norm(dim=-1).mean()
+            text_recon_stats["visual_memory_mask_ratio"] = x.new_tensor(
+                float(visual_memory_mask_ratio) if visual_memory_mask_enabled else 0.0)
+            text_recon_stats["visual_memory_mask_actual_ratio"] = visual_memory_mask_actual_ratio
 
         selected_cross_attn_weights = None
         for i in range(self.num_layers):
@@ -1697,6 +1717,12 @@ class ViTDecoder(nn.Module):
             inject_text = text_memory_lnd_by_layer is not None and i in text_injection_layer_set
             if inject_text:
                 layer_visual_memory = x
+                if visual_memory_mask is not None:
+                    layer_visual_memory = torch.where(
+                        visual_memory_mask,
+                        visual_mask_token.to(device=x.device, dtype=x.dtype),
+                        layer_visual_memory,
+                    )
                 if visual_type_embedding is not None:
                     layer_visual_memory = layer_visual_memory + visual_type_embedding.to(
                         device=x.device, dtype=x.dtype)

@@ -1706,3 +1706,76 @@ git diff --name-status upstream/master...HEAD
   - `tokenizer/tokenizer_image/vq/vq_loss.py`
   - `scripts/stage1/evaluate_textatlas_reconstruction.py`
 - 已用 Ruby YAML 解析检查两个新增 config 可读。
+
+## 2026-04-28 Stage-1 Text Reconstruction Conditioning 第二阶段：concat_memory_visual_mask
+
+## 目标
+- 实现师姐第二种方法：`visual + text concat`，同时训练时随机 mask 一小部分 cross-attention visual memory。
+- 只 mask visual memory token，不 mask decoder query。
+- HR 逻辑保持不变，仍然是 selected decoder layer 的 `gram_scaled_identity`。
+
+## 实现约束
+- 新增 `text_recon_conditioning.mode=concat_memory_visual_mask`。
+- 强校验：
+  - `mode=concat_memory` 时 `visual_memory_mask.enabled` 必须为 `False`。
+  - `mode=concat_memory_visual_mask` 时 `visual_memory_mask.enabled` 必须为 `True`。
+- `visual_mask_token` 只在 mask mode 创建，`concat_memory` 不新增这个参数。
+- 每个 forward 只采样一次 visual mask，decoder 8-15 所有注入层复用同一个 mask。
+- mask 顺序：
+  - 先用 `visual_mask_token` 替换被 mask 的 visual 内容；
+  - 再加 `visual_type_embedding`，保证被 mask token 仍保留 visual 类型信息。
+- mask 只在 training 生效；validation / eval / reconstruction grid 中关闭。
+- padding mask 不变，被 mask 的 visual token 仍是 valid key。
+
+## 新增日志
+- numeric metrics：
+  - `visual_memory_mask_ratio`
+  - `visual_memory_mask_actual_ratio`
+- eval 时：
+  - `visual_memory_mask_ratio` 保留配置值；
+  - `visual_memory_mask_actual_ratio=0`。
+
+## 新增配置
+- `configs/vq/VQ_BL256_dino_disc_text_recon_concat_mask_hr_v1.yaml`
+- 基于 `VQ_BL256_dino_disc_text_recon_concat_hr_v1.yaml`，只改：
+  - `mode: concat_memory_visual_mask`
+  - `visual_memory_mask.enabled: True`
+  - `visual_memory_mask.ratio: 0.05`
+  - `visual_memory_mask.mode: learned_mask_token`
+
+## 建议 smoke
+```bash
+MODE=hr TAG=dense ITERS=2 \
+CONFIG=configs/vq/VQ_BL256_dino_disc_text_recon_concat_mask_hr_v1.yaml \
+ASCEND_RT_VISIBLE_DEVICES=0 \
+bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
+```
+
+需要确认日志包含：
+- `text_recon_mode=concat_memory_visual_mask`
+- `visual_memory_mask_ratio=0.05`
+- `visual_memory_mask_actual_ratio` 接近 0.05
+- `text_hr_svd_mode=gram_scaled_identity`
+- `text_hr_loss`
+
+## 2026-04-28 论文调研：Glyph-ByT5 与 LongTextAR baseline
+
+## 调研对象
+- Glyph-ByT5: A Customized Text Encoder for Accurate Visual Text Rendering, arXiv:2403.09622。
+- Glyph-ByT5-v2: arXiv:2406.10208，当前有 `nlpcvcode/Glyph-SDXL-v2` HF 包和官方 `AIGText/Glyph-ByT5` 仓库。
+- Beyond Words: Advancing Long-Text Image Generation via Multimodal Autoregressive Models, arXiv:2503.20198，即 LongTextAR / TextBinarizer。
+
+## 和当前 Stage-1 的关系
+- Glyph-ByT5 的主要价值在 text encoder：字符级 ByT5 + glyph 对齐预训练，适合替代或对照当前 frozen T5 text conditioning。
+- 但当前主线是 GigaTok B-L tokenizer decoder-only fine-tune，目标是验证 TextAtlas 重建和 HR decoder attention；直接换 Glyph-ByT5 会引入新的 text encoder 变量，不适合作为第一组 matched native vs text-recon+HR 的严格主线。
+- LongTextAR 的主要贡献在 text-focused binary tokenizer 和多模态 AR 生成；它的“decoder 好”更偏 LLaMA2/Chameleon AR decoder 与 image-token 预测，不是当前 GigaTok tokenizer 的 final CNN decoder 或 transformer reconstruction decoder。
+
+## 可借鉴点
+- LongTextAR 可作为老师要求的外部 baseline：论文报告、项目页和可视化对照优先记录；当前项目页显示 Github 仍为 Coming Soon，HF paper 页面也未列出官方模型/数据链接，因此直接复现实验成本高。
+- LongTextAR 的 TextBinarizer 思路支持我们的研究动机：普通 VQ tokenizer 对长文本细节是瓶颈；但替换 GigaTok quantizer/codebook 属于架构改动，暂不进入 Stage-1 pilot。
+- Glyph-ByT5 可作为后续 probe：保留同一 GigaTok checkpoint、同一 TextAtlas 数据、同一训练步数，只把 `text_conditioning.encoder_name` 从 T5 换成 Glyph-ByT5/ByT5 系列，并新增投影兼容；这应放在当前 matched native vs text-recon+HR 跑通之后。
+
+## 当前建议
+- Stage-1 先跑现有两组：`VQ_BL256_dino_disc_matched_native_v1.yaml` vs `VQ_BL256_dino_disc_text_recon_concat_hr_v1.yaml`。
+- 若 text sensitivity 显示 correct 明显优于 empty/shuffled，再做 Glyph-ByT5 text encoder 对照；否则先修 text injection/attention 使用率，不急于换 encoder。
+- 对外汇报时可把 LongTextAR 作为“强 text-focused tokenizer/AR baseline”，但代码实现层面只借鉴其 tokenizer bottleneck 论证和重建评估口径，不在当前第一轮改 GigaTok tokenizer 架构。

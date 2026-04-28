@@ -480,6 +480,10 @@ def main(args):
     text_conditioning_on = bool(text_conditioning_cfg.get("enabled", False))
     text_recon_on = bool(text_recon_cfg.get("enabled", False))
     text_hr_on = bool(text_hr_cfg.get("enabled", False))
+    text_recon_mode = str(text_recon_cfg.get("mode", "concat_memory"))
+    visual_memory_mask_cfg = text_recon_cfg.get("visual_memory_mask", {})
+    visual_memory_mask_enabled = bool(visual_memory_mask_cfg.get("enabled", False))
+    visual_memory_mask_ratio = float(visual_memory_mask_cfg.get("ratio", 0.0))
     if text_recon_on and not text_conditioning_on:
         raise ValueError("text_recon_conditioning.enabled requires text_conditioning.enabled=True.")
     if text_hr_on and not text_conditioning_on:
@@ -487,9 +491,26 @@ def main(args):
     if hr_on and text_hr_on:
         raise ValueError("v1 hr_on and v2 text_hr.enabled cannot be enabled at the same time.")
     if text_recon_on:
-        if str(text_recon_cfg.get("mode", "concat_memory")) != "concat_memory":
-            raise NotImplementedError("Only text_recon_conditioning.mode=concat_memory is implemented.")
-        for block_name in ("visual_memory_mask", "residual", "adaln"):
+        if text_recon_mode not in {"concat_memory", "concat_memory_visual_mask"}:
+            raise NotImplementedError(
+                "Only text_recon_conditioning.mode=concat_memory or concat_memory_visual_mask is implemented."
+            )
+        if text_recon_mode == "concat_memory" and visual_memory_mask_enabled:
+            raise ValueError("text_recon_conditioning.visual_memory_mask.enabled must be false for mode=concat_memory.")
+        if text_recon_mode == "concat_memory_visual_mask" and not visual_memory_mask_enabled:
+            raise ValueError(
+                "text_recon_conditioning.visual_memory_mask.enabled must be true for "
+                "mode=concat_memory_visual_mask."
+            )
+        if visual_memory_mask_enabled:
+            if str(visual_memory_mask_cfg.get("mode", "learned_mask_token")) != "learned_mask_token":
+                raise NotImplementedError("Only visual_memory_mask.mode=learned_mask_token is implemented.")
+            if visual_memory_mask_ratio < 0.0 or visual_memory_mask_ratio >= 1.0:
+                raise ValueError(
+                    f"text_recon_conditioning.visual_memory_mask.ratio must be in [0, 1), "
+                    f"got {visual_memory_mask_ratio}"
+                )
+        for block_name in ("residual", "adaln"):
             block_cfg = text_recon_cfg.get(block_name, {})
             if isinstance(block_cfg, dict) and bool(block_cfg.get("enabled", False)):
                 raise NotImplementedError(f"text_recon_conditioning.{block_name} is planned but not implemented.")
@@ -750,6 +771,7 @@ def main(args):
             visual_type_embedding=text_recon_on and bool(text_recon_cfg.get("visual_type_embedding", False)),
             text_gate_enabled=text_recon_on and bool(text_gate_cfg.get("enabled", False)),
             text_gate_init=float(text_gate_cfg.get("init", 0.1)),
+            visual_memory_mask_enabled=text_recon_on and text_recon_mode == "concat_memory_visual_mask",
         )
 
     # create and load model
@@ -866,11 +888,11 @@ def main(args):
     text_conditioning_missing_keys = []
     if skip_model_optimizer_load:
         for name, _ in vq_model.named_parameters():
-            if name in {"text_type_embedding", "visual_type_embedding", "text_gate_logit"} \
+            if name in {"text_type_embedding", "visual_type_embedding", "text_gate_logit", "visual_mask_token"} \
                     or name.startswith("text_projection."):
                 text_conditioning_missing_keys.append(name)
         for name, _ in vq_model.named_buffers():
-            if name in {"text_type_embedding", "visual_type_embedding", "text_gate_logit"} \
+            if name in {"text_type_embedding", "visual_type_embedding", "text_gate_logit", "visual_mask_token"} \
                     or name.startswith("text_projection."):
                 text_conditioning_missing_keys.append(name)
     if args.vq_ckpt:
@@ -1080,8 +1102,10 @@ def main(args):
                     f"missing={missing_hr_layers}"
                 )
         logger.info(
-            f"Text reconstruction conditioning enabled: mode={text_recon_cfg.get('mode', 'concat_memory')}, "
-            f"text_injection_layers={text_injection_layers}, text_recon_layer_pairs={text_recon_layer_pairs}"
+            f"Text reconstruction conditioning enabled: text_recon_mode={text_recon_mode}, "
+            f"text_injection_layers={text_injection_layers}, text_recon_layer_pairs={text_recon_layer_pairs}, "
+            f"visual_memory_mask_enabled={visual_memory_mask_enabled}, "
+            f"visual_memory_mask_ratio={visual_memory_mask_ratio}"
         )
     if args.compile:
         logger.info("compiling the model... (may take several minutes)")
@@ -1342,6 +1366,8 @@ def main(args):
                         decoder_text_features_by_layer=decoder_text_features_by_layer,
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                         text_injection_layers=text_injection_layers if text_recon_on else None,
+                        visual_memory_mask_enabled=text_recon_on and visual_memory_mask_enabled,
+                        visual_memory_mask_ratio=visual_memory_mask_ratio,
                         return_text_recon_stats=text_recon_on,
                     )
                     if selected_decoder_layer is not None:
@@ -1372,6 +1398,8 @@ def main(args):
                         decoder_text_features_by_layer=decoder_text_features_by_layer,
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                         text_injection_layers=text_injection_layers if text_recon_on else None,
+                        visual_memory_mask_enabled=text_recon_on and visual_memory_mask_enabled,
+                        visual_memory_mask_ratio=visual_memory_mask_ratio,
                         return_text_recon_stats=text_recon_on,
                     )
                     if selected_decoder_layer is not None:

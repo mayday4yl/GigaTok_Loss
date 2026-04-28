@@ -844,6 +844,9 @@ class VQLoss(nn.Module):
                         f"selected_text_memory_norm: {text_recon_stat_float('selected_text_memory_norm'):.4e}, "
                         f"visual_memory_norm_mean: {text_recon_stat_float('visual_memory_norm_mean'):.4e}, "
                         f"text_visual_norm_ratio: {text_recon_stat_float('text_visual_norm_ratio'):.4e}, "
+                        f"visual_memory_mask_ratio: {text_recon_stat_float('visual_memory_mask_ratio'):.4f}, "
+                        f"visual_memory_mask_actual_ratio: "
+                        f"{text_recon_stat_float('visual_memory_mask_actual_ratio'):.4f}, "
                         f"empty_text_count: {text_recon_stat_float('empty_text_count'):.0f}, "
                         f"text_valid_tokens_mean: {text_recon_stat_float('text_valid_tokens_mean'):.2f}"
                     )

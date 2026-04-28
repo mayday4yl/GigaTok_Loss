@@ -38,7 +38,12 @@ RunSpec = Tuple[str, Path, Path]
 
 
 TEXT_CONDITIONING_MISSING_PREFIXES = ("text_projection.",)
-TEXT_CONDITIONING_MISSING_NAMES = {"text_type_embedding", "visual_type_embedding", "text_gate_logit"}
+TEXT_CONDITIONING_MISSING_NAMES = {
+    "text_type_embedding",
+    "visual_type_embedding",
+    "text_gate_logit",
+    "visual_mask_token",
+}
 
 
 def parse_run(value: str) -> RunSpec:
@@ -289,11 +294,28 @@ def validate_text_recon_config(config: Mapping[str, Any]) -> None:
     text_recon_cfg = config.get("text_recon_conditioning", {})
     if not bool(text_recon_cfg.get("enabled", False)):
         return
-    if str(text_recon_cfg.get("mode", "concat_memory")) != "concat_memory":
-        raise NotImplementedError("Only text_recon_conditioning.mode=concat_memory is implemented.")
+    mode = str(text_recon_cfg.get("mode", "concat_memory"))
+    visual_memory_mask_cfg = text_recon_cfg.get("visual_memory_mask", {})
+    visual_memory_mask_enabled = bool(visual_memory_mask_cfg.get("enabled", False))
+    if mode not in {"concat_memory", "concat_memory_visual_mask"}:
+        raise NotImplementedError(
+            "Only text_recon_conditioning.mode=concat_memory or concat_memory_visual_mask is implemented."
+        )
+    if mode == "concat_memory" and visual_memory_mask_enabled:
+        raise ValueError("text_recon_conditioning.visual_memory_mask.enabled must be false for mode=concat_memory.")
+    if mode == "concat_memory_visual_mask" and not visual_memory_mask_enabled:
+        raise ValueError(
+            "text_recon_conditioning.visual_memory_mask.enabled must be true for mode=concat_memory_visual_mask."
+        )
+    if visual_memory_mask_enabled:
+        if str(visual_memory_mask_cfg.get("mode", "learned_mask_token")) != "learned_mask_token":
+            raise NotImplementedError("Only visual_memory_mask.mode=learned_mask_token is implemented.")
+        ratio = float(visual_memory_mask_cfg.get("ratio", 0.0))
+        if ratio < 0.0 or ratio >= 1.0:
+            raise ValueError(f"text_recon_conditioning.visual_memory_mask.ratio must be in [0, 1), got {ratio}")
     if not text_recon_cfg.get("layers", None) and not text_recon_cfg.get("layer_pairs", None):
         raise ValueError("text_recon_conditioning.enabled=True requires non-empty layers or layer_pairs.")
-    for block_name in ("visual_memory_mask", "residual", "adaln"):
+    for block_name in ("residual", "adaln"):
         block_cfg = text_recon_cfg.get(block_name, {})
         if isinstance(block_cfg, Mapping) and bool(block_cfg.get("enabled", False)):
             raise NotImplementedError(f"text_recon_conditioning.{block_name} is planned but not implemented.")
@@ -340,6 +362,7 @@ def load_tokenizer_model(
     if config.get("text_conditioning", {}).get("enabled", False):
         text_recon_cfg = config.get("text_recon_conditioning", {})
         text_recon_on = bool(text_recon_cfg.get("enabled", False))
+        text_recon_mode = str(text_recon_cfg.get("mode", "concat_memory"))
         text_gate_cfg = text_recon_cfg.get("text_gate", {}) if text_recon_on else {}
         model.configure_text_conditioning(
             text_feature_dim=text_feature_dim,
@@ -348,6 +371,7 @@ def load_tokenizer_model(
             visual_type_embedding=text_recon_on and bool(text_recon_cfg.get("visual_type_embedding", False)),
             text_gate_enabled=text_recon_on and bool(text_gate_cfg.get("enabled", False)),
             text_gate_init=float(text_gate_cfg.get("init", 0.1)),
+            visual_memory_mask_enabled=text_recon_on and text_recon_mode == "concat_memory_visual_mask",
         )
 
     checkpoint = torch.load(ckpt_path, map_location="cpu")
