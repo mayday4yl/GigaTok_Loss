@@ -833,6 +833,20 @@ class VQLoss(nn.Module):
                         f"text_hr_skipped_samples: {text_hr_stats['skipped_samples']}"
                     )
                 if text_recon_stats:
+                    printed_text_recon_keys = {
+                        "text_recon_enabled",
+                        "text_injection_layer_count",
+                        "text_gate",
+                        "text_memory_norm_before_gate_mean",
+                        "text_memory_norm_after_gate_mean",
+                        "selected_text_memory_norm",
+                        "visual_memory_norm_mean",
+                        "text_visual_norm_ratio",
+                        "visual_memory_mask_ratio",
+                        "visual_memory_mask_actual_ratio",
+                        "empty_text_count",
+                        "text_valid_tokens_mean",
+                    }
                     log_msg += (
                         f", text_recon_enabled: {text_recon_stat_float('text_recon_enabled'):.0f}, "
                         f"text_injection_layer_count: {text_recon_stat_float('text_injection_layer_count'):.0f}, "
@@ -850,6 +864,10 @@ class VQLoss(nn.Module):
                         f"empty_text_count: {text_recon_stat_float('empty_text_count'):.0f}, "
                         f"text_valid_tokens_mean: {text_recon_stat_float('text_valid_tokens_mean'):.2f}"
                     )
+                    for stat_key in sorted(text_recon_stats):
+                        if stat_key in printed_text_recon_keys:
+                            continue
+                        log_msg += f", {stat_key}: {text_recon_stat_float(stat_key):.4e}"
                 logger.info(log_msg)
 
                 # update to wandb

@@ -1897,6 +1897,22 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - checkpoint load smoke：本机 Python 环境没有 `torch`，未能在本机执行；需要在 ModelArts/PyTorch 环境跑。
 - 全仓 `git diff --check` 当前会被既有无关文件 `docs/original_gigatok_line_review.md` 的 EOF 空行阻断；本 commit 相关文件需单独检查。
 
+## 服务器 smoke 结果
+- GitHub commit `4c108d6` 已推送并在服务器 fast-forward 拉取。
+- checkpoint load smoke：通过。
+  - missing keys 只有 `text_projection.*`、`residual_head_gate`、`residual_head_mlp.*`。
+  - unexpected keys 数量为 0。
+- 第一次 2-step smoke 启动失败：未设置 `PYTHONPATH=$PWD`，导致 `ModuleNotFoundError: No module named 'utils'`。
+- 第二次 2-step smoke 启动失败：未设置 `TORCH_HOME` / `DINOV2_REPO_DIR`，DINOv2 走 GitHub 下载并被远端断开。
+- 第三次 2-step smoke 使用缓存路径后通过：
+  - `TORCH_HOME=/home/ma-user/work/GigaTok_hr/gigatok_persist/cache/torch`
+  - `DINOV2_REPO_DIR=/home/ma-user/work/GigaTok_hr/gigatok_persist/cache/torch/hub/facebookresearch_dinov2_main`
+  - 2 step 训练完成，无 NaN/OOM。
+  - step 1 Val MSE 0.022345，PSNR 16.5083。
+  - step 2 Val MSE 0.025767，PSNR 15.8894。
+  - checkpoint 保存到 `outputs/text_recon_residual_head_v1/residual_head_smoke_2step_cached/checkpoints/last.pt`。
+- 发现 console log 只打印旧 text recon 固定字段，`residual_head` shape/norm stats 未出现在日志行；已追加通用 extra text recon stats console 打印，需重新跑一次 2-step 确认 shape 字段可见。
+
 ## 服务器待跑命令
 ```bash
 cd /home/ma-user/work/GigaTok_hr/GigaTok_Loss
