@@ -2028,3 +2028,42 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - `python3 -m py_compile tokenizer/tokenizer_image/vq/vq_vit_model.py tokenizer/tokenizer_image/vq/blocks.py tokenizer/tokenizer_image/vq/vq_train.py tokenizer/tokenizer_image/vq/vq_loss.py scripts/stage1/evaluate_textatlas_reconstruction.py`：通过。
 - YAML parse：使用 Ruby `YAML.load_file` 读取 `VQ_BL256_dino_disc_text_recon_adaln_v1.yaml`，通过，mode=`adaln`，layers=`[8,9,10,11,12,13,14,15]`，`text_hr.enabled=False`。
 - 本机 Python 环境没有 `torch`，eval forward smoke / checkpoint load smoke / AdaLN zero-init equivalence smoke 需要在 ModelArts/PyTorch 环境跑。
+
+## 服务器 smoke 结果
+- GitHub commit `32357ad` 已推送并在服务器 fast-forward 拉取。
+- 服务器 py_compile：通过。
+- 服务器 YAML parse：通过，生成本地配置 `configs/vq/_local_text_recon_adaln_v1.yaml`，T5 路径指向 `/home/ma-user/work/GigaTok_hr/gigatok_persist/models/google_t5-v1_1-xl`。
+- checkpoint load smoke：通过。
+  - missing keys 只有 `text_projection.*`、`adaln_mlps.*`。
+  - unexpected keys 数量为 0。
+- mode-specific trainable parameter check：通过。
+  - `adaln_mlps.*` trainable。
+  - `residual_head_*` / `residual_text_mlp.*` / `residual_gate` 未创建。
+- eval forward smoke：通过。
+  - 输入 random quant `[1,8,1,256]` 和 layer 8-15 random T5 features。
+  - 输出 `dec_shape=(1,3,256,256)`，`rec_shape=(1,256,16,16)`。
+- AdaLN zero-init equivalence smoke：通过。
+  - 不传 AdaLN 与传入 zero gamma/beta 的 `decode()` 输出一致。
+  - `dec_max_abs_diff=0.0`，`rec_max_abs_diff=0.0`。
+  - 初始 `adaln_*_norm_mean` 全为 0。
+- 2-step server smoke：通过。
+  - 2 step 训练完成，无 NaN/OOM。
+  - step 1 Val MSE 0.045982，PSNR 13.3741。
+  - step 2 Val MSE 0.051011，PSNR 12.9233。
+  - console log 已出现 `adaln_self/cross/ffn_gamma/beta_norm_mean`。
+  - checkpoint 保存到 `outputs/text_recon_adaln_v1/adaln_smoke_2step/checkpoints/last.pt`。
+  - 注意：第 2 个 step 后 AdaLN gamma/beta norm 约 2.5，验证 MSE 较 zero-init 起点明显变差；后续短训需要重点观察学习率和稳定性。
+
+## 兼容 smoke
+- 本 commit 未重新跑所有兼容 smoke。
+- 待跑兼容命令仍是：
+  - `CONFIG=configs/vq/VQ_BL256_dino_disc_text_recon_concat_hr_v1.yaml` 跑 concat_memory 2-step。
+  - `CONFIG=configs/vq/VQ_BL256_dino_disc_text_recon_concat_mask_hr_v1.yaml` 跑 concat_memory_visual_mask 2-step。
+  - `CONFIG=configs/vq/VQ_BL256_dino_disc_text_recon_residual_head_v1.yaml` 跑 residual_head 2-step。
+  - `CONFIG=configs/vq/VQ_BL256_dino_disc_text_recon_residual_pooled_layer_v1.yaml` 跑 residual_pooled_layer 2-step。
+  - `CONFIG=configs/vq/VQ_BL256_dino_disc_matched_native_v1.yaml` 跑 matched native 2-step。
+  - `CONFIG=configs/vq/VQ_BL256_dino_disc_text_hr_probe_gram_identity_v2.yaml` 跑旧 selected-layer gram 2-step。
+
+## 下一步
+- Commit 3 已完成并通过 checkpoint load smoke / eval forward smoke / zero-init equivalence smoke / 2-step server smoke。
+- 三个剩余 mode 已全部实现，下一步应先做统一兼容 smoke 或进入 100-step mini smoke，不要继续改新架构。
