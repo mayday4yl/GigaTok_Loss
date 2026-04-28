@@ -1960,3 +1960,29 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - `python3 -m py_compile tokenizer/tokenizer_image/vq/vq_vit_model.py tokenizer/tokenizer_image/vq/blocks.py tokenizer/tokenizer_image/vq/vq_train.py tokenizer/tokenizer_image/vq/vq_loss.py scripts/stage1/evaluate_textatlas_reconstruction.py`：通过。
 - YAML parse：使用 Ruby `YAML.load_file` 读取 `VQ_BL256_dino_disc_text_recon_residual_pooled_layer_v1.yaml`，通过，mode=`residual_pooled_layer`，layers=`[8,9,10,11,12,13,14,15]`。
 - 本机 Python 环境没有 `torch`，eval forward smoke / checkpoint load smoke 需要在 ModelArts/PyTorch 环境跑。
+
+## 服务器 smoke 结果
+- GitHub commit `546cf27` 已推送并在服务器 fast-forward 拉取。
+- 服务器 py_compile：通过。
+- 服务器 YAML parse：通过，生成本地配置 `configs/vq/_local_text_recon_residual_pooled_layer_v1.yaml`，T5 路径指向 `/home/ma-user/work/GigaTok_hr/gigatok_persist/models/google_t5-v1_1-xl`。
+- checkpoint load smoke：通过。
+  - missing keys 只有 `text_projection.*`、`residual_gate`、`residual_text_mlp.*`。
+  - unexpected keys 数量为 0。
+- mode-specific trainable parameter check：通过。
+  - `residual_gate` trainable。
+  - `residual_text_mlp.*` trainable。
+  - `residual_head_mlp.*` / `residual_head_gate` 未创建。
+- eval forward smoke：通过。
+  - 输入 random quant `[1,8,1,256]` 和 layer 8-15 random T5 features。
+  - 输出 `dec_shape=(1,3,256,256)`，`rec_shape=(1,256,16,16)`。
+  - `residual_gate=0.0010000000474974513`，`residual_norm_mean=3.7933`。
+- 2-step server smoke：通过。
+  - 2 step 训练完成，无 NaN/OOM。
+  - step 1 Val MSE 0.022344，PSNR 16.5084。
+  - step 2 Val MSE 0.025785，PSNR 15.8863。
+  - console log 已出现 `residual_gate`、`residual_norm_mean`。
+  - checkpoint 保存到 `outputs/text_recon_residual_pooled_layer_v1/residual_pooled_layer_smoke_2step/checkpoints/last.pt`。
+
+## 下一步
+- Commit 2 已完成并通过 checkpoint load smoke / eval forward smoke / 2-step server smoke。
+- 下一 commit 才开始 `adaln`，不要把 AdaLN 混入当前 commit。
