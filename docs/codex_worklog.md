@@ -1911,56 +1911,15 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - step 1 Val MSE 0.022345，PSNR 16.5083。
   - step 2 Val MSE 0.025767，PSNR 15.8894。
   - checkpoint 保存到 `outputs/text_recon_residual_head_v1/residual_head_smoke_2step_cached/checkpoints/last.pt`。
-- 发现 console log 只打印旧 text recon 固定字段，`residual_head` shape/norm stats 未出现在日志行；已追加通用 extra text recon stats console 打印，需重新跑一次 2-step 确认 shape 字段可见。
+- 发现 console log 只打印旧 text recon 固定字段，`residual_head` shape/norm stats 未出现在日志行；已追加通用 extra text recon stats console 打印。
+- 追加日志后复跑 `residual_head_smoke_2step_logged`：通过。
+  - 2 step 训练完成，无 NaN/OOM。
+  - step 1 Val MSE 0.022346，PSNR 16.5079。
+  - step 2 Val MSE 0.025768，PSNR 15.8892。
+  - checkpoint 保存到 `outputs/text_recon_residual_head_v1/residual_head_smoke_2step_logged/checkpoints/last.pt`。
+  - console log 已出现 `residual_head_gate`、`residual_head_norm_mean`、`residual_head_rec_spatial_channels`、`residual_head_text_spatial_channels`、`residual_head_token_size`。
+  - shape 记录确认：`rec_spatial=[B,256,16,16]`，`text_spatial` channel 为 256，`s1to2decoder.token_size=256`。
 
-## 服务器待跑命令
-```bash
-cd /home/ma-user/work/GigaTok_hr/GigaTok_Loss
-git pull --ff-only origin codex/text-hr-decoder
-
-SAVE_ROOT=/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_recon_residual_head_v1
-TRAIN_MANIFEST=/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/manifest/train_materialized_manifest_v2text.jsonl
-VAL_MANIFEST=/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/manifest/val_materialized_manifest_v2text.jsonl
-CKPT=/home/ma-user/work/GigaTok_hr/gigatok_persist/checkpoints/VQ_BL256_dino_disc.pt
-LOCAL_T5=/home/ma-user/work/GigaTok_hr/gigatok_persist/models/google_t5-v1_1-xl
-mkdir -p "$SAVE_ROOT/logs"
-
-python - <<'PY'
-import yaml
-src = "configs/vq/VQ_BL256_dino_disc_text_recon_residual_head_v1.yaml"
-dst = "configs/vq/_local_text_recon_residual_head_v1.yaml"
-local_t5 = "/home/ma-user/work/GigaTok_hr/gigatok_persist/models/google_t5-v1_1-xl"
-with open(src) as f:
-    cfg = yaml.safe_load(f)
-cfg["text_conditioning"]["encoder_name"] = local_t5
-cfg["text_conditioning"]["local_files_only"] = True
-with open(dst, "w") as f:
-    yaml.safe_dump(cfg, f, sort_keys=False)
-print("wrote", dst, "mode=", cfg["text_recon_conditioning"]["mode"])
-PY
-
-ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 \
-  tokenizer/tokenizer_image/vq/vq_train.py \
-  --model-config configs/vq/_local_text_recon_residual_head_v1.yaml \
-  --data-path "$TRAIN_MANIFEST" \
-  --json-path "$TRAIN_MANIFEST" \
-  --val-json-path "$VAL_MANIFEST" \
-  --save-path "$SAVE_ROOT" \
-  --vq-ckpt "$CKPT" \
-  --dataset textatlas_image_text \
-  --device-backend npu \
-  --finetune \
-  --global-batch-size 24 \
-  --gradient-accumulation-steps 1 \
-  --max-images 300000 \
-  --iterations 2 \
-  --num-workers 4 \
-  --val-every 1 \
-  --val-max-images 32 \
-  --eval-batch-size 8 \
-  --log-every 1 \
-  --ckpt-every 999999 \
-  --save-last \
-  --sub-exp-dir residual_head_smoke_2step \
-  --no-wandb 2>&1 | tee "$SAVE_ROOT/logs/residual_head_smoke_2step.log"
-```
+## 下一步
+- Commit 1 已完成并通过服务器 checkpoint load smoke / 2-step smoke。
+- 下一 commit 才开始 `residual_pooled_layer`，不要把 AdaLN 或 residual_pooled_layer 混入当前 commit。
