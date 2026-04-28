@@ -263,6 +263,8 @@ def high_rank_image_text_attention_loss(
     energy_top1s = []
     energy_top5s = []
     gram_losses = []
+    text_attention_masses = []
+    visual_attention_masses = []
     valid_token_counts = []
     skipped_samples = 0
 
@@ -275,6 +277,12 @@ def high_rank_image_text_attention_loss(
 
         matrix = text_attn[batch_idx, :, :, valid_mask]
         raw_matrix = matrix.reshape(num_heads * num_queries, valid_token_count).float()
+        # Attention mass checks whether the selected decoder layer actually
+        # attends to text keys after visual/text memory concat.
+        text_attention_masses.append(matrix.sum(dim=-1).float().mean().detach())
+        visual_attention_masses.append(
+            attn_weights[batch_idx, :, :, :image_token_len].sum(dim=-1).float().mean().detach()
+        )
         # Text-HR v2: SVD is computed in float32 for stability even under bf16 training.
         raw_sigma = torch.linalg.svdvals(raw_matrix)
         matrix_normed, fro_norm = _frobenius_normalize_attention_matrix(raw_matrix, eps=eps)
@@ -338,6 +346,8 @@ def high_rank_image_text_attention_loss(
             "energy_top1_mean": zero.detach(),
             "energy_top5_mean": zero.detach(),
             "gram_loss_mean": zero.detach(),
+            "text_attention_mass_mean": zero.detach(),
+            "visual_attention_mass_mean": zero.detach(),
             "valid_text_tokens_mean": zero.detach(),
             "valid_samples": 0,
             "skipped_samples": skipped_samples,
@@ -366,6 +376,8 @@ def high_rank_image_text_attention_loss(
         "energy_top1_mean": torch.stack(energy_top1s).mean(),
         "energy_top5_mean": torch.stack(energy_top5s).mean(),
         "gram_loss_mean": torch.stack(gram_losses).mean(),
+        "text_attention_mass_mean": torch.stack(text_attention_masses).mean(),
+        "visual_attention_mass_mean": torch.stack(visual_attention_masses).mean(),
         "valid_text_tokens_mean": valid_tokens.mean(),
         "valid_samples": len(losses),
         "skipped_samples": skipped_samples,
@@ -573,7 +585,8 @@ class VQLoss(nn.Module):
                 text_hr_attn_weights=None, text_attention_mask=None, text_hr_loss_weight=0.0,
                 selected_text_layer=None, text_hr_tau=1.0,
                 text_hr_skip_if_valid_tokens_lt=2, text_hr_image_token_len=256,
-                text_hr_svd_mode="frobenius_uniform", text_hr_eps=1e-8
+                text_hr_svd_mode="frobenius_uniform", text_hr_eps=1e-8,
+                text_recon_stats=None
                 ):
         assert len(inter_loss_set) == 2
         assert isinstance(all_reconstructions, list)
@@ -723,6 +736,12 @@ class VQLoss(nn.Module):
                 raise ValueError("text_hr_loss_weight is non-zero but text_hr_attn_weights is None.")
 
             text_hr_loss_term = text_hr_loss_weight * text_hr_loss if text_hr_loss is not None else 0.0
+            text_recon_stats = text_recon_stats or {}
+            def text_recon_stat_float(name, default=0.0):
+                value = text_recon_stats.get(name, default)
+                if torch.is_tensor(value):
+                    return float(value.detach().float().mean().item())
+                return float(value)
             loss = self.rec_weight * (rec_loss + direct_rec_loss) + \
                 self.perceptual_weight * (p_loss + direct_p_loss) + \
                 disc_adaptive_weight * disc_weight * (generator_adv_loss + direct_generator_adv_loss) + \
@@ -765,6 +784,8 @@ class VQLoss(nn.Module):
                             f"text_hr_participation_rank_ratio_mean: {text_hr_stats['participation_rank_ratio_mean']:.4f}, "
                             f"text_hr_effective_rank_mean: {text_hr_stats['effective_rank_mean']:.2f}, "
                             f"text_hr_gram_loss_mean: {text_hr_stats['gram_loss_mean']:.4e}, "
+                            f"text_hr_text_attention_mass_mean: {text_hr_stats['text_attention_mass_mean']:.4f}, "
+                            f"text_hr_visual_attention_mass_mean: {text_hr_stats['visual_attention_mass_mean']:.4f}, "
                             f"text_hr_valid_text_tokens_mean: {text_hr_stats['valid_text_tokens_mean']:.2f}, "
                             f"text_hr_skipped_samples: {text_hr_stats['skipped_samples']}\n"
                         )
@@ -806,8 +827,25 @@ class VQLoss(nn.Module):
                         f"text_hr_effective_rank_mean: {text_hr_stats['effective_rank_mean']:.2f}, "
                         f"text_hr_energy_top1_mean: {text_hr_stats['energy_top1_mean']:.4f}, "
                         f"text_hr_gram_loss_mean: {text_hr_stats['gram_loss_mean']:.4e}, "
+                        f"text_hr_text_attention_mass_mean: {text_hr_stats['text_attention_mass_mean']:.4f}, "
+                        f"text_hr_visual_attention_mass_mean: {text_hr_stats['visual_attention_mass_mean']:.4f}, "
                         f"text_hr_valid_text_tokens_mean: {text_hr_stats['valid_text_tokens_mean']:.2f}, "
                         f"text_hr_skipped_samples: {text_hr_stats['skipped_samples']}"
+                    )
+                if text_recon_stats:
+                    log_msg += (
+                        f", text_recon_enabled: {text_recon_stat_float('text_recon_enabled'):.0f}, "
+                        f"text_injection_layer_count: {text_recon_stat_float('text_injection_layer_count'):.0f}, "
+                        f"text_gate: {text_recon_stat_float('text_gate'):.4f}, "
+                        f"text_memory_norm_before_gate_mean: "
+                        f"{text_recon_stat_float('text_memory_norm_before_gate_mean'):.4e}, "
+                        f"text_memory_norm_after_gate_mean: "
+                        f"{text_recon_stat_float('text_memory_norm_after_gate_mean'):.4e}, "
+                        f"selected_text_memory_norm: {text_recon_stat_float('selected_text_memory_norm'):.4e}, "
+                        f"visual_memory_norm_mean: {text_recon_stat_float('visual_memory_norm_mean'):.4e}, "
+                        f"text_visual_norm_ratio: {text_recon_stat_float('text_visual_norm_ratio'):.4e}, "
+                        f"empty_text_count: {text_recon_stat_float('empty_text_count'):.0f}, "
+                        f"text_valid_tokens_mean: {text_recon_stat_float('text_valid_tokens_mean'):.2f}"
                     )
                 logger.info(log_msg)
 
@@ -857,10 +895,18 @@ class VQLoss(nn.Module):
                         "(Generator)text_hr_energy_top1_mean": text_hr_stats["energy_top1_mean"].detach(),
                         "(Generator)text_hr_energy_top5_mean": text_hr_stats["energy_top5_mean"].detach(),
                         "(Generator)text_hr_gram_loss_mean": text_hr_stats["gram_loss_mean"].detach(),
+                        "(Generator)text_hr_text_attention_mass_mean": text_hr_stats["text_attention_mass_mean"].detach(),
+                        "(Generator)text_hr_visual_attention_mass_mean": text_hr_stats["visual_attention_mass_mean"].detach(),
                         "(Generator)text_hr_valid_text_tokens_mean": text_hr_stats["valid_text_tokens_mean"].detach(),
                         "(Generator)text_hr_valid_samples": text_hr_stats["valid_samples"],
                         "(Generator)text_hr_skipped_samples": text_hr_stats["skipped_samples"],
                     })
+                if text_recon_stats:
+                    for stat_key, stat_value in text_recon_stats.items():
+                        if torch.is_tensor(stat_value):
+                            update_info[f"(Generator){stat_key}"] = stat_value.detach()
+                        else:
+                            update_info[f"(Generator){stat_key}"] = stat_value
 
                 # if proj_loss > 0:
                 #     update_info["(Generator)proj_loss"] = proj_loss

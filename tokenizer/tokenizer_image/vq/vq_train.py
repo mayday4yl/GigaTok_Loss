@@ -141,7 +141,7 @@ def synchronize_device(device_backend):
         raise ValueError(f"Unsupported device backend: {device_backend}")
 
 
-def build_text_layer_pairs(text_hr_cfg, decoder_num_layers, text_num_layers=None):
+def build_text_layer_pairs(text_hr_cfg, decoder_num_layers, text_num_layers=None, config_name="text_hr"):
     raw_pairs = text_hr_cfg.get("layer_pairs", None)
     if not raw_pairs:
         shared_layers = min(decoder_num_layers, text_num_layers) if text_num_layers is not None else decoder_num_layers
@@ -152,7 +152,7 @@ def build_text_layer_pairs(text_hr_cfg, decoder_num_layers, text_num_layers=None
     layer_pairs = []
     for pair in raw_pairs:
         if len(pair) != 2:
-            raise ValueError(f"text_hr.layer_pairs entries must be [t5_layer, decoder_layer], got {pair}")
+            raise ValueError(f"{config_name}.layer_pairs entries must be [t5_layer, decoder_layer], got {pair}")
         text_layer, decoder_layer = int(pair[0]), int(pair[1])
         if decoder_layer < 0 or decoder_layer >= decoder_num_layers:
             raise ValueError(
@@ -165,6 +165,26 @@ def build_text_layer_pairs(text_hr_cfg, decoder_num_layers, text_num_layers=None
     if not layer_pairs:
         raise ValueError("No valid text/decode layer pairs configured.")
     return layer_pairs
+
+
+def parse_text_recon_layers(text_recon_cfg, decoder_num_layers=None):
+    raw_layers = text_recon_cfg.get("layers", None)
+    if not raw_layers:
+        raw_pairs = text_recon_cfg.get("layer_pairs", None)
+        if raw_pairs:
+            raw_layers = [pair[1] for pair in raw_pairs]
+    if not raw_layers:
+        return []
+    layers = [int(layer) for layer in raw_layers]
+    if len(set(layers)) != len(layers):
+        raise ValueError(f"text_recon_conditioning.layers must not contain duplicates, got {layers}")
+    if decoder_num_layers is not None:
+        out_of_range = [layer for layer in layers if layer < 0 or layer >= decoder_num_layers]
+        if out_of_range:
+            raise ValueError(
+                f"text_recon_conditioning.layers out of range for decoder_num_layers={decoder_num_layers}: {out_of_range}"
+            )
+    return layers
 
 
 def append_csv_row(path, fieldnames, row):
@@ -185,6 +205,8 @@ def compute_reconstruction_metrics(
         text_tokenizer=None,
         text_encoder=None,
         text_layer_pairs=None,
+        text_recon_layer_pairs=None,
+        text_injection_layers=None,
         text_max_length=None,
         mixed_precision_dtype=None,
 ):
@@ -201,15 +223,15 @@ def compute_reconstruction_metrics(
             imgs = imgs.to(device, non_blocking=True)
             selected_decoder_layer = None
             decoder_text_features = None
+            decoder_text_features_by_layer = None
             decoder_text_key_padding_mask = None
 
             if text_tokenizer is not None:
-                if text_encoder is None or not text_layer_pairs:
-                    raise ValueError("Text-conditioned validation requires text_encoder and text_layer_pairs.")
+                if text_encoder is None:
+                    raise ValueError("Text-conditioned validation requires text_encoder.")
                 if not isinstance(text_batch, (list, tuple)):
                     raise TypeError("Text-conditioned validation requires the validation dataset to return text strings.")
 
-                selected_text_layer, selected_decoder_layer = text_layer_pairs[0]
                 text_inputs = text_tokenizer(
                     [str(text) for text in text_batch],
                     padding="max_length",
@@ -230,13 +252,25 @@ def compute_reconstruction_metrics(
                 hidden_states = text_outputs.hidden_states
                 if hidden_states is None:
                     raise RuntimeError("T5 encoder did not return hidden_states during validation.")
-                hidden_state_index = selected_text_layer + 1
-                if hidden_state_index >= len(hidden_states):
-                    raise ValueError(
-                        f"selected_text_layer={selected_text_layer} maps to hidden_states[{hidden_state_index}], "
-                        f"but T5 returned only {len(hidden_states)} hidden states."
-                    )
-                decoder_text_features = hidden_states[hidden_state_index].detach()
+                t5_layer_states = hidden_states[1:]
+                if text_recon_layer_pairs:
+                    decoder_text_features_by_layer = {}
+                    for text_layer, decoder_layer in text_recon_layer_pairs:
+                        if text_layer >= len(t5_layer_states):
+                            raise ValueError(
+                                f"text_layer={text_layer} is out of range for T5 layer outputs={len(t5_layer_states)}"
+                            )
+                        decoder_text_features_by_layer[int(decoder_layer)] = t5_layer_states[text_layer].detach()
+                else:
+                    if not text_layer_pairs:
+                        raise ValueError("Text-conditioned validation requires text_layer_pairs.")
+                    selected_text_layer, selected_decoder_layer = text_layer_pairs[0]
+                    if selected_text_layer >= len(t5_layer_states):
+                        raise ValueError(
+                            f"selected_text_layer={selected_text_layer} is out of range for "
+                            f"T5 layer outputs={len(t5_layer_states)}"
+                        )
+                    decoder_text_features = t5_layer_states[selected_text_layer].detach()
 
             with autocast_context(args.device_backend, args.mixed_precision, dtype=mixed_precision_dtype):
                 outputs = vq_model(
@@ -244,7 +278,9 @@ def compute_reconstruction_metrics(
                     causal_type=causal_type,
                     selected_decoder_layer=selected_decoder_layer,
                     decoder_text_features=decoder_text_features,
+                    decoder_text_features_by_layer=decoder_text_features_by_layer,
                     decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                    text_injection_layers=text_injection_layers,
                 )
             recons = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
             diff = (recons.float() - imgs.float()) * 0.5
@@ -439,13 +475,24 @@ def main(args):
     # Text-HR v2: separate config blocks make the text-conditioned path optional.
     # If both switches are off, the original GigaTok stage-1 path is used.
     text_conditioning_cfg = config.get("text_conditioning", {})
+    text_recon_cfg = config.get("text_recon_conditioning", {})
     text_hr_cfg = config.get("text_hr", {})
     text_conditioning_on = bool(text_conditioning_cfg.get("enabled", False))
+    text_recon_on = bool(text_recon_cfg.get("enabled", False))
     text_hr_on = bool(text_hr_cfg.get("enabled", False))
+    if text_recon_on and not text_conditioning_on:
+        raise ValueError("text_recon_conditioning.enabled requires text_conditioning.enabled=True.")
     if text_hr_on and not text_conditioning_on:
         raise ValueError("text_hr.enabled requires text_conditioning.enabled=True.")
     if hr_on and text_hr_on:
         raise ValueError("v1 hr_on and v2 text_hr.enabled cannot be enabled at the same time.")
+    if text_recon_on:
+        if str(text_recon_cfg.get("mode", "concat_memory")) != "concat_memory":
+            raise NotImplementedError("Only text_recon_conditioning.mode=concat_memory is implemented.")
+        for block_name in ("visual_memory_mask", "residual", "adaln"):
+            block_cfg = text_recon_cfg.get(block_name, {})
+            if isinstance(block_cfg, dict) and bool(block_cfg.get("enabled", False)):
+                raise NotImplementedError(f"text_recon_conditioning.{block_name} is planned but not implemented.")
     text_hr_loss_weight = float(text_hr_cfg.get("hr_loss_weight", 0.0)) if text_hr_on else 0.0
     text_hr_tau = float(text_hr_cfg.get("tau", 1.0))
     text_hr_svd_mode = str(text_hr_cfg.get("svd_mode", "frobenius_uniform"))
@@ -695,10 +742,14 @@ def main(args):
     if text_conditioning_on:
         # Text-HR v2: add the lightweight projection parameters after loading
         # the base model definition, before checkpoint compatibility loading.
+        text_gate_cfg = text_recon_cfg.get("text_gate", {}) if text_recon_on else {}
         vq_model.configure_text_conditioning(
             text_feature_dim=text_feature_dim,
             text_projection=text_conditioning_cfg.get("text_projection", "linear_layernorm"),
             text_type_embedding=text_conditioning_cfg.get("text_type_embedding", True),
+            visual_type_embedding=text_recon_on and bool(text_recon_cfg.get("visual_type_embedding", False)),
+            text_gate_enabled=text_recon_on and bool(text_gate_cfg.get("enabled", False)),
+            text_gate_init=float(text_gate_cfg.get("init", 0.1)),
         )
 
     # create and load model
@@ -815,10 +866,12 @@ def main(args):
     text_conditioning_missing_keys = []
     if skip_model_optimizer_load:
         for name, _ in vq_model.named_parameters():
-            if name == "text_type_embedding" or name.startswith("text_projection."):
+            if name in {"text_type_embedding", "visual_type_embedding", "text_gate_logit"} \
+                    or name.startswith("text_projection."):
                 text_conditioning_missing_keys.append(name)
         for name, _ in vq_model.named_buffers():
-            if name == "text_type_embedding" or name.startswith("text_projection."):
+            if name in {"text_type_embedding", "visual_type_embedding", "text_gate_logit"} \
+                    or name.startswith("text_projection."):
                 text_conditioning_missing_keys.append(name)
     if args.vq_ckpt:
         checkpoint = torch.load(args.vq_ckpt, map_location="cpu")
@@ -984,6 +1037,8 @@ def main(args):
     
     decoder_num_layers = vq_model.s1to2decoder.num_layers
     text_layer_pairs = None
+    text_recon_layer_pairs = None
+    text_injection_layers = []
     text_hr_image_token_len = int(text_hr_cfg.get("image_token_len", vq_model.config.num_latent_tokens))
     if text_conditioning_on:
         text_layer_pairs = build_text_layer_pairs(
@@ -994,6 +1049,39 @@ def main(args):
         logger.info(
             f"Text-conditioned decoder layer pairs [t5_layer, decoder_layer]={text_layer_pairs}; "
             f"image_token_len={text_hr_image_token_len}"
+        )
+    if text_recon_on:
+        configured_layers = parse_text_recon_layers(text_recon_cfg, decoder_num_layers=decoder_num_layers)
+        if not configured_layers:
+            raise ValueError("text_recon_conditioning.enabled=True requires non-empty layers or layer_pairs.")
+        text_recon_pairs_cfg = dict(text_recon_cfg)
+        if not text_recon_pairs_cfg.get("layer_pairs", None):
+            text_recon_pairs_cfg["layer_pairs"] = [[layer_idx, layer_idx] for layer_idx in configured_layers]
+        text_recon_layer_pairs = build_text_layer_pairs(
+            text_recon_pairs_cfg,
+            decoder_num_layers=decoder_num_layers,
+            text_num_layers=text_encoder_num_layers,
+            config_name="text_recon_conditioning",
+        )
+        text_injection_layers = [decoder_layer for _, decoder_layer in text_recon_layer_pairs]
+        if configured_layers and sorted(configured_layers) != sorted(text_injection_layers):
+            raise ValueError(
+                f"text_recon_conditioning.layers={configured_layers} must match decoder layers from "
+                f"text_recon_conditioning.layer_pairs={text_recon_layer_pairs}"
+            )
+        if len(set(text_injection_layers)) != len(text_injection_layers):
+            raise ValueError(f"text_recon_conditioning decoder layers must be unique: {text_recon_layer_pairs}")
+        if text_hr_on:
+            hr_decoder_layers = {decoder_layer for _, decoder_layer in text_layer_pairs}
+            missing_hr_layers = sorted(hr_decoder_layers - set(text_injection_layers))
+            if missing_hr_layers:
+                raise ValueError(
+                    f"text_hr decoder layers must be included in text_recon_conditioning.layers, "
+                    f"missing={missing_hr_layers}"
+                )
+        logger.info(
+            f"Text reconstruction conditioning enabled: mode={text_recon_cfg.get('mode', 'concat_memory')}, "
+            f"text_injection_layers={text_injection_layers}, text_recon_layer_pairs={text_recon_layer_pairs}"
         )
     if args.compile:
         logger.info("compiling the model... (may take several minutes)")
@@ -1120,8 +1208,10 @@ def main(args):
 
             selected_text_layer = None
             decoder_text_features = None
+            decoder_text_features_by_layer = None
             decoder_text_key_padding_mask = None
             text_attention_mask = None
+            text_recon_stats = None
 
             if text_conditioning_on:
                 pair_rng = random.Random(train_steps + 1 + args.global_seed)
@@ -1160,15 +1250,32 @@ def main(args):
                 hidden_states = text_outputs.hidden_states
                 if hidden_states is None:
                     raise RuntimeError("T5 encoder did not return hidden_states.")
-                hidden_state_index = selected_text_layer + 1
-                if hidden_state_index >= len(hidden_states):
-                    raise ValueError(
-                        f"selected_text_layer={selected_text_layer} maps to hidden_states[{hidden_state_index}], "
-                        f"but T5 returned only {len(hidden_states)} hidden states."
-                    )
-                # Text-HR v2: this hidden state is projected inside VQVitModelPlus
-                # and injected only into selected_decoder_layer.
-                decoder_text_features = hidden_states[hidden_state_index].detach()
+                t5_layer_states = hidden_states[1:]
+                if text_recon_on:
+                    decoder_text_features_by_layer = {}
+                    for text_layer, decoder_layer in text_recon_layer_pairs:
+                        if text_layer >= len(t5_layer_states):
+                            raise ValueError(
+                                f"text_layer={text_layer} is out of range for T5 layer outputs={len(t5_layer_states)}"
+                            )
+                        decoder_text_features_by_layer[int(decoder_layer)] = t5_layer_states[text_layer].detach()
+                else:
+                    if selected_text_layer >= len(t5_layer_states):
+                        raise ValueError(
+                            f"selected_text_layer={selected_text_layer} is out of range for "
+                            f"T5 layer outputs={len(t5_layer_states)}"
+                        )
+                    # Text-HR v2 legacy: this hidden state is projected inside
+                    # VQVitModelPlus and injected only into selected_decoder_layer.
+                    decoder_text_features = t5_layer_states[selected_text_layer].detach()
+                if text_recon_on:
+                    text_recon_stats = {
+                        "text_recon_enabled": torch.tensor(1.0, device=device),
+                        "text_injection_layer_count": torch.tensor(float(len(text_injection_layers)), device=device),
+                        "empty_text_count": torch.tensor(
+                            float(sum(1 for text in texts if not str(text).strip())), device=device),
+                        "text_valid_tokens_mean": text_attention_mask.float().sum(dim=1).mean(),
+                    }
             elif hr_on:
                 if hr_random_one_layer:
                     layer_rng = random.Random(train_steps + 1 + args.global_seed)
@@ -1232,12 +1339,23 @@ def main(args):
                         max_steps=total_steps,
                         selected_decoder_layer=selected_decoder_layer,
                         decoder_text_features=decoder_text_features,
+                        decoder_text_features_by_layer=decoder_text_features_by_layer,
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                        text_injection_layers=text_injection_layers if text_recon_on else None,
+                        return_text_recon_stats=text_recon_on,
                     )
                     if selected_decoder_layer is not None:
-                        recons_imgs, inter_loss_set, inner_feat, hr_attn_weights = vq_outputs
+                        if text_recon_on:
+                            recons_imgs, inter_loss_set, inner_feat, hr_attn_weights, model_text_recon_stats = vq_outputs
+                            text_recon_stats.update(model_text_recon_stats)
+                        else:
+                            recons_imgs, inter_loss_set, inner_feat, hr_attn_weights = vq_outputs
                     else:
-                        recons_imgs, inter_loss_set, inner_feat = vq_outputs
+                        if text_recon_on:
+                            recons_imgs, inter_loss_set, inner_feat, model_text_recon_stats = vq_outputs
+                            text_recon_stats.update(model_text_recon_stats)
+                        else:
+                            recons_imgs, inter_loss_set, inner_feat = vq_outputs
                         hr_attn_weights = None
                 else:
                     vq_outputs = vq_model(
@@ -1251,12 +1369,23 @@ def main(args):
                         max_steps=total_steps,
                         selected_decoder_layer=selected_decoder_layer,
                         decoder_text_features=decoder_text_features,
+                        decoder_text_features_by_layer=decoder_text_features_by_layer,
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                        text_injection_layers=text_injection_layers if text_recon_on else None,
+                        return_text_recon_stats=text_recon_on,
                     )
                     if selected_decoder_layer is not None:
-                        recons_imgs, inter_loss_set, hr_attn_weights = vq_outputs
+                        if text_recon_on:
+                            recons_imgs, inter_loss_set, hr_attn_weights, model_text_recon_stats = vq_outputs
+                            text_recon_stats.update(model_text_recon_stats)
+                        else:
+                            recons_imgs, inter_loss_set, hr_attn_weights = vq_outputs
                     else:
-                        recons_imgs, inter_loss_set = vq_outputs
+                        if text_recon_on:
+                            recons_imgs, inter_loss_set, model_text_recon_stats = vq_outputs
+                            text_recon_stats.update(model_text_recon_stats)
+                        else:
+                            recons_imgs, inter_loss_set = vq_outputs
                         hr_attn_weights = None
                     inner_feat = None
                 loss_gen = vq_loss(inter_loss_set, imgs, recons_imgs, exp_dir=exp_dir, optimizer_idx=0, global_step=train_steps+1, 
@@ -1279,6 +1408,7 @@ def main(args):
                                    text_hr_eps=text_hr_eps,
                                    text_hr_skip_if_valid_tokens_lt=text_hr_skip_if_valid_tokens_lt,
                                    text_hr_image_token_len=text_hr_image_token_len,
+                                   text_recon_stats=text_recon_stats,
                                    )
             
             if train_steps + 1 >= int(config["loss"]["params"].get("gen_start", 0)):
@@ -1385,6 +1515,8 @@ def main(args):
                     text_tokenizer=text_tokenizer if text_conditioning_on else None,
                     text_encoder=text_encoder if text_conditioning_on else None,
                     text_layer_pairs=text_layer_pairs if text_conditioning_on else None,
+                    text_recon_layer_pairs=text_recon_layer_pairs if text_recon_on else None,
+                    text_injection_layers=text_injection_layers if text_recon_on else None,
                     text_max_length=text_max_length if text_conditioning_on else None,
                     mixed_precision_dtype=ptdtype,
                 )

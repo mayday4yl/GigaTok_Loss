@@ -4,7 +4,8 @@
 #   REPA: https://github.com/sihyun-yu/REPA
 #   DETR: https://github.com/facebookresearch/detr
 from dataclasses import dataclass, field
-from typing import List
+import math
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -287,6 +288,8 @@ class VQVitModelPlus(nn.Module):
 
         self.text_projection = None
         self.text_type_embedding = None
+        self.visual_type_embedding = None
+        self.text_gate_logit = None
         
         self.freeze_but_2d_decoder_flag = False
 
@@ -358,7 +361,10 @@ class VQVitModelPlus(nn.Module):
             self,
             text_feature_dim,
             text_projection="linear_layernorm",
-            text_type_embedding=True):
+            text_type_embedding=True,
+            visual_type_embedding=False,
+            text_gate_enabled=False,
+            text_gate_init=1.0):
         # Text-HR v2: build the small trainable bridge from frozen T5 hidden states
         # to the GigaTok transformer decoder width.
         decoder_width = self.s1to2decoder.width
@@ -388,6 +394,19 @@ class VQVitModelPlus(nn.Module):
         else:
             self.text_type_embedding = None
 
+        if visual_type_embedding:
+            self.visual_type_embedding = nn.Parameter(torch.zeros(1, 1, decoder_width))
+        else:
+            self.visual_type_embedding = None
+
+        if text_gate_enabled:
+            init = float(text_gate_init)
+            if init <= 0.0 or init >= 1.0:
+                raise ValueError(f"text_gate_init must be in (0, 1), got {text_gate_init}")
+            self.text_gate_logit = nn.Parameter(torch.tensor(math.log(init / (1.0 - init))))
+        else:
+            self.text_gate_logit = None
+
     def project_text_memory(self, decoder_text_features):
         # Text-HR v2: decoder_text_features are selected T5 layer features [B, T, d_t5].
         # This projects them to decoder memory tokens [B, T, d_dec].
@@ -402,6 +421,75 @@ class VQVitModelPlus(nn.Module):
                 dtype=text_memory.dtype,
             )
         return text_memory
+
+    def _text_gate(self, device, dtype):
+        if self.text_gate_logit is None:
+            return torch.ones((), device=device, dtype=dtype)
+        return torch.sigmoid(self.text_gate_logit.to(device=device, dtype=dtype))
+
+    @staticmethod
+    def _mean_token_norm(tensor):
+        return tensor.float().norm(dim=-1).mean()
+
+    def project_text_memory_by_layer(
+            self,
+            decoder_text_features_by_layer: Optional[Mapping[int, torch.Tensor]],
+            selected_decoder_layer=None):
+        if not decoder_text_features_by_layer:
+            return None, {}
+        if self.text_projection is None:
+            raise RuntimeError("Text conditioning is enabled, but text_projection is not configured.")
+
+        text_memory_by_layer: Dict[int, torch.Tensor] = {}
+        before_norms = []
+        after_norms = []
+        selected_norm = None
+        gate = None
+
+        for decoder_layer, decoder_text_features in decoder_text_features_by_layer.items():
+            text_memory = self.text_projection(decoder_text_features)
+            if self.text_type_embedding is not None:
+                text_memory = text_memory + self.text_type_embedding.to(
+                    device=text_memory.device,
+                    dtype=text_memory.dtype,
+                )
+            if gate is None:
+                gate = self._text_gate(text_memory.device, text_memory.dtype)
+            before_norm = self._mean_token_norm(text_memory)
+            gated_text_memory = gate * text_memory
+            after_norm = self._mean_token_norm(gated_text_memory)
+            text_memory_by_layer[int(decoder_layer)] = gated_text_memory
+            before_norms.append(before_norm)
+            after_norms.append(after_norm)
+            if selected_decoder_layer is not None and int(decoder_layer) == int(selected_decoder_layer):
+                selected_norm = after_norm
+
+        if gate is None:
+            gate = torch.tensor(1.0)
+        if selected_norm is None and after_norms:
+            selected_norm = torch.stack(after_norms).mean()
+        stats = {
+            "text_gate": gate.float(),
+            "text_memory_norm_before_gate_mean": torch.stack(before_norms).mean(),
+            "text_memory_norm_after_gate_mean": torch.stack(after_norms).mean(),
+            "selected_text_memory_norm": selected_norm,
+        }
+        return text_memory_by_layer, stats
+
+    @staticmethod
+    def _merge_text_recon_stats(text_stats, decoder_stats):
+        if not text_stats and not decoder_stats:
+            return {}
+        stats = {}
+        if text_stats:
+            stats.update(text_stats)
+        if decoder_stats:
+            stats.update(decoder_stats)
+        text_norm = stats.get("text_memory_norm_after_gate_mean", None)
+        visual_norm = stats.get("visual_memory_norm_mean", None)
+        if text_norm is not None and visual_norm is not None:
+            stats["text_visual_norm_ratio"] = text_norm / visual_norm.clamp_min(1e-8)
+        return stats
     
     def _init_weights(self, module):
         """ Initialize the weights.
@@ -484,28 +572,64 @@ class VQVitModelPlus(nn.Module):
             return_feat=False,    # the feature for linear probe
             selected_decoder_layer=None,
             decoder_text_features=None,
+            decoder_text_features_by_layer=None,
             decoder_text_key_padding_mask=None,
+            text_injection_layers=None,
+            return_text_recon_stats=False,
             ):
         quant = self.post_quant_conv(quant)
         text_memory = self.project_text_memory(decoder_text_features)
         if text_memory is not None and selected_decoder_layer is None:
             raise ValueError("decoder_text_features requires selected_decoder_layer for text injection.")
+        text_memory_by_layer, text_stats = self.project_text_memory_by_layer(
+            decoder_text_features_by_layer,
+            selected_decoder_layer=selected_decoder_layer,
+        )
         # Text-HR v2: only the selected decoder layer receives text_memory and
         # returns its post-softmax cross-attention weights for the HR loss.
         if ret_inner_feat:
             if selected_decoder_layer is not None:
-                rec_spatial, inner_feat, decoder_cross_attn = self.s1to2decoder(
+                decoder_outputs = self.s1to2decoder(
                     quant,
                     ret_inner_feat=True,
                     selected_decoder_layer=selected_decoder_layer,
                     text_memory=text_memory,
+                    text_memory_by_layer=text_memory_by_layer,
                     text_key_padding_mask=decoder_text_key_padding_mask,
+                    text_injection_layers=text_injection_layers,
+                    visual_type_embedding=self.visual_type_embedding,
+                    return_text_recon_stats=return_text_recon_stats,
                 )
+                if return_text_recon_stats:
+                    rec_spatial, inner_feat, decoder_cross_attn, decoder_stats = decoder_outputs
+                else:
+                    rec_spatial, inner_feat, decoder_cross_attn = decoder_outputs
             else:
-                rec_spatial, inner_feat = self.s1to2decoder(quant, ret_inner_feat=True)
+                decoder_outputs = self.s1to2decoder(
+                    quant,
+                    ret_inner_feat=True,
+                    text_memory_by_layer=text_memory_by_layer,
+                    text_key_padding_mask=decoder_text_key_padding_mask,
+                    text_injection_layers=text_injection_layers,
+                    visual_type_embedding=self.visual_type_embedding,
+                    return_text_recon_stats=return_text_recon_stats,
+                )
+                if return_text_recon_stats:
+                    rec_spatial, inner_feat, decoder_stats = decoder_outputs
+                else:
+                    rec_spatial, inner_feat = decoder_outputs
+                decoder_cross_attn = None
             pixel_dec = self.decoder(rec_spatial)
+            text_recon_stats = self._merge_text_recon_stats(
+                text_stats,
+                decoder_stats if return_text_recon_stats else None,
+            )
             if selected_decoder_layer is not None:
+                if return_text_recon_stats:
+                    return pixel_dec, rec_spatial, inner_feat, decoder_cross_attn, text_recon_stats
                 return pixel_dec, rec_spatial, inner_feat, decoder_cross_attn
+            if return_text_recon_stats:
+                return pixel_dec, rec_spatial, inner_feat, text_recon_stats
             return pixel_dec, rec_spatial, inner_feat
         elif return_feat:
             # specifically for linear probe
@@ -514,17 +638,45 @@ class VQVitModelPlus(nn.Module):
             return None, None, inner_feat
         else:
             if selected_decoder_layer is not None:
-                rec_spatial, decoder_cross_attn = self.s1to2decoder(
+                decoder_outputs = self.s1to2decoder(
                     quant,
                     selected_decoder_layer=selected_decoder_layer,
                     text_memory=text_memory,
+                    text_memory_by_layer=text_memory_by_layer,
                     text_key_padding_mask=decoder_text_key_padding_mask,
+                    text_injection_layers=text_injection_layers,
+                    visual_type_embedding=self.visual_type_embedding,
+                    return_text_recon_stats=return_text_recon_stats,
                 )
+                if return_text_recon_stats:
+                    rec_spatial, decoder_cross_attn, decoder_stats = decoder_outputs
+                else:
+                    rec_spatial, decoder_cross_attn = decoder_outputs
             else:
-                rec_spatial = self.s1to2decoder(quant)
+                decoder_outputs = self.s1to2decoder(
+                    quant,
+                    text_memory_by_layer=text_memory_by_layer,
+                    text_key_padding_mask=decoder_text_key_padding_mask,
+                    text_injection_layers=text_injection_layers,
+                    visual_type_embedding=self.visual_type_embedding,
+                    return_text_recon_stats=return_text_recon_stats,
+                )
+                if return_text_recon_stats:
+                    rec_spatial, decoder_stats = decoder_outputs
+                else:
+                    rec_spatial = decoder_outputs
+                decoder_cross_attn = None
             pixel_dec = self.decoder(rec_spatial)
+            text_recon_stats = self._merge_text_recon_stats(
+                text_stats,
+                decoder_stats if return_text_recon_stats else None,
+            )
             if selected_decoder_layer is not None:
+                if return_text_recon_stats:
+                    return pixel_dec, rec_spatial, decoder_cross_attn, text_recon_stats
                 return pixel_dec, rec_spatial, decoder_cross_attn
+            if return_text_recon_stats:
+                return pixel_dec, rec_spatial, text_recon_stats
             return pixel_dec, rec_spatial
 
     def decode_code(self, code_b, shape=None, channel_first=True):
@@ -545,7 +697,10 @@ class VQVitModelPlus(nn.Module):
             max_steps=None,
             selected_decoder_layer=None,
             decoder_text_features=None,
+            decoder_text_features_by_layer=None,
             decoder_text_key_padding_mask=None,
+            text_injection_layers=None,
+            return_text_recon_stats=False,
             ):
         # Text-HR v2: selected_decoder_layer / decoder_text_features keep the
         # original image-only path unchanged when they are None.
@@ -564,37 +719,89 @@ class VQVitModelPlus(nn.Module):
                 inner_feat = rearrange(spatial, 'b c h w -> b (h w) c')
                 inner_feat = self.distill_mlp(inner_feat)
                 if selected_decoder_layer is not None:
-                    dec, rec_spatial, decoder_cross_attn = self.decode(
+                    decode_outputs = self.decode(
                         quant,
                         selected_decoder_layer=selected_decoder_layer,
                         decoder_text_features=decoder_text_features,
+                        decoder_text_features_by_layer=decoder_text_features_by_layer,
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                        text_injection_layers=text_injection_layers,
+                        return_text_recon_stats=return_text_recon_stats,
                     )
+                    if return_text_recon_stats:
+                        dec, rec_spatial, decoder_cross_attn, text_recon_stats = decode_outputs
+                    else:
+                        dec, rec_spatial, decoder_cross_attn = decode_outputs
                 else:
-                    dec, rec_spatial = self.decode(quant)
+                    decode_outputs = self.decode(
+                        quant,
+                        decoder_text_features_by_layer=decoder_text_features_by_layer,
+                        decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                        text_injection_layers=text_injection_layers,
+                        return_text_recon_stats=return_text_recon_stats,
+                    )
+                    if return_text_recon_stats:
+                        dec, rec_spatial, text_recon_stats = decode_outputs
+                    else:
+                        dec, rec_spatial = decode_outputs
                     decoder_cross_attn = None
             else:
                 if selected_decoder_layer is not None:
-                    dec, rec_spatial, inner_feat, decoder_cross_attn = self.decode(
+                    decode_outputs = self.decode(
                         quant,
                         ret_inner_feat=True,
                         selected_decoder_layer=selected_decoder_layer,
                         decoder_text_features=decoder_text_features,
+                        decoder_text_features_by_layer=decoder_text_features_by_layer,
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                        text_injection_layers=text_injection_layers,
+                        return_text_recon_stats=return_text_recon_stats,
                     )
+                    if return_text_recon_stats:
+                        dec, rec_spatial, inner_feat, decoder_cross_attn, text_recon_stats = decode_outputs
+                    else:
+                        dec, rec_spatial, inner_feat, decoder_cross_attn = decode_outputs
                 else:
-                    dec, rec_spatial, inner_feat = self.decode(quant, ret_inner_feat=True)
+                    decode_outputs = self.decode(
+                        quant,
+                        ret_inner_feat=True,
+                        decoder_text_features_by_layer=decoder_text_features_by_layer,
+                        decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                        text_injection_layers=text_injection_layers,
+                        return_text_recon_stats=return_text_recon_stats,
+                    )
+                    if return_text_recon_stats:
+                        dec, rec_spatial, inner_feat, text_recon_stats = decode_outputs
+                    else:
+                        dec, rec_spatial, inner_feat = decode_outputs
                     decoder_cross_attn = None
         else:
             if selected_decoder_layer is not None:
-                dec, rec_spatial, decoder_cross_attn = self.decode(
+                decode_outputs = self.decode(
                     quant,
                     selected_decoder_layer=selected_decoder_layer,
                     decoder_text_features=decoder_text_features,
+                    decoder_text_features_by_layer=decoder_text_features_by_layer,
                     decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                    text_injection_layers=text_injection_layers,
+                    return_text_recon_stats=return_text_recon_stats,
                 )
+                if return_text_recon_stats:
+                    dec, rec_spatial, decoder_cross_attn, text_recon_stats = decode_outputs
+                else:
+                    dec, rec_spatial, decoder_cross_attn = decode_outputs
             else:
-                dec, rec_spatial = self.decode(quant)
+                decode_outputs = self.decode(
+                    quant,
+                    decoder_text_features_by_layer=decoder_text_features_by_layer,
+                    decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                    text_injection_layers=text_injection_layers,
+                    return_text_recon_stats=return_text_recon_stats,
+                )
+                if return_text_recon_stats:
+                    dec, rec_spatial, text_recon_stats = decode_outputs
+                else:
+                    dec, rec_spatial = decode_outputs
                 decoder_cross_attn = None
 
         if self.training:
@@ -614,14 +821,26 @@ class VQVitModelPlus(nn.Module):
             
             if ret_inner_feat:
                 if selected_decoder_layer is not None:
+                    if return_text_recon_stats:
+                        return [dec, dir_dec], [diff, fea_rec_loss], inner_feat, decoder_cross_attn, text_recon_stats
                     return [dec, dir_dec], [diff, fea_rec_loss], inner_feat, decoder_cross_attn
+                if return_text_recon_stats:
+                    return [dec, dir_dec], [diff, fea_rec_loss], inner_feat, text_recon_stats
                 return [dec, dir_dec], [diff, fea_rec_loss], inner_feat
             if selected_decoder_layer is not None:
+                if return_text_recon_stats:
+                    return [dec, dir_dec], [diff, fea_rec_loss], decoder_cross_attn, text_recon_stats
                 return [dec, dir_dec], [diff, fea_rec_loss], decoder_cross_attn
+            if return_text_recon_stats:
+                return [dec, dir_dec], [diff, fea_rec_loss], text_recon_stats
             return [dec, dir_dec], [diff, fea_rec_loss]
 
         if selected_decoder_layer is not None:
+            if return_text_recon_stats:
+                return dec, diff, decoder_cross_attn, text_recon_stats
             return dec, diff, decoder_cross_attn
+        if return_text_recon_stats:
+            return dec, diff, text_recon_stats
         return dec, diff
 
 

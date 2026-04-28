@@ -1363,6 +1363,74 @@ git diff --name-status upstream/master...HEAD
   - 训练层的重建最好，但 text attention mass 极低，说明 decoder 主要仍走 image/code 路径。
   - 当前 v2 tau HR loss 没有把 image-to-text attention 推成高秩，反而在后期表现为 text attention 奇异值整体变小。
 
+## 2026-04-27 三张单图训练前后 SVD 对比
+
+## 操作
+- 为避免旧 dense 7-token 诊断混入，重新对当前三张图的原始 checkpoint 跑训练前诊断。
+- 只扫 HR 实际训练层 `8-15`：
+  - `dense_pretrain_current_configpairs`
+  - `medium_pretrain_current_configpairs`
+  - `sparse_pretrain_current_configpairs`
+- 训练后对比：
+  - dense: `dense_hr_last_rerun_1719`
+  - medium: `medium_hr_last`
+  - sparse: `sparse_hr_last`
+
+## 8-15 层平均结果
+| image | tokens | phase | text mass | sigma_mean | sigma_max | top1_ratio | effective_rank | tau_loss |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| dense | 82 | pre | 16.56% | 0.02851 | 0.76891 | 0.291 | 24.12 | 0.9772 |
+| dense | 82 | post | 0.39% | 0.000827 | 0.02879 | 0.424 | 16.34 | 0.9992 |
+| medium | 30 | pre | 7.29% | 0.05074 | 0.57955 | 0.356 | 12.26 | 0.9578 |
+| medium | 30 | post | 1.56% | 0.02228 | 0.59517 | 0.527 | 8.31 | 1.0063 |
+| sparse | 26 | pre | 6.64% | 0.04662 | 0.37843 | 0.347 | 10.94 | 0.9534 |
+| sparse | 26 | post | 0.81% | 0.01762 | 0.40678 | 0.562 | 6.30 | 1.0012 |
+
+## 解释
+- 训练后重建 MSE 下降，但 text attention mass 在 HR 训练层显著下降。
+- dense 训练后绝对奇异值整体从约 `0.7689/0.2605/0.1551/...` 降到约 `0.0288/0.0081/0.0025/...`。
+- medium/sparse 的平均 `sigma_max` 没明显下降，是因为 layer 9 训练后出现单一大奇异值：
+  - medium layer 9: `sigma_max=4.42377`, `top1_ratio=0.956`, `effective_rank=1.32`
+  - sparse layer 9: `sigma_max=2.95964`, `top1_ratio=0.962`, `effective_rank=1.25`
+- 这不是高秩变好，而是典型 top1 塌缩。
+- 结论：当前单图训练后，HR 实际训练层没有形成更高秩的 image-to-text attention；模型更倾向降低 text attention mass 或集中到单一奇异方向。
+
+## 2026-04-27 dense 三种师姐 Frobenius HR loss 单图 probe 结果
+
+## 设置
+- 三个 run 都使用当前 dense 单图 `CleanTextSynth:train:2713`，`valid_t5_tokens=82`。
+- 训练 1000 step：
+  - `dense_sigma_mean_1000step`
+  - `dense_gram_identity_1000step`
+  - `dense_log_rank_1000step`
+- 对三个 `last.pt` 用 `diagnose_single_image.py --layer-mode config_pairs` 重扫 decoder layer `8-15`。
+- 同时用新诊断脚本重扫旧 tau run：
+  - `dense_old_tau_last_newmetrics`
+
+## 8-15 层平均结果
+| run | MSE | PSNR | text mass | raw fro norm | participation ratio | effective rank | energy top1 | log PR loss | gram loss |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| pretrain | 0.063203 | 11.99 | 16.56% | 3.520 | 0.125 | 3.51 | 0.678 | -2.219 | 7.53e-05 |
+| old tau | 0.000150 | 38.25 | 0.39% | 0.122 | 0.066 | 1.75 | 0.882 | -1.631 | 1.16e-04 |
+| sigma_mean_mse | 0.000164 | 37.85 | 0.92% | 1.697 | 0.078 | 1.99 | 0.862 | -1.693 | 1.11e-04 |
+| gram_scaled_identity | 0.000152 | 38.18 | 0.51% | 0.217 | 0.200 | 10.49 | 0.229 | -2.759 | 1.81e-05 |
+| log_participation_ratio | 0.000144 | 38.43 | 0.93% | 1.693 | 0.076 | 2.00 | 0.856 | -1.651 | 1.10e-04 |
+
+## 结论
+- 三种新方法都能完成单图重建，PSNR 都在 `37.85-38.43`。
+- `gram_scaled_identity` 是目前唯一明显改善归一化谱形状的方法：
+  - participation ratio: `0.066(old tau) -> 0.200`
+  - effective rank: `1.75(old tau) -> 10.49`
+  - energy top1: `0.882(old tau) -> 0.229`
+  - gram loss: `1.16e-04(old tau) -> 1.81e-05`
+- `sigma_mean_mse` 和 `log_participation_ratio` 虽然重建正常，但 8-15 层平均谱仍偏低秩：
+  - participation ratio 约 `0.076-0.078`
+  - effective rank 约 `2`
+  - energy top1 约 `0.86`
+- 重要问题仍未解决：
+  - 三种方法训练后的 text attention mass 都很低，`gram_scaled_identity` 只有约 `0.51%`，`sigma_mean/log_rank` 约 `0.92-0.93%`。
+  - 因此 `gram_scaled_identity` 可以说改善了 Frobenius-normalized spectrum，但还不能说明模型真正依赖 text；下一步需要跑 medium/sparse 以及 correct/empty/wrong text sensitivity。
+
 ## 2026-04-27 给师姐看的原版 GigaTok 行号说明
 
 ## 背景
@@ -1529,3 +1597,112 @@ git diff --name-status upstream/master...HEAD
   - `text_hr_participation_rank_ratio_mean`
   - `text_hr_energy_top1_mean`
   - `text_hr_fro_norm_mean`
+
+## 2026-04-27 单图三种 Frobenius loss 结果补充
+
+## dense / medium / sparse 结论
+- 三种文字密度的单图 1000 step 都能把重建误差降下来。
+- 在归一化 SVD 谱上，`gram_scaled_identity` 是三种方法里最稳定有效的：
+  - dense：8-15 层平均 effective rank = 10.49，energy top1 = 0.229。
+  - medium：8-15 层平均 effective rank = 9.49，energy top1 = 0.258。
+  - sparse：8-15 层平均 effective rank = 8.97，energy top1 = 0.196。
+- `sigma_mean_mse` 和 `log_participation_ratio` 在 medium / sparse 上基本仍保持低秩：
+  - medium 的 effective rank 约 1.80 / 1.69。
+  - sparse 的 effective rank 约 1.60 / 1.57。
+- `gram_scaled_identity` 仍不是“模型一定依赖 text”的证明；text attention mass 仍偏低：
+  - medium 8-15 层平均约 2.13%。
+  - sparse 8-15 层平均约 2.07%。
+
+## medium 结果
+- `sigma_mean_mse`：训练日志中 HR loss 从 0.0285 到 0.0272，仅小幅下降；诊断 effective rank = 1.80，energy top1 = 0.865。
+- `gram_scaled_identity`：HR loss 从 6.14e-04 到 7.49e-05；诊断 effective rank = 9.49，energy top1 = 0.258。
+- `log_participation_ratio`：loss 最低到 -1.943，但最终 -1.426；诊断 effective rank = 1.69，energy top1 = 0.878。
+- 注意 medium 的 layer 9 仍是异常层，`gram_scaled_identity` 后仍接近 rank-1：
+  - layer 9 top singular values: 0.9998, 0.0194, 0.0043, 0.0025。
+
+## sparse 结果
+- `sigma_mean_mse`：HR loss 从 0.0333 到 0.0326，仅小幅下降；诊断 effective rank = 1.60，energy top1 = 0.889。
+- `gram_scaled_identity`：HR loss 从 7.69e-04 到 1.01e-04；诊断 effective rank = 8.97，energy top1 = 0.196。
+- `log_participation_ratio`：loss 从 -1.050 到 -1.290，但诊断 effective rank = 1.57，energy top1 = 0.886。
+- sparse 的 layer 9 比 medium 好一些但仍是最弱层：
+  - layer 9 top singular values: 0.6847, 0.6399, 0.3489, 0.0061。
+
+## 当前判断
+- 如果目标是三种师姐 loss 里先选一个继续试，结果支持优先用 `gram_scaled_identity`。
+- 如果目标是证明模型真的使用文字，还需要继续做正确文本 / 空文本 / 错误文本的敏感性验证。
+
+## 2026-04-28 Stage-1 Text Reconstruction Conditioning 第一阶段
+
+## 背景
+- 之前的 Text-HR 是弱注入版本：每个 step 只随机选 1 个 decoder layer，把 visual memory 和 text memory concat；同一层 attention 再用于 HR 约束。
+- 这意味着 text 注入层和 HR 计算层绑在一起，decoder 8-15 里只有一层真正看到 text，CNN decoder 本身也没有直接 text 分支。
+- 师姐的新建议是：重建头 / decoder 需要更明确地放入 text 信息，HR loss 只能作为额外约束，不能作为唯一主线。
+
+## 本次实现
+- 新增多层 text reconstruction conditioning：
+  - decoder layer 8-15 全部注入 text；
+  - HR 仍然每 step 只随机选 1 层返回 post-softmax attention；
+  - 当前 HR 使用 `gram_scaled_identity`，即 Frobenius-normalized Gram high-rank orthogonality loss。
+- 保留旧 selected-layer `project_text_memory()` 路径，旧 Text-HR probe config 仍可继续跑。
+- 新增 `project_text_memory_by_layer()`，支持 `{decoder_layer: T5 hidden}` 多层输入。
+- T5 hidden state 显式使用 `hidden_states[1:]`，避免 embedding output 导致 off-by-one。
+- 新增 zero-init `visual_type_embedding`，用于区分 visual memory token。
+- 新增 shared scalar `text_gate`，用 `sigmoid(text_gate_logit)`，默认初始化为 0.1，对应 `logit(0.1)`。
+- 所有注入层都拼接正确的 padding mask；visual mask 长度按当前 visual memory token 数动态生成，不硬编码 256。
+- validation 和 `scripts/stage1/evaluate_textatlas_reconstruction.py` 已同步支持多层 text injection，避免训练和重建图 forward 不一致。
+- `visual_type_embedding` 加在 cross-attention 的 visual memory token 上；decoder query 是 `latent_tokens`，没有加 visual type embedding。
+- matched native 和新方法 config 的 `freeze_post_quant_conv` 均设为 `False`，对齐原生 stage-1 baseline 默认训练边界。
+
+## 新增日志
+- numeric metrics：
+  - `text_recon_enabled`
+  - `text_injection_layer_count`
+  - `text_gate`
+  - `text_memory_norm_before_gate_mean`
+  - `text_memory_norm_after_gate_mean`
+  - `selected_text_memory_norm`
+  - `visual_memory_norm_mean`
+  - `text_visual_norm_ratio`
+  - `empty_text_count`
+  - `text_valid_tokens_mean`
+- console log 保留：
+  - `text_injection_layers`
+  - `text_recon_layer_pairs`
+- 继续保留已有 HR 指标，包括 `text_hr_loss`、`text_hr_gram_loss_mean`、`text_hr_effective_rank_mean`、`text_hr_energy_top1_mean`、`text_hr_participation_rank_ratio_mean`。
+- 新增 selected layer attention mass：
+  - `text_hr_text_attention_mass_mean`
+  - `text_hr_visual_attention_mass_mean`
+  - 用来判断 text 虽然被 concat 进去后，decoder 是否真的 attend 到 text keys。
+
+## 新增配置
+- 新方法：
+  - `configs/vq/VQ_BL256_dino_disc_text_recon_concat_hr_v1.yaml`
+  - 开启 `text_conditioning`、`text_recon_conditioning`、`text_hr`。
+  - 注入层和 HR layer pairs 均为 8-15。
+- matched native：
+  - `configs/vq/VQ_BL256_dino_disc_matched_native_v1.yaml`
+  - 从新方法 config 复制，只关闭：
+    - `text_conditioning.enabled`
+    - `text_recon_conditioning.enabled`
+    - `text_hr.enabled`
+  - 其它模型、loss、freeze strategy 保持一致，便于和新方法严格同参对比。
+
+## 后续计划
+- 第一阶段先跑 matched native vs 多层 text injection + Gram HR。
+- 如果重建有收益，再补 text injection only vs text injection + HR，拆分 text 注入和 HR 的贡献。
+- `scripts/stage1/evaluate_textatlas_reconstruction.py` 新增 `--text-input-mode correct|empty|shuffled` 和 `--wrong-text-seed`，用于 1000-step checkpoint 后固定 16/32 张图做 sensitivity：
+  - correct 明显好于 empty/shuffled：说明 text 真正参与重建；
+  - 三者接近：说明 text concat 进来了但模型基本没用。
+- 后续方法暂不实现，只保留 config 结构；如果误开启会直接报 `NotImplementedError`：
+  - visual memory mask；
+  - rec_spatial_before_cnn residual；
+  - AdaLN。
+
+## 本地检查
+- 已通过 `py_compile`：
+  - `tokenizer/tokenizer_image/vq/vq_vit_model.py`
+  - `tokenizer/tokenizer_image/vq/blocks.py`
+  - `tokenizer/tokenizer_image/vq/vq_train.py`
+  - `tokenizer/tokenizer_image/vq/vq_loss.py`
+  - `scripts/stage1/evaluate_textatlas_reconstruction.py`
+- 已用 Ruby YAML 解析检查两个新增 config 可读。

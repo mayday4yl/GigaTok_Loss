@@ -1408,6 +1408,9 @@ class ViTDecoder_V2(nn.Module):
         N, C, H, W = z_quantized.shape
         # assert H == 1 and W == self.num_latent_tokens, f"{H}, {W}, {self.num_latent_tokens}"
         selected_latent_tokens = W
+        # x is the cross-attention visual memory. The decoder queries are
+        # latent_tokens below, so visual_type_embedding must be applied to x,
+        # not to latent_tokens.
         x = z_quantized.reshape(N, C*H, W).permute(2, 0, 1) # LND
         x = self.decoder_embed(self.ln_pre(x))
 
@@ -1573,13 +1576,19 @@ class ViTDecoder(nn.Module):
             return_feat=False,      # return feature for linear probe
             selected_decoder_layer=None,
             text_memory=None,
+            text_memory_by_layer=None,
             text_key_padding_mask=None,
+            text_injection_layers=None,
+            visual_type_embedding=None,
+            return_text_recon_stats=False,
             ):
         assert selected_decoder_layer is None or not return_feat, \
             "selected_decoder_layer is not supported with return_feat=True"
         N, C, H, W = z_quantized.shape
         # assert H == 1 and W == self.num_latent_tokens, f"{H}, {W}, {self.num_latent_tokens}"
         selected_latent_tokens = W
+        # x is the cross-attention visual memory. The decoder queries are
+        # latent_tokens below, so visual_type_embedding belongs on x only.
         x = z_quantized.reshape(N, C*H, W).permute(2, 0, 1) # LND
         x = self.decoder_embed(self.ln_pre(x))
         # upsample
@@ -1625,6 +1634,7 @@ class ViTDecoder(nn.Module):
         pos_embed = self.latent_token_positional_embedding[:selected_latent_tokens].repeat(1, bs, 1).to(x.dtype)
 
         text_memory_lnd = None
+        text_memory_lnd_by_layer = None
         text_memory_key_padding_mask = None
         if text_memory is not None:
             assert selected_decoder_layer is not None, \
@@ -1639,6 +1649,44 @@ class ViTDecoder(nn.Module):
                 text_memory_key_padding_mask = text_key_padding_mask.to(device=x.device, dtype=torch.bool)
                 assert text_memory_key_padding_mask.shape == text_memory.shape[:2], \
                     f"text_key_padding_mask shape={text_memory_key_padding_mask.shape}, expected={text_memory.shape[:2]}"
+        if text_memory_by_layer is not None:
+            assert text_memory is None, "text_memory and text_memory_by_layer cannot both be set"
+            assert isinstance(text_memory_by_layer, dict), "text_memory_by_layer must be a dict"
+            text_memory_lnd_by_layer = {}
+            for layer_idx, layer_text_memory in text_memory_by_layer.items():
+                layer_idx = int(layer_idx)
+                assert layer_text_memory.dim() == 3, \
+                    f"Invalid text_memory_by_layer[{layer_idx}] shape: {layer_text_memory.shape}"
+                assert layer_text_memory.shape[0] == bs, \
+                    f"text_memory_by_layer[{layer_idx}] batch={layer_text_memory.shape[0]} does not match decoder batch={bs}"
+                assert layer_text_memory.shape[2] == self.width, \
+                    f"text_memory_by_layer[{layer_idx}] width={layer_text_memory.shape[2]} does not match decoder width={self.width}"
+                text_memory_lnd_by_layer[layer_idx] = layer_text_memory.to(
+                    device=x.device, dtype=x.dtype).permute(1, 0, 2)
+            if text_key_padding_mask is not None:
+                text_memory_key_padding_mask = text_key_padding_mask.to(device=x.device, dtype=torch.bool)
+                first_text_memory = next(iter(text_memory_by_layer.values()))
+                assert text_memory_key_padding_mask.shape == first_text_memory.shape[:2], \
+                    f"text_key_padding_mask shape={text_memory_key_padding_mask.shape}, expected={first_text_memory.shape[:2]}"
+        if text_memory_lnd_by_layer is not None:
+            if text_injection_layers is None:
+                text_injection_layer_set = set(text_memory_lnd_by_layer.keys())
+            else:
+                text_injection_layer_set = {int(layer_idx) for layer_idx in text_injection_layers}
+            missing_layers = sorted(layer_idx for layer_idx in text_injection_layer_set
+                                    if layer_idx not in text_memory_lnd_by_layer)
+            if missing_layers:
+                raise ValueError(f"text_memory_by_layer is missing decoder layers: {missing_layers}")
+        else:
+            text_injection_layer_set = set()
+
+        text_recon_stats = {}
+        if (text_memory_lnd is not None or text_memory_lnd_by_layer is not None) and return_text_recon_stats:
+            visual_memory_for_norm = x
+            if visual_type_embedding is not None:
+                visual_memory_for_norm = visual_memory_for_norm + visual_type_embedding.to(
+                    device=x.device, dtype=x.dtype)
+            text_recon_stats["visual_memory_norm_mean"] = visual_memory_for_norm.float().norm(dim=-1).mean()
 
         selected_cross_attn_weights = None
         for i in range(self.num_layers):
@@ -1646,9 +1694,31 @@ class ViTDecoder(nn.Module):
             layer_memory = x
             layer_pos_embed = pos_embed
             layer_memory_key_padding_mask = None
-            if text_memory_lnd is not None and return_cross_attn_weights:
+            inject_text = text_memory_lnd_by_layer is not None and i in text_injection_layer_set
+            if inject_text:
+                layer_visual_memory = x
+                if visual_type_embedding is not None:
+                    layer_visual_memory = layer_visual_memory + visual_type_embedding.to(
+                        device=x.device, dtype=x.dtype)
+                layer_text_memory = text_memory_lnd_by_layer[i]
+                layer_memory = torch.cat([layer_visual_memory, layer_text_memory], dim=0)
+                layer_pos_embed = torch.cat([pos_embed, torch.zeros_like(layer_text_memory)], dim=0)
+                # PyTorch key_padding_mask semantics: False means valid key,
+                # True means masked/padded key. Visual memory tokens are always valid.
+                image_key_padding_mask = torch.zeros(
+                    (bs, selected_latent_tokens), device=x.device, dtype=torch.bool)
+                if text_memory_key_padding_mask is None:
+                    text_padding = torch.zeros(
+                        (bs, layer_text_memory.shape[0]), device=x.device, dtype=torch.bool)
+                else:
+                    text_padding = text_memory_key_padding_mask
+                layer_memory_key_padding_mask = torch.cat(
+                    [image_key_padding_mask, text_padding], dim=1)
+            elif text_memory_lnd is not None and return_cross_attn_weights:
                 layer_memory = torch.cat([x, text_memory_lnd], dim=0)
                 layer_pos_embed = torch.cat([pos_embed, torch.zeros_like(text_memory_lnd)], dim=0)
+                # PyTorch key_padding_mask semantics: False means valid key,
+                # True means masked/padded key. Visual memory tokens are always valid.
                 image_key_padding_mask = torch.zeros(
                     (bs, selected_latent_tokens), device=x.device, dtype=torch.bool)
                 if text_memory_key_padding_mask is None:
@@ -1664,7 +1734,9 @@ class ViTDecoder(nn.Module):
                     memory_key_padding_mask=layer_memory_key_padding_mask,
                     return_cross_attn_weights=True)
             else:
-                latent_tokens = self.transformer[i](latent_tokens, x, pos=pos_embed, query_pos=query_pos)
+                latent_tokens = self.transformer[i](
+                    latent_tokens, layer_memory, pos=layer_pos_embed, query_pos=query_pos,
+                    memory_key_padding_mask=layer_memory_key_padding_mask)
             if self.out_inner_feat and ret_inner_feat and (i + 1) == self.out_inner_depth:
                 inner_feat = self.distill_mlp(latent_tokens)
 
@@ -1689,11 +1761,19 @@ class ViTDecoder(nn.Module):
             # L N D -> N L D
             inner_feat = inner_feat.permute(1, 0, 2)
             if selected_decoder_layer is not None:
+                if return_text_recon_stats:
+                    return latent_tokens, inner_feat, selected_cross_attn_weights, text_recon_stats
                 return latent_tokens, inner_feat, selected_cross_attn_weights
+            if return_text_recon_stats:
+                return latent_tokens, inner_feat, text_recon_stats
             return latent_tokens, inner_feat
         else:
             if selected_decoder_layer is not None:
+                if return_text_recon_stats:
+                    return latent_tokens, selected_cross_attn_weights, text_recon_stats
                 return latent_tokens, selected_cross_attn_weights
+            if return_text_recon_stats:
+                return latent_tokens, text_recon_stats
             return latent_tokens
 
 
