@@ -291,6 +291,8 @@ class VQVitModelPlus(nn.Module):
         self.visual_type_embedding = None
         self.text_gate_logit = None
         self.visual_mask_token = None
+        self.residual_head_mlp = None
+        self.residual_head_gate = None
         
         self.freeze_but_2d_decoder_flag = False
 
@@ -366,7 +368,10 @@ class VQVitModelPlus(nn.Module):
             visual_type_embedding=False,
             text_gate_enabled=False,
             text_gate_init=1.0,
-            visual_memory_mask_enabled=False):
+            visual_memory_mask_enabled=False,
+            text_recon_mode=None,
+            residual_head_gate_init=1e-3,
+            residual_head_mlp_hidden_mult=4.0):
         # Text-HR v2: build the small trainable bridge from frozen T5 hidden states
         # to the GigaTok transformer decoder width.
         decoder_width = self.s1to2decoder.width
@@ -414,6 +419,20 @@ class VQVitModelPlus(nn.Module):
         else:
             self.visual_mask_token = None
 
+        if text_recon_mode == "residual_head":
+            hidden_dim = int(decoder_width * float(residual_head_mlp_hidden_mult))
+            rec_spatial_channels = int(self.s1to2decoder.token_size)
+            self.residual_head_mlp = nn.Sequential(
+                nn.Linear(decoder_width, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, rec_spatial_channels),
+            )
+            self.residual_head_mlp.apply(self._init_weights)
+            self.residual_head_gate = nn.Parameter(torch.tensor(float(residual_head_gate_init)))
+        else:
+            self.residual_head_mlp = None
+            self.residual_head_gate = None
+
     def project_text_memory(self, decoder_text_features):
         # Text-HR v2: decoder_text_features are selected T5 layer features [B, T, d_t5].
         # This projects them to decoder memory tokens [B, T, d_dec].
@@ -428,6 +447,34 @@ class VQVitModelPlus(nn.Module):
                 dtype=text_memory.dtype,
             )
         return text_memory
+
+    def project_text_memory_for_pooling(self, decoder_text_features):
+        # Text reconstruction residual modes use projected T5 features directly:
+        # no modality/type embedding and no concat text gate.
+        if decoder_text_features is None:
+            return None
+        if self.text_projection is None:
+            raise RuntimeError("Text conditioning is enabled, but text_projection is not configured.")
+        return self.text_projection(decoder_text_features)
+
+    @staticmethod
+    def masked_mean_text(text_memory, text_key_padding_mask=None, eps=1e-6):
+        if text_memory.dim() != 3:
+            raise ValueError(f"text_memory must be [B, T, C], got {text_memory.shape}")
+        if text_key_padding_mask is None:
+            return text_memory.mean(dim=1)
+        text_key_padding_mask = text_key_padding_mask.to(
+            device=text_memory.device,
+            dtype=torch.bool,
+        )
+        if text_key_padding_mask.shape != text_memory.shape[:2]:
+            raise ValueError(
+                f"text_key_padding_mask shape={text_key_padding_mask.shape}, "
+                f"expected={text_memory.shape[:2]}"
+            )
+        valid = (~text_key_padding_mask).to(dtype=text_memory.dtype)
+        denom = valid.sum(dim=1).clamp_min(float(eps))
+        return (text_memory * valid.unsqueeze(-1)).sum(dim=1) / denom.unsqueeze(-1)
 
     def _text_gate(self, device, dtype):
         if self.text_gate_logit is None:
@@ -497,6 +544,50 @@ class VQVitModelPlus(nn.Module):
         if text_norm is not None and visual_norm is not None:
             stats["text_visual_norm_ratio"] = text_norm / visual_norm.clamp_min(1e-8)
         return stats
+
+    def apply_residual_head(
+            self,
+            rec_spatial,
+            decoder_head_text_features=None,
+            decoder_text_key_padding_mask=None,
+            return_text_recon_stats=False):
+        if decoder_head_text_features is None:
+            return rec_spatial, {}
+        if self.residual_head_mlp is None or self.residual_head_gate is None:
+            raise RuntimeError("decoder_head_text_features requires text_recon_conditioning.mode=residual_head.")
+
+        expected_channels = int(self.s1to2decoder.token_size)
+        assert rec_spatial.shape[1] == expected_channels, (
+            f"residual_head expected rec_spatial channels={expected_channels}, "
+            f"got rec_spatial.shape={tuple(rec_spatial.shape)}"
+        )
+
+        text_memory = self.project_text_memory_for_pooling(decoder_head_text_features)
+        pooled_text = self.masked_mean_text(text_memory, decoder_text_key_padding_mask)
+        text_vec = self.residual_head_mlp(pooled_text)
+        text_spatial = text_vec[:, :, None, None]
+        assert text_spatial.shape[1] == rec_spatial.shape[1], (
+            f"residual_head text_spatial channels={text_spatial.shape[1]} do not match "
+            f"rec_spatial channels={rec_spatial.shape[1]}"
+        )
+
+        text_spatial = text_spatial.to(device=rec_spatial.device, dtype=rec_spatial.dtype)
+        gate = self.residual_head_gate.to(device=rec_spatial.device, dtype=rec_spatial.dtype)
+        rec_spatial = rec_spatial + gate * text_spatial.expand_as(rec_spatial)
+
+        if not return_text_recon_stats:
+            return rec_spatial, {}
+
+        stats = {
+            "residual_head_gate": gate.float(),
+            "residual_head_norm_mean": text_spatial.float().flatten(1).norm(dim=1).mean(),
+            "residual_head_rec_spatial_channels": rec_spatial.new_tensor(float(rec_spatial.shape[1])),
+            "residual_head_rec_spatial_height": rec_spatial.new_tensor(float(rec_spatial.shape[2])),
+            "residual_head_rec_spatial_width": rec_spatial.new_tensor(float(rec_spatial.shape[3])),
+            "residual_head_text_spatial_channels": rec_spatial.new_tensor(float(text_spatial.shape[1])),
+            "residual_head_token_size": rec_spatial.new_tensor(float(expected_channels)),
+        }
+        return rec_spatial, stats
     
     def _init_weights(self, module):
         """ Initialize the weights.
@@ -580,6 +671,7 @@ class VQVitModelPlus(nn.Module):
             selected_decoder_layer=None,
             decoder_text_features=None,
             decoder_text_features_by_layer=None,
+            decoder_head_text_features=None,
             decoder_text_key_padding_mask=None,
             text_injection_layers=None,
             visual_memory_mask_enabled=False,
@@ -634,11 +726,19 @@ class VQVitModelPlus(nn.Module):
                 else:
                     rec_spatial, inner_feat = decoder_outputs
                 decoder_cross_attn = None
+            rec_spatial, residual_head_stats = self.apply_residual_head(
+                rec_spatial,
+                decoder_head_text_features=decoder_head_text_features,
+                decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                return_text_recon_stats=return_text_recon_stats,
+            )
             pixel_dec = self.decoder(rec_spatial)
             text_recon_stats = self._merge_text_recon_stats(
                 text_stats,
                 decoder_stats if return_text_recon_stats else None,
             )
+            if residual_head_stats:
+                text_recon_stats.update(residual_head_stats)
             if selected_decoder_layer is not None:
                 if return_text_recon_stats:
                     return pixel_dec, rec_spatial, inner_feat, decoder_cross_attn, text_recon_stats
@@ -687,11 +787,19 @@ class VQVitModelPlus(nn.Module):
                 else:
                     rec_spatial = decoder_outputs
                 decoder_cross_attn = None
+            rec_spatial, residual_head_stats = self.apply_residual_head(
+                rec_spatial,
+                decoder_head_text_features=decoder_head_text_features,
+                decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                return_text_recon_stats=return_text_recon_stats,
+            )
             pixel_dec = self.decoder(rec_spatial)
             text_recon_stats = self._merge_text_recon_stats(
                 text_stats,
                 decoder_stats if return_text_recon_stats else None,
             )
+            if residual_head_stats:
+                text_recon_stats.update(residual_head_stats)
             if selected_decoder_layer is not None:
                 if return_text_recon_stats:
                     return pixel_dec, rec_spatial, decoder_cross_attn, text_recon_stats
@@ -719,6 +827,7 @@ class VQVitModelPlus(nn.Module):
             selected_decoder_layer=None,
             decoder_text_features=None,
             decoder_text_features_by_layer=None,
+            decoder_head_text_features=None,
             decoder_text_key_padding_mask=None,
             text_injection_layers=None,
             visual_memory_mask_enabled=False,
@@ -747,6 +856,7 @@ class VQVitModelPlus(nn.Module):
                         selected_decoder_layer=selected_decoder_layer,
                         decoder_text_features=decoder_text_features,
                         decoder_text_features_by_layer=decoder_text_features_by_layer,
+                        decoder_head_text_features=decoder_head_text_features,
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                         text_injection_layers=text_injection_layers,
                         visual_memory_mask_enabled=visual_memory_mask_enabled,
@@ -761,6 +871,7 @@ class VQVitModelPlus(nn.Module):
                     decode_outputs = self.decode(
                         quant,
                         decoder_text_features_by_layer=decoder_text_features_by_layer,
+                        decoder_head_text_features=decoder_head_text_features,
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                         text_injection_layers=text_injection_layers,
                         visual_memory_mask_enabled=visual_memory_mask_enabled,
@@ -780,6 +891,7 @@ class VQVitModelPlus(nn.Module):
                         selected_decoder_layer=selected_decoder_layer,
                         decoder_text_features=decoder_text_features,
                         decoder_text_features_by_layer=decoder_text_features_by_layer,
+                        decoder_head_text_features=decoder_head_text_features,
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                         text_injection_layers=text_injection_layers,
                         visual_memory_mask_enabled=visual_memory_mask_enabled,
@@ -795,6 +907,7 @@ class VQVitModelPlus(nn.Module):
                         quant,
                         ret_inner_feat=True,
                         decoder_text_features_by_layer=decoder_text_features_by_layer,
+                        decoder_head_text_features=decoder_head_text_features,
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                         text_injection_layers=text_injection_layers,
                         visual_memory_mask_enabled=visual_memory_mask_enabled,
@@ -813,6 +926,7 @@ class VQVitModelPlus(nn.Module):
                     selected_decoder_layer=selected_decoder_layer,
                     decoder_text_features=decoder_text_features,
                     decoder_text_features_by_layer=decoder_text_features_by_layer,
+                    decoder_head_text_features=decoder_head_text_features,
                     decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                     text_injection_layers=text_injection_layers,
                     visual_memory_mask_enabled=visual_memory_mask_enabled,
@@ -827,6 +941,7 @@ class VQVitModelPlus(nn.Module):
                 decode_outputs = self.decode(
                     quant,
                     decoder_text_features_by_layer=decoder_text_features_by_layer,
+                    decoder_head_text_features=decoder_head_text_features,
                     decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                     text_injection_layers=text_injection_layers,
                     visual_memory_mask_enabled=visual_memory_mask_enabled,

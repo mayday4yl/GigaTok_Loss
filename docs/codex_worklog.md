@@ -1758,6 +1758,81 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - `text_hr_svd_mode=gram_scaled_identity`
 - `text_hr_loss`
 
+## 2026-04-28 当前阶段收尾检查
+
+## 已完成方法
+- 方法 1：`concat_memory`
+  - decoder 8-15 多层 text injection。
+  - visual/text type embedding。
+  - shared scalar text gate。
+  - 支持 selected-layer `gram_scaled_identity` HR。
+- 方法 2：`concat_memory_visual_mask`
+  - 在 `concat_memory` 基础上，仅训练时随机 mask 一小部分 cross-attention visual memory。
+  - 使用 learnable `visual_mask_token`。
+  - 每个 forward 采样一次 mask，8-15 注入层复用。
+  - validation / eval / reconstruction grid 关闭 mask。
+  - padding mask 不变，被 mask visual token 仍是 valid key。
+  - 支持 selected-layer `gram_scaled_identity` HR。
+
+## 当前代码边界
+- `text_recon_conditioning.mode` 当前只允许：
+  - `concat_memory`
+  - `concat_memory_visual_mask`
+- `matched_native` 关闭：
+  - `text_conditioning`
+  - `text_recon_conditioning`
+  - `text_hr`
+- 旧 selected-layer Text-HR config 不走 `text_recon_conditioning`，仍保留兼容。
+- `visual_memory_mask.enabled` 和 mode 有强校验：
+  - `concat_memory` 必须关闭 mask。
+  - `concat_memory_visual_mask` 必须开启 mask。
+- checkpoint missing-key 白名单只包含当前实现需要的新参数：
+  - `text_projection.*`
+  - `text_type_embedding`
+  - `visual_type_embedding`
+  - `text_gate_logit`
+  - `visual_mask_token`
+
+## 当前 config
+- matched native：
+  - `configs/vq/VQ_BL256_dino_disc_matched_native_v1.yaml`
+- concat memory + HR：
+  - `configs/vq/VQ_BL256_dino_disc_text_recon_concat_hr_v1.yaml`
+- concat memory visual mask + HR：
+  - `configs/vq/VQ_BL256_dino_disc_text_recon_concat_mask_hr_v1.yaml`
+
+## 实验记录状态
+- 代码中已支持记录：
+  - `text_hr_loss`
+  - `text_hr_gram_loss_mean`
+  - `text_hr_effective_rank_mean`
+  - `text_hr_energy_top1_mean`
+  - `text_hr_text_attention_mass_mean`
+  - `text_hr_visual_attention_mass_mean`
+  - `visual_memory_mask_ratio`
+  - `visual_memory_mask_actual_ratio`
+- 具体 1000-step 数值和 reconstruction grid 结论需要从服务器日志与输出图补录；本地仓库当前没有这些日志文件。
+
+## 下一阶段计划
+后续再实现剩余 text reconstruction conditioning 方法，本阶段不实现：
+- `concat_head`
+  - 在重建头前显式融合 visual feature 和 text feature。
+- `residual_head`
+  - 在 `rec_spatial_before_cnn` 位置加入 gated text residual。
+- `residual_pooled_layer`
+  - 用 pooled text feature 经 adapter 注入中间层或重建前特征。
+- `residual_cross_attn`
+  - 用 text feature 通过 cross-attention residual 注入 decoder hidden。
+- `adaln`
+  - pooled text -> MLP -> gamma/beta，调制 LayerNorm。
+
+下一阶段开始前需要先固定对比表：
+- matched native。
+- `concat_memory + HR`。
+- `concat_memory_visual_mask + HR`。
+- reconstruction grid。
+- correct / empty / shuffled text sensitivity。
+
 ## 2026-04-28 论文调研：Glyph-ByT5 与 LongTextAR baseline
 
 ## 调研对象
@@ -1779,3 +1854,97 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - Stage-1 先跑现有两组：`VQ_BL256_dino_disc_matched_native_v1.yaml` vs `VQ_BL256_dino_disc_text_recon_concat_hr_v1.yaml`。
 - 若 text sensitivity 显示 correct 明显优于 empty/shuffled，再做 Glyph-ByT5 text encoder 对照；否则先修 text injection/attention 使用率，不急于换 encoder。
 - 对外汇报时可把 LongTextAR 作为“强 text-focused tokenizer/AR baseline”，但代码实现层面只借鉴其 tokenizer bottleneck 论证和重建评估口径，不在当前第一轮改 GigaTok tokenizer 架构。
+
+## 2026-04-29 Commit 1：residual_head 文本重建模式
+
+## 实现范围
+- 只实现剩余三种方法中的第一个 mode：`text_recon_conditioning.mode=residual_head`。
+- `residual_head` 默认不接 HR，配置要求 `text_hr.enabled=False`。
+- `residual_head` 要求 `visual_memory_mask.enabled=False`。
+- 旧 selected-layer Text-HR、`concat_memory`、`concat_memory_visual_mask`、matched native 路径保持不变。
+
+## 方法细节
+- 新增公共 helper：`masked_mean_text(text_memory, text_key_padding_mask, eps=1e-6)`。
+  - `text_key_padding_mask=True` 表示 padding。
+  - 只平均 valid text token；全 padding 时 denominator clamp，避免除 0。
+- `residual_head` 的 text 路径固定为：
+  - `T5 hidden -> text_projection -> masked_mean_text -> residual_head_mlp`
+  - 不加 `text_type_embedding`。
+  - 不乘 concat 路径的 `text_gate`。
+- 注入位置在 `VQVitModelPlus.decode()` 内：
+  - `rec_spatial = self.s1to2decoder(...)`
+  - `rec_spatial = rec_spatial + residual_head_gate * text_spatial`
+  - `pixel_dec = self.decoder(rec_spatial)`
+- channel 来源：
+  - `C = self.s1to2decoder.token_size`
+  - forward assert `rec_spatial.shape[1] == self.s1to2decoder.token_size`
+  - forward assert `text_spatial.shape[1] == rec_spatial.shape[1]`
+  - assert 失败时不 reshape 硬凑，应检查 `rec_spatial` channel 来源。
+
+## 新增配置
+- `configs/vq/VQ_BL256_dino_disc_text_recon_residual_head_v1.yaml`
+  - `text_conditioning.enabled=True`
+  - `text_conditioning.text_type_embedding=False`
+  - `text_recon_conditioning.mode=residual_head`
+  - `text_recon_conditioning.head_text_layer=15`
+  - `text_recon_conditioning.visual_memory_mask.enabled=False`
+  - `text_hr.enabled=False`
+
+## 本地检查
+- `python3 -m py_compile tokenizer/tokenizer_image/vq/vq_vit_model.py tokenizer/tokenizer_image/vq/blocks.py tokenizer/tokenizer_image/vq/vq_train.py tokenizer/tokenizer_image/vq/vq_loss.py scripts/stage1/evaluate_textatlas_reconstruction.py`：通过。
+- YAML parse：本机没有 PyYAML，使用 Ruby `YAML.load_file` 读取 `VQ_BL256_dino_disc_text_recon_residual_head_v1.yaml`，通过。
+- eval forward smoke：本机 Python 环境没有 `torch`，未能在本机执行；需要在 ModelArts/PyTorch 环境跑。
+- checkpoint load smoke：本机 Python 环境没有 `torch`，未能在本机执行；需要在 ModelArts/PyTorch 环境跑。
+- 全仓 `git diff --check` 当前会被既有无关文件 `docs/original_gigatok_line_review.md` 的 EOF 空行阻断；本 commit 相关文件需单独检查。
+
+## 服务器待跑命令
+```bash
+cd /home/ma-user/work/GigaTok_hr/GigaTok_Loss
+git pull --ff-only origin codex/text-hr-decoder
+
+SAVE_ROOT=/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_recon_residual_head_v1
+TRAIN_MANIFEST=/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/manifest/train_materialized_manifest_v2text.jsonl
+VAL_MANIFEST=/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/textatlas_stage1_fixed_310k/manifest/val_materialized_manifest_v2text.jsonl
+CKPT=/home/ma-user/work/GigaTok_hr/gigatok_persist/checkpoints/VQ_BL256_dino_disc.pt
+LOCAL_T5=/home/ma-user/work/GigaTok_hr/gigatok_persist/models/google_t5-v1_1-xl
+mkdir -p "$SAVE_ROOT/logs"
+
+python - <<'PY'
+import yaml
+src = "configs/vq/VQ_BL256_dino_disc_text_recon_residual_head_v1.yaml"
+dst = "configs/vq/_local_text_recon_residual_head_v1.yaml"
+local_t5 = "/home/ma-user/work/GigaTok_hr/gigatok_persist/models/google_t5-v1_1-xl"
+with open(src) as f:
+    cfg = yaml.safe_load(f)
+cfg["text_conditioning"]["encoder_name"] = local_t5
+cfg["text_conditioning"]["local_files_only"] = True
+with open(dst, "w") as f:
+    yaml.safe_dump(cfg, f, sort_keys=False)
+print("wrote", dst, "mode=", cfg["text_recon_conditioning"]["mode"])
+PY
+
+ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 \
+  tokenizer/tokenizer_image/vq/vq_train.py \
+  --model-config configs/vq/_local_text_recon_residual_head_v1.yaml \
+  --data-path "$TRAIN_MANIFEST" \
+  --json-path "$TRAIN_MANIFEST" \
+  --val-json-path "$VAL_MANIFEST" \
+  --save-path "$SAVE_ROOT" \
+  --vq-ckpt "$CKPT" \
+  --dataset textatlas_image_text \
+  --device-backend npu \
+  --finetune \
+  --global-batch-size 24 \
+  --gradient-accumulation-steps 1 \
+  --max-images 300000 \
+  --iterations 2 \
+  --num-workers 4 \
+  --val-every 1 \
+  --val-max-images 32 \
+  --eval-batch-size 8 \
+  --log-every 1 \
+  --ckpt-every 999999 \
+  --save-last \
+  --sub-exp-dir residual_head_smoke_2step \
+  --no-wandb 2>&1 | tee "$SAVE_ROOT/logs/residual_head_smoke_2step.log"
+```

@@ -43,7 +43,9 @@ TEXT_CONDITIONING_MISSING_NAMES = {
     "visual_type_embedding",
     "text_gate_logit",
     "visual_mask_token",
+    "residual_head_gate",
 }
+TEXT_CONDITIONING_MISSING_PREFIXES = TEXT_CONDITIONING_MISSING_PREFIXES + ("residual_head_mlp.",)
 
 
 def parse_run(value: str) -> RunSpec:
@@ -297,23 +299,29 @@ def validate_text_recon_config(config: Mapping[str, Any]) -> None:
     mode = str(text_recon_cfg.get("mode", "concat_memory"))
     visual_memory_mask_cfg = text_recon_cfg.get("visual_memory_mask", {})
     visual_memory_mask_enabled = bool(visual_memory_mask_cfg.get("enabled", False))
-    if mode not in {"concat_memory", "concat_memory_visual_mask"}:
+    if mode not in {"concat_memory", "concat_memory_visual_mask", "residual_head"}:
         raise NotImplementedError(
-            "Only text_recon_conditioning.mode=concat_memory or concat_memory_visual_mask is implemented."
+            "Only text_recon_conditioning.mode=concat_memory, concat_memory_visual_mask, "
+            "or residual_head is implemented in the current commit."
         )
-    if mode == "concat_memory" and visual_memory_mask_enabled:
-        raise ValueError("text_recon_conditioning.visual_memory_mask.enabled must be false for mode=concat_memory.")
+    if mode != "concat_memory_visual_mask" and visual_memory_mask_enabled:
+        raise ValueError(
+            "text_recon_conditioning.visual_memory_mask.enabled must be false unless "
+            "mode=concat_memory_visual_mask."
+        )
     if mode == "concat_memory_visual_mask" and not visual_memory_mask_enabled:
         raise ValueError(
             "text_recon_conditioning.visual_memory_mask.enabled must be true for mode=concat_memory_visual_mask."
         )
+    if mode == "residual_head" and bool(config.get("text_hr", {}).get("enabled", False)):
+        raise ValueError("text_recon_conditioning.mode=residual_head requires text_hr.enabled=false.")
     if visual_memory_mask_enabled:
         if str(visual_memory_mask_cfg.get("mode", "learned_mask_token")) != "learned_mask_token":
             raise NotImplementedError("Only visual_memory_mask.mode=learned_mask_token is implemented.")
         ratio = float(visual_memory_mask_cfg.get("ratio", 0.0))
         if ratio < 0.0 or ratio >= 1.0:
             raise ValueError(f"text_recon_conditioning.visual_memory_mask.ratio must be in [0, 1), got {ratio}")
-    if not text_recon_cfg.get("layers", None) and not text_recon_cfg.get("layer_pairs", None):
+    if mode != "residual_head" and not text_recon_cfg.get("layers", None) and not text_recon_cfg.get("layer_pairs", None):
         raise ValueError("text_recon_conditioning.enabled=True requires non-empty layers or layer_pairs.")
     for block_name in ("residual", "adaln"):
         block_cfg = text_recon_cfg.get(block_name, {})
@@ -329,6 +337,8 @@ class TextContext:
             layer_pairs: Sequence[Tuple[int, int]],
             text_recon_layer_pairs: Optional[Sequence[Tuple[int, int]]],
             text_injection_layers: Optional[Sequence[int]],
+            text_recon_mode: Optional[str],
+            head_text_layer: Optional[int],
             max_length: int,
             pair_index: int,
     ) -> None:
@@ -337,6 +347,8 @@ class TextContext:
         self.layer_pairs = list(layer_pairs)
         self.text_recon_layer_pairs = list(text_recon_layer_pairs or [])
         self.text_injection_layers = list(text_injection_layers or [])
+        self.text_recon_mode = text_recon_mode
+        self.head_text_layer = head_text_layer
         self.max_length = max_length
         if pair_index < 0 or pair_index >= len(self.layer_pairs):
             raise ValueError(f"--text-layer-pair-index={pair_index} out of range for {len(self.layer_pairs)} pairs")
@@ -364,14 +376,19 @@ def load_tokenizer_model(
         text_recon_on = bool(text_recon_cfg.get("enabled", False))
         text_recon_mode = str(text_recon_cfg.get("mode", "concat_memory"))
         text_gate_cfg = text_recon_cfg.get("text_gate", {}) if text_recon_on else {}
+        residual_head_cfg = text_recon_cfg.get("residual_head", {}) if text_recon_on else {}
+        concat_memory_mode = text_recon_mode in {"concat_memory", "concat_memory_visual_mask"}
         model.configure_text_conditioning(
             text_feature_dim=text_feature_dim,
             text_projection=config.get("text_conditioning", {}).get("text_projection", "linear_layernorm"),
             text_type_embedding=config.get("text_conditioning", {}).get("text_type_embedding", True),
-            visual_type_embedding=text_recon_on and bool(text_recon_cfg.get("visual_type_embedding", False)),
-            text_gate_enabled=text_recon_on and bool(text_gate_cfg.get("enabled", False)),
+            visual_type_embedding=text_recon_on and concat_memory_mode and bool(text_recon_cfg.get("visual_type_embedding", False)),
+            text_gate_enabled=text_recon_on and concat_memory_mode and bool(text_gate_cfg.get("enabled", False)),
             text_gate_init=float(text_gate_cfg.get("init", 0.1)),
             visual_memory_mask_enabled=text_recon_on and text_recon_mode == "concat_memory_visual_mask",
+            text_recon_mode=text_recon_mode if text_recon_on else None,
+            residual_head_gate_init=float(residual_head_cfg.get("gate_init", 1e-3)),
+            residual_head_mlp_hidden_mult=float(residual_head_cfg.get("mlp_hidden_mult", 4.0)),
         )
 
     checkpoint = torch.load(ckpt_path, map_location="cpu")
@@ -394,15 +411,29 @@ def load_tokenizer_model(
         layer_pairs = build_text_layer_pairs(config, decoder_num_layers, text_num_layers)
         text_recon_layer_pairs = None
         text_injection_layers = None
+        text_recon_mode = None
+        head_text_layer = None
         if bool(config.get("text_recon_conditioning", {}).get("enabled", False)):
-            text_recon_layer_pairs = build_text_recon_layer_pairs(config, decoder_num_layers, text_num_layers)
-            text_injection_layers = [decoder_layer for _, decoder_layer in text_recon_layer_pairs]
+            text_recon_cfg = config.get("text_recon_conditioning", {})
+            text_recon_mode = str(text_recon_cfg.get("mode", "concat_memory"))
+            if text_recon_mode == "residual_head":
+                head_text_layer = int(text_recon_cfg.get("head_text_layer", 15))
+                if text_num_layers is not None and (head_text_layer < 0 or head_text_layer >= text_num_layers):
+                    raise ValueError(
+                        f"text_recon_conditioning.head_text_layer={head_text_layer} is out of range "
+                        f"for T5 num_layers={text_num_layers}"
+                    )
+            else:
+                text_recon_layer_pairs = build_text_recon_layer_pairs(config, decoder_num_layers, text_num_layers)
+                text_injection_layers = [decoder_layer for _, decoder_layer in text_recon_layer_pairs]
         text_context = TextContext(
             tokenizer=tokenizer,
             encoder=text_encoder,
             layer_pairs=layer_pairs,
             text_recon_layer_pairs=text_recon_layer_pairs,
             text_injection_layers=text_injection_layers,
+            text_recon_mode=text_recon_mode,
+            head_text_layer=head_text_layer,
             max_length=int(config.get("text_conditioning", {}).get("max_length", 128)),
             pair_index=text_layer_pair_index,
         )
@@ -450,8 +481,18 @@ def reconstruct_batch(
         decoder_text_key_padding_mask = ~text_attention_mask.bool()
         decoder_text_features = None
         decoder_text_features_by_layer = None
+        decoder_head_text_features = None
         call_selected_decoder_layer = selected_decoder_layer
-        if text_context.text_recon_layer_pairs:
+        if text_context.text_recon_mode == "residual_head":
+            head_text_layer = int(text_context.head_text_layer)
+            if head_text_layer >= len(t5_layer_states):
+                raise ValueError(
+                    f"head_text_layer={head_text_layer} is out of range for "
+                    f"T5 layer outputs={len(t5_layer_states)}"
+                )
+            decoder_head_text_features = t5_layer_states[head_text_layer].detach()
+            call_selected_decoder_layer = None
+        elif text_context.text_recon_layer_pairs:
             decoder_text_features_by_layer = {}
             for text_layer, decoder_layer in text_context.text_recon_layer_pairs:
                 if text_layer >= len(t5_layer_states):
@@ -473,6 +514,7 @@ def reconstruct_batch(
                 selected_decoder_layer=call_selected_decoder_layer,
                 decoder_text_features=decoder_text_features,
                 decoder_text_features_by_layer=decoder_text_features_by_layer,
+                decoder_head_text_features=decoder_head_text_features,
                 decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                 text_injection_layers=text_context.text_injection_layers or None,
             )
