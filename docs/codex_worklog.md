@@ -1923,3 +1923,40 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 ## 下一步
 - Commit 1 已完成并通过服务器 checkpoint load smoke / 2-step smoke。
 - 下一 commit 才开始 `residual_pooled_layer`，不要把 AdaLN 或 residual_pooled_layer 混入当前 commit。
+
+## 2026-04-29 Commit 2：residual_pooled_layer 文本重建模式
+
+## 实现范围
+- 只实现剩余方法中的第二个 mode：`text_recon_conditioning.mode=residual_pooled_layer`。
+- 不实现 AdaLN。
+- `residual_pooled_layer` 默认不接 HR，配置要求 `text_hr.enabled=False`。
+- `residual_pooled_layer` 要求 `visual_memory_mask.enabled=False`。
+- 旧 selected-layer Text-HR、matched native、`concat_memory`、`concat_memory_visual_mask`、`residual_head` 路径保持兼容。
+
+## 方法细节
+- 每层使用 `text_recon_conditioning.layer_pairs` 对应的 T5 layer：
+  - `T5 hidden -> text_projection -> masked_mean_text -> residual_text_mlp -> residual_i`
+  - 不加 `text_type_embedding`。
+  - 不乘 concat 路径的 `text_gate`。
+- `residual_text_mlp` 为共享 adapter。
+- `residual_gate` 为共享 scalar，初始化 `1e-3`。
+- 注入位置在 `ViTDecoder_V2.forward()` 内 decoder layer block 后：
+  - 当前 latent layout 为 `[L,B,C]`。
+  - residual 从 `[B,C]` 变为 `[1,B,C]` broadcast。
+  - forward assert residual batch 维等于 `latent_tokens.shape[1]`。
+
+## 新增配置
+- `configs/vq/VQ_BL256_dino_disc_text_recon_residual_pooled_layer_v1.yaml`
+  - `text_conditioning.enabled=True`
+  - `text_conditioning.text_type_embedding=False`
+  - `text_recon_conditioning.mode=residual_pooled_layer`
+  - `text_recon_conditioning.layers=[8,9,10,11,12,13,14,15]`
+  - `text_recon_conditioning.layer_pairs=[[8,8],...,[15,15]]`
+  - `text_recon_conditioning.visual_memory_mask.enabled=False`
+  - `text_recon_conditioning.residual_pooled_layer.gate_init=1e-3`
+  - `text_hr.enabled=False`
+
+## 本地检查
+- `python3 -m py_compile tokenizer/tokenizer_image/vq/vq_vit_model.py tokenizer/tokenizer_image/vq/blocks.py tokenizer/tokenizer_image/vq/vq_train.py tokenizer/tokenizer_image/vq/vq_loss.py scripts/stage1/evaluate_textatlas_reconstruction.py`：通过。
+- YAML parse：使用 Ruby `YAML.load_file` 读取 `VQ_BL256_dino_disc_text_recon_residual_pooled_layer_v1.yaml`，通过，mode=`residual_pooled_layer`，layers=`[8,9,10,11,12,13,14,15]`。
+- 本机 Python 环境没有 `torch`，eval forward smoke / checkpoint load smoke 需要在 ModelArts/PyTorch 环境跑。

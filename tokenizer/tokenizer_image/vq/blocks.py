@@ -1583,6 +1583,8 @@ class ViTDecoder(nn.Module):
             visual_mask_token=None,
             visual_memory_mask_enabled=False,
             visual_memory_mask_ratio=0.0,
+            residual_text_by_layer=None,
+            residual_gate=None,
             return_text_recon_stats=False,
             ):
         assert selected_decoder_layer is None or not return_feat, \
@@ -1683,6 +1685,24 @@ class ViTDecoder(nn.Module):
         else:
             text_injection_layer_set = set()
 
+        residual_lnd_by_layer = None
+        if residual_text_by_layer is not None:
+            if residual_gate is None:
+                raise RuntimeError("residual_gate is required when residual_text_by_layer is set.")
+            if not isinstance(residual_text_by_layer, dict):
+                raise TypeError("residual_text_by_layer must be a dict")
+            residual_lnd_by_layer = {}
+            for layer_idx, residual_text in residual_text_by_layer.items():
+                layer_idx = int(layer_idx)
+                assert residual_text.dim() == 2, \
+                    f"Invalid residual_text_by_layer[{layer_idx}] shape: {residual_text.shape}"
+                assert residual_text.shape[0] == bs, \
+                    f"residual_text_by_layer[{layer_idx}] batch={residual_text.shape[0]} does not match decoder batch={bs}"
+                assert residual_text.shape[1] == self.width, \
+                    f"residual_text_by_layer[{layer_idx}] width={residual_text.shape[1]} does not match decoder width={self.width}"
+                residual_lnd_by_layer[layer_idx] = residual_text.to(
+                    device=x.device, dtype=x.dtype).unsqueeze(0)
+
         visual_memory_mask_actual_ratio = x.new_zeros(())
         visual_memory_mask = None
         if visual_memory_mask_enabled:
@@ -1763,6 +1783,14 @@ class ViTDecoder(nn.Module):
                 latent_tokens = self.transformer[i](
                     latent_tokens, layer_memory, pos=layer_pos_embed, query_pos=query_pos,
                     memory_key_padding_mask=layer_memory_key_padding_mask)
+            if residual_lnd_by_layer is not None and i in residual_lnd_by_layer:
+                residual = residual_lnd_by_layer[i]
+                assert residual.shape[1] == latent_tokens.shape[1], (
+                    f"residual pooled batch={residual.shape[1]} does not match "
+                    f"latent_tokens batch={latent_tokens.shape[1]}"
+                )
+                gate = residual_gate.to(device=latent_tokens.device, dtype=latent_tokens.dtype)
+                latent_tokens = latent_tokens + gate * residual
             if self.out_inner_feat and ret_inner_feat and (i + 1) == self.out_inner_depth:
                 inner_feat = self.distill_mlp(latent_tokens)
 

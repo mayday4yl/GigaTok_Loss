@@ -44,8 +44,12 @@ TEXT_CONDITIONING_MISSING_NAMES = {
     "text_gate_logit",
     "visual_mask_token",
     "residual_head_gate",
+    "residual_gate",
 }
-TEXT_CONDITIONING_MISSING_PREFIXES = TEXT_CONDITIONING_MISSING_PREFIXES + ("residual_head_mlp.",)
+TEXT_CONDITIONING_MISSING_PREFIXES = TEXT_CONDITIONING_MISSING_PREFIXES + (
+    "residual_head_mlp.",
+    "residual_text_mlp.",
+)
 
 
 def parse_run(value: str) -> RunSpec:
@@ -299,10 +303,10 @@ def validate_text_recon_config(config: Mapping[str, Any]) -> None:
     mode = str(text_recon_cfg.get("mode", "concat_memory"))
     visual_memory_mask_cfg = text_recon_cfg.get("visual_memory_mask", {})
     visual_memory_mask_enabled = bool(visual_memory_mask_cfg.get("enabled", False))
-    if mode not in {"concat_memory", "concat_memory_visual_mask", "residual_head"}:
+    if mode not in {"concat_memory", "concat_memory_visual_mask", "residual_head", "residual_pooled_layer"}:
         raise NotImplementedError(
             "Only text_recon_conditioning.mode=concat_memory, concat_memory_visual_mask, "
-            "or residual_head is implemented in the current commit."
+            "residual_head, or residual_pooled_layer is implemented in the current commit."
         )
     if mode != "concat_memory_visual_mask" and visual_memory_mask_enabled:
         raise ValueError(
@@ -313,8 +317,8 @@ def validate_text_recon_config(config: Mapping[str, Any]) -> None:
         raise ValueError(
             "text_recon_conditioning.visual_memory_mask.enabled must be true for mode=concat_memory_visual_mask."
         )
-    if mode == "residual_head" and bool(config.get("text_hr", {}).get("enabled", False)):
-        raise ValueError("text_recon_conditioning.mode=residual_head requires text_hr.enabled=false.")
+    if mode in {"residual_head", "residual_pooled_layer"} and bool(config.get("text_hr", {}).get("enabled", False)):
+        raise ValueError(f"text_recon_conditioning.mode={mode} requires text_hr.enabled=false.")
     if visual_memory_mask_enabled:
         if str(visual_memory_mask_cfg.get("mode", "learned_mask_token")) != "learned_mask_token":
             raise NotImplementedError("Only visual_memory_mask.mode=learned_mask_token is implemented.")
@@ -377,6 +381,7 @@ def load_tokenizer_model(
         text_recon_mode = str(text_recon_cfg.get("mode", "concat_memory"))
         text_gate_cfg = text_recon_cfg.get("text_gate", {}) if text_recon_on else {}
         residual_head_cfg = text_recon_cfg.get("residual_head", {}) if text_recon_on else {}
+        residual_pooled_cfg = text_recon_cfg.get("residual_pooled_layer", {}) if text_recon_on else {}
         concat_memory_mode = text_recon_mode in {"concat_memory", "concat_memory_visual_mask"}
         model.configure_text_conditioning(
             text_feature_dim=text_feature_dim,
@@ -389,6 +394,8 @@ def load_tokenizer_model(
             text_recon_mode=text_recon_mode if text_recon_on else None,
             residual_head_gate_init=float(residual_head_cfg.get("gate_init", 1e-3)),
             residual_head_mlp_hidden_mult=float(residual_head_cfg.get("mlp_hidden_mult", 4.0)),
+            residual_gate_init=float(residual_pooled_cfg.get("gate_init", 1e-3)),
+            residual_mlp_hidden_mult=float(residual_pooled_cfg.get("mlp_hidden_mult", 4.0)),
         )
 
     checkpoint = torch.load(ckpt_path, map_location="cpu")

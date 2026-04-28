@@ -503,10 +503,15 @@ def main(args):
     if hr_on and text_hr_on:
         raise ValueError("v1 hr_on and v2 text_hr.enabled cannot be enabled at the same time.")
     if text_recon_on:
-        if text_recon_mode not in {"concat_memory", "concat_memory_visual_mask", "residual_head"}:
+        if text_recon_mode not in {
+            "concat_memory",
+            "concat_memory_visual_mask",
+            "residual_head",
+            "residual_pooled_layer",
+        }:
             raise NotImplementedError(
                 "Only text_recon_conditioning.mode=concat_memory, concat_memory_visual_mask, "
-                "or residual_head is implemented in the current commit."
+                "residual_head, or residual_pooled_layer is implemented in the current commit."
             )
         if text_recon_mode != "concat_memory_visual_mask" and visual_memory_mask_enabled:
             raise ValueError(
@@ -518,8 +523,10 @@ def main(args):
                 "text_recon_conditioning.visual_memory_mask.enabled must be true for "
                 "mode=concat_memory_visual_mask."
             )
-        if text_recon_mode == "residual_head" and text_hr_on:
-            raise ValueError("text_recon_conditioning.mode=residual_head requires text_hr.enabled=false.")
+        if text_recon_mode in {"residual_head", "residual_pooled_layer"} and text_hr_on:
+            raise ValueError(
+                f"text_recon_conditioning.mode={text_recon_mode} requires text_hr.enabled=false."
+            )
         if visual_memory_mask_enabled:
             if str(visual_memory_mask_cfg.get("mode", "learned_mask_token")) != "learned_mask_token":
                 raise NotImplementedError("Only visual_memory_mask.mode=learned_mask_token is implemented.")
@@ -783,6 +790,7 @@ def main(args):
         # the base model definition, before checkpoint compatibility loading.
         text_gate_cfg = text_recon_cfg.get("text_gate", {}) if text_recon_on else {}
         residual_head_cfg = text_recon_cfg.get("residual_head", {}) if text_recon_on else {}
+        residual_pooled_cfg = text_recon_cfg.get("residual_pooled_layer", {}) if text_recon_on else {}
         concat_memory_mode = text_recon_mode in {"concat_memory", "concat_memory_visual_mask"}
         vq_model.configure_text_conditioning(
             text_feature_dim=text_feature_dim,
@@ -795,6 +803,8 @@ def main(args):
             text_recon_mode=text_recon_mode if text_recon_on else None,
             residual_head_gate_init=float(residual_head_cfg.get("gate_init", 1e-3)),
             residual_head_mlp_hidden_mult=float(residual_head_cfg.get("mlp_hidden_mult", 4.0)),
+            residual_gate_init=float(residual_pooled_cfg.get("gate_init", 1e-3)),
+            residual_mlp_hidden_mult=float(residual_pooled_cfg.get("mlp_hidden_mult", 4.0)),
         )
 
     # create and load model
@@ -913,14 +923,18 @@ def main(args):
         for name, _ in vq_model.named_parameters():
             if name in {"text_type_embedding", "visual_type_embedding", "text_gate_logit", "visual_mask_token"} \
                     or name in {"residual_head_gate"} \
+                    or name in {"residual_gate"} \
                     or name.startswith("text_projection.") \
-                    or name.startswith("residual_head_mlp."):
+                    or name.startswith("residual_head_mlp.") \
+                    or name.startswith("residual_text_mlp."):
                 text_conditioning_missing_keys.append(name)
         for name, _ in vq_model.named_buffers():
             if name in {"text_type_embedding", "visual_type_embedding", "text_gate_logit", "visual_mask_token"} \
                     or name in {"residual_head_gate"} \
+                    or name in {"residual_gate"} \
                     or name.startswith("text_projection.") \
-                    or name.startswith("residual_head_mlp."):
+                    or name.startswith("residual_head_mlp.") \
+                    or name.startswith("residual_text_mlp."):
                 text_conditioning_missing_keys.append(name)
     if args.vq_ckpt:
         checkpoint = torch.load(args.vq_ckpt, map_location="cpu")

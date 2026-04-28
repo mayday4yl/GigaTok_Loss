@@ -293,6 +293,8 @@ class VQVitModelPlus(nn.Module):
         self.visual_mask_token = None
         self.residual_head_mlp = None
         self.residual_head_gate = None
+        self.residual_text_mlp = None
+        self.residual_gate = None
         
         self.freeze_but_2d_decoder_flag = False
 
@@ -371,7 +373,9 @@ class VQVitModelPlus(nn.Module):
             visual_memory_mask_enabled=False,
             text_recon_mode=None,
             residual_head_gate_init=1e-3,
-            residual_head_mlp_hidden_mult=4.0):
+            residual_head_mlp_hidden_mult=4.0,
+            residual_gate_init=1e-3,
+            residual_mlp_hidden_mult=4.0):
         # Text-HR v2: build the small trainable bridge from frozen T5 hidden states
         # to the GigaTok transformer decoder width.
         decoder_width = self.s1to2decoder.width
@@ -432,6 +436,19 @@ class VQVitModelPlus(nn.Module):
         else:
             self.residual_head_mlp = None
             self.residual_head_gate = None
+
+        if text_recon_mode == "residual_pooled_layer":
+            hidden_dim = int(decoder_width * float(residual_mlp_hidden_mult))
+            self.residual_text_mlp = nn.Sequential(
+                nn.Linear(decoder_width, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, decoder_width),
+            )
+            self.residual_text_mlp.apply(self._init_weights)
+            self.residual_gate = nn.Parameter(torch.tensor(float(residual_gate_init)))
+        else:
+            self.residual_text_mlp = None
+            self.residual_gate = None
 
     def project_text_memory(self, decoder_text_features):
         # Text-HR v2: decoder_text_features are selected T5 layer features [B, T, d_t5].
@@ -529,6 +546,37 @@ class VQVitModelPlus(nn.Module):
             "selected_text_memory_norm": selected_norm,
         }
         return text_memory_by_layer, stats
+
+    def project_residual_text_by_layer(
+            self,
+            decoder_text_features_by_layer: Optional[Mapping[int, torch.Tensor]],
+            decoder_text_key_padding_mask=None):
+        if not decoder_text_features_by_layer:
+            return None, {}
+        if self.residual_text_mlp is None or self.residual_gate is None:
+            return None, {}
+        if self.text_projection is None:
+            raise RuntimeError("Text conditioning is enabled, but text_projection is not configured.")
+
+        residual_text_by_layer: Dict[int, torch.Tensor] = {}
+        residual_norms = []
+        gate = None
+        for decoder_layer, decoder_text_features in decoder_text_features_by_layer.items():
+            text_memory = self.project_text_memory_for_pooling(decoder_text_features)
+            pooled_text = self.masked_mean_text(text_memory, decoder_text_key_padding_mask)
+            residual = self.residual_text_mlp(pooled_text)
+            residual_text_by_layer[int(decoder_layer)] = residual
+            residual_norms.append(residual.float().norm(dim=-1).mean())
+            if gate is None:
+                gate = self.residual_gate.to(device=residual.device, dtype=residual.dtype)
+
+        if gate is None:
+            gate = torch.tensor(0.0)
+        stats = {
+            "residual_gate": gate.float(),
+            "residual_norm_mean": torch.stack(residual_norms).mean(),
+        }
+        return residual_text_by_layer, stats
 
     @staticmethod
     def _merge_text_recon_stats(text_stats, decoder_stats):
@@ -682,10 +730,19 @@ class VQVitModelPlus(nn.Module):
         text_memory = self.project_text_memory(decoder_text_features)
         if text_memory is not None and selected_decoder_layer is None:
             raise ValueError("decoder_text_features requires selected_decoder_layer for text injection.")
-        text_memory_by_layer, text_stats = self.project_text_memory_by_layer(
+        residual_text_by_layer, residual_text_stats = self.project_residual_text_by_layer(
             decoder_text_features_by_layer,
-            selected_decoder_layer=selected_decoder_layer,
+            decoder_text_key_padding_mask=decoder_text_key_padding_mask,
         )
+        if residual_text_by_layer is None:
+            text_memory_by_layer, text_stats = self.project_text_memory_by_layer(
+                decoder_text_features_by_layer,
+                selected_decoder_layer=selected_decoder_layer,
+            )
+            residual_gate = None
+        else:
+            text_memory_by_layer, text_stats = None, residual_text_stats
+            residual_gate = self.residual_gate
         # Text-HR v2: only the selected decoder layer receives text_memory and
         # returns its post-softmax cross-attention weights for the HR loss.
         if ret_inner_feat:
@@ -702,6 +759,8 @@ class VQVitModelPlus(nn.Module):
                     visual_mask_token=self.visual_mask_token,
                     visual_memory_mask_enabled=visual_memory_mask_enabled,
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
+                    residual_text_by_layer=residual_text_by_layer,
+                    residual_gate=residual_gate,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -719,6 +778,8 @@ class VQVitModelPlus(nn.Module):
                     visual_mask_token=self.visual_mask_token,
                     visual_memory_mask_enabled=visual_memory_mask_enabled,
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
+                    residual_text_by_layer=residual_text_by_layer,
+                    residual_gate=residual_gate,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -764,6 +825,8 @@ class VQVitModelPlus(nn.Module):
                     visual_mask_token=self.visual_mask_token,
                     visual_memory_mask_enabled=visual_memory_mask_enabled,
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
+                    residual_text_by_layer=residual_text_by_layer,
+                    residual_gate=residual_gate,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -780,6 +843,8 @@ class VQVitModelPlus(nn.Module):
                     visual_mask_token=self.visual_mask_token,
                     visual_memory_mask_enabled=visual_memory_mask_enabled,
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
+                    residual_text_by_layer=residual_text_by_layer,
+                    residual_gate=residual_gate,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
