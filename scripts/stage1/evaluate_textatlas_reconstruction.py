@@ -50,6 +50,8 @@ TEXT_CONDITIONING_MISSING_PREFIXES = TEXT_CONDITIONING_MISSING_PREFIXES + (
     "residual_head_mlp.",
     "residual_text_mlp.",
     "adaln_mlps.",
+    "s1to2decoder.residual_cross_attn_layers.",
+    "s1to2decoder.residual_cross_attn_projs.",
 )
 
 
@@ -304,21 +306,33 @@ def validate_text_recon_config(config: Mapping[str, Any]) -> None:
     mode = str(text_recon_cfg.get("mode", "concat_memory"))
     visual_memory_mask_cfg = text_recon_cfg.get("visual_memory_mask", {})
     visual_memory_mask_enabled = bool(visual_memory_mask_cfg.get("enabled", False))
-    if mode not in {"concat_memory", "concat_memory_visual_mask", "residual_head", "residual_pooled_layer", "adaln"}:
+    if mode not in {
+        "concat_memory",
+        "concat_memory_visual_mask",
+        "residual_head",
+        "residual_pooled_layer",
+        "adaln",
+        "residual_cross_attn_visual_mask",
+    }:
         raise NotImplementedError(
             "Only text_recon_conditioning.mode=concat_memory, concat_memory_visual_mask, "
-            "residual_head, residual_pooled_layer, or adaln is implemented in the current commit."
+            "residual_head, residual_pooled_layer, adaln, or residual_cross_attn_visual_mask "
+            "is implemented in the current commit."
         )
-    if mode != "concat_memory_visual_mask" and visual_memory_mask_enabled:
+    visual_mask_modes = {"concat_memory_visual_mask", "residual_cross_attn_visual_mask"}
+    if mode not in visual_mask_modes and visual_memory_mask_enabled:
         raise ValueError(
             "text_recon_conditioning.visual_memory_mask.enabled must be false unless "
-            "mode=concat_memory_visual_mask."
+            "mode=concat_memory_visual_mask or residual_cross_attn_visual_mask."
         )
-    if mode == "concat_memory_visual_mask" and not visual_memory_mask_enabled:
-        raise ValueError(
-            "text_recon_conditioning.visual_memory_mask.enabled must be true for mode=concat_memory_visual_mask."
-        )
-    if mode in {"residual_head", "residual_pooled_layer", "adaln"} and bool(config.get("text_hr", {}).get("enabled", False)):
+    if mode in visual_mask_modes and not visual_memory_mask_enabled:
+        raise ValueError(f"text_recon_conditioning.visual_memory_mask.enabled must be true for mode={mode}.")
+    if mode in {
+        "residual_head",
+        "residual_pooled_layer",
+        "adaln",
+        "residual_cross_attn_visual_mask",
+    } and bool(config.get("text_hr", {}).get("enabled", False)):
         raise ValueError(f"text_recon_conditioning.mode={mode} requires text_hr.enabled=false.")
     if visual_memory_mask_enabled:
         if str(visual_memory_mask_cfg.get("mode", "learned_mask_token")) != "learned_mask_token":
@@ -389,11 +403,17 @@ def load_tokenizer_model(
         adaln_cfg = text_recon_cfg.get("adaln", {}) if text_recon_on else {}
         concat_memory_mode = text_recon_mode in {"concat_memory", "concat_memory_visual_mask"}
         adaln_layers = None
+        residual_cross_attn_layers = None
         if text_recon_on and text_recon_mode == "adaln":
             raw_layers = text_recon_cfg.get("layers", None)
             if not raw_layers:
                 raw_layers = [pair[1] for pair in text_recon_cfg.get("layer_pairs", [])]
             adaln_layers = [int(layer_idx) for layer_idx in raw_layers]
+        if text_recon_on and text_recon_mode == "residual_cross_attn_visual_mask":
+            raw_layers = text_recon_cfg.get("layers", None)
+            if not raw_layers:
+                raw_layers = [pair[1] for pair in text_recon_cfg.get("layer_pairs", [])]
+            residual_cross_attn_layers = [int(layer_idx) for layer_idx in raw_layers]
         model.configure_text_conditioning(
             text_feature_dim=text_feature_dim,
             text_projection=config.get("text_conditioning", {}).get("text_projection", "linear_layernorm"),
@@ -401,7 +421,9 @@ def load_tokenizer_model(
             visual_type_embedding=text_recon_on and concat_memory_mode and bool(text_recon_cfg.get("visual_type_embedding", False)),
             text_gate_enabled=text_recon_on and concat_memory_mode and bool(text_gate_cfg.get("enabled", False)),
             text_gate_init=float(text_gate_cfg.get("init", 0.1)),
-            visual_memory_mask_enabled=text_recon_on and text_recon_mode == "concat_memory_visual_mask",
+            visual_memory_mask_enabled=(
+                text_recon_on and text_recon_mode in {"concat_memory_visual_mask", "residual_cross_attn_visual_mask"}
+            ),
             text_recon_mode=text_recon_mode if text_recon_on else None,
             residual_head_gate_init=float(residual_head_cfg.get("gate_init", 1e-3)),
             residual_head_mlp_hidden_mult=float(residual_head_cfg.get("mlp_hidden_mult", 4.0)),
@@ -410,6 +432,7 @@ def load_tokenizer_model(
             adaln_layers=adaln_layers,
             adaln_mlp_hidden_mult=float(adaln_cfg.get("mlp_hidden_mult", 4.0)),
             adaln_zero_init_last=bool(adaln_cfg.get("zero_init_last", True)),
+            residual_cross_attn_layers=residual_cross_attn_layers,
         )
 
     checkpoint = torch.load(ckpt_path, map_location="cpu")

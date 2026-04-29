@@ -296,6 +296,7 @@ class VQVitModelPlus(nn.Module):
         self.residual_text_mlp = None
         self.residual_gate = None
         self.adaln_mlps = None
+        self.text_recon_mode = None
         
         self.freeze_but_2d_decoder_flag = False
 
@@ -379,10 +380,12 @@ class VQVitModelPlus(nn.Module):
             residual_mlp_hidden_mult=4.0,
             adaln_layers=None,
             adaln_mlp_hidden_mult=4.0,
-            adaln_zero_init_last=True):
+            adaln_zero_init_last=True,
+            residual_cross_attn_layers=None):
         # Text-HR v2: build the small trainable bridge from frozen T5 hidden states
         # to the GigaTok transformer decoder width.
         decoder_width = self.s1to2decoder.width
+        self.text_recon_mode = text_recon_mode
         if text_projection == "linear":
             self.text_projection = nn.Linear(text_feature_dim, decoder_width)
         elif text_projection == "linear_layernorm":
@@ -473,6 +476,30 @@ class VQVitModelPlus(nn.Module):
                 self.adaln_mlps[layer_key] = mlp
         else:
             self.adaln_mlps = None
+
+        if text_recon_mode == "residual_cross_attn_visual_mask":
+            if not residual_cross_attn_layers:
+                raise ValueError(
+                    "text_recon_conditioning.mode=residual_cross_attn_visual_mask "
+                    "requires non-empty residual_cross_attn_layers."
+                )
+            self.s1to2decoder.residual_cross_attn_layers = nn.ModuleDict()
+            self.s1to2decoder.residual_cross_attn_projs = nn.ModuleDict()
+            for layer_idx in residual_cross_attn_layers:
+                layer_key = str(int(layer_idx))
+                self.s1to2decoder.residual_cross_attn_layers[layer_key] = nn.MultiheadAttention(
+                    decoder_width,
+                    self.s1to2decoder.num_heads,
+                    dropout=0.0,
+                    batch_first=False,
+                )
+                proj = nn.Linear(decoder_width, decoder_width)
+                nn.init.zeros_(proj.weight)
+                nn.init.zeros_(proj.bias)
+                self.s1to2decoder.residual_cross_attn_projs[layer_key] = proj
+        else:
+            self.s1to2decoder.residual_cross_attn_layers = None
+            self.s1to2decoder.residual_cross_attn_projs = None
 
     def project_text_memory(self, decoder_text_features):
         # Text-HR v2: decoder_text_features are selected T5 layer features [B, T, d_t5].
@@ -567,6 +594,36 @@ class VQVitModelPlus(nn.Module):
             "text_gate": gate.float(),
             "text_memory_norm_before_gate_mean": torch.stack(before_norms).mean(),
             "text_memory_norm_after_gate_mean": torch.stack(after_norms).mean(),
+            "selected_text_memory_norm": selected_norm,
+        }
+        return text_memory_by_layer, stats
+
+    def project_residual_cross_attn_text_by_layer(
+            self,
+            decoder_text_features_by_layer: Optional[Mapping[int, torch.Tensor]],
+            selected_decoder_layer=None):
+        if not decoder_text_features_by_layer:
+            return None, {}
+        if self.text_projection is None:
+            raise RuntimeError("Text conditioning is enabled, but text_projection is not configured.")
+
+        text_memory_by_layer: Dict[int, torch.Tensor] = {}
+        token_norms = []
+        selected_norm = None
+        for decoder_layer, decoder_text_features in decoder_text_features_by_layer.items():
+            text_memory = self.project_text_memory_for_pooling(decoder_text_features)
+            token_norm = self._mean_token_norm(text_memory)
+            text_memory_by_layer[int(decoder_layer)] = text_memory
+            token_norms.append(token_norm)
+            if selected_decoder_layer is not None and int(decoder_layer) == int(selected_decoder_layer):
+                selected_norm = token_norm
+
+        if selected_norm is None and token_norms:
+            selected_norm = torch.stack(token_norms).mean()
+        stats = {
+            "text_gate": torch.zeros((), device=token_norms[0].device if token_norms else "cpu"),
+            "text_memory_norm_before_gate_mean": torch.stack(token_norms).mean(),
+            "text_memory_norm_after_gate_mean": torch.stack(token_norms).mean(),
             "selected_text_memory_norm": selected_norm,
         }
         return text_memory_by_layer, stats
@@ -814,6 +871,14 @@ class VQVitModelPlus(nn.Module):
         if adaln_params_by_layer is not None:
             text_memory_by_layer, text_stats = None, adaln_stats
             residual_text_by_layer, residual_gate = None, None
+            residual_cross_attn_text_by_layer = None
+        elif self.text_recon_mode == "residual_cross_attn_visual_mask":
+            residual_cross_attn_text_by_layer, text_stats = self.project_residual_cross_attn_text_by_layer(
+                decoder_text_features_by_layer,
+                selected_decoder_layer=selected_decoder_layer,
+            )
+            text_memory_by_layer = None
+            residual_text_by_layer, residual_gate = None, None
         else:
             residual_text_by_layer, residual_text_stats = self.project_residual_text_by_layer(
                 decoder_text_features_by_layer,
@@ -828,6 +893,7 @@ class VQVitModelPlus(nn.Module):
             else:
                 text_memory_by_layer, text_stats = None, residual_text_stats
                 residual_gate = self.residual_gate
+            residual_cross_attn_text_by_layer = None
         # Text-HR v2: only the selected decoder layer receives text_memory and
         # returns its post-softmax cross-attention weights for the HR loss.
         if ret_inner_feat:
@@ -846,6 +912,7 @@ class VQVitModelPlus(nn.Module):
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
                     residual_text_by_layer=residual_text_by_layer,
                     residual_gate=residual_gate,
+                    residual_cross_attn_text_by_layer=residual_cross_attn_text_by_layer,
                     adaln_params_by_layer=adaln_params_by_layer,
                     return_text_recon_stats=return_text_recon_stats,
                 )
@@ -866,6 +933,7 @@ class VQVitModelPlus(nn.Module):
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
                     residual_text_by_layer=residual_text_by_layer,
                     residual_gate=residual_gate,
+                    residual_cross_attn_text_by_layer=residual_cross_attn_text_by_layer,
                     adaln_params_by_layer=adaln_params_by_layer,
                     return_text_recon_stats=return_text_recon_stats,
                 )
@@ -914,6 +982,7 @@ class VQVitModelPlus(nn.Module):
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
                     residual_text_by_layer=residual_text_by_layer,
                     residual_gate=residual_gate,
+                    residual_cross_attn_text_by_layer=residual_cross_attn_text_by_layer,
                     adaln_params_by_layer=adaln_params_by_layer,
                     return_text_recon_stats=return_text_recon_stats,
                 )
@@ -933,6 +1002,7 @@ class VQVitModelPlus(nn.Module):
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
                     residual_text_by_layer=residual_text_by_layer,
                     residual_gate=residual_gate,
+                    residual_cross_attn_text_by_layer=residual_cross_attn_text_by_layer,
                     adaln_params_by_layer=adaln_params_by_layer,
                     return_text_recon_stats=return_text_recon_stats,
                 )

@@ -509,22 +509,30 @@ def main(args):
             "residual_head",
             "residual_pooled_layer",
             "adaln",
+            "residual_cross_attn_visual_mask",
         }:
             raise NotImplementedError(
                 "Only text_recon_conditioning.mode=concat_memory, concat_memory_visual_mask, "
-                "residual_head, residual_pooled_layer, or adaln is implemented in the current commit."
+                "residual_head, residual_pooled_layer, adaln, or residual_cross_attn_visual_mask "
+                "is implemented in the current commit."
             )
-        if text_recon_mode != "concat_memory_visual_mask" and visual_memory_mask_enabled:
+        visual_mask_modes = {"concat_memory_visual_mask", "residual_cross_attn_visual_mask"}
+        if text_recon_mode not in visual_mask_modes and visual_memory_mask_enabled:
             raise ValueError(
                 "text_recon_conditioning.visual_memory_mask.enabled must be false unless "
-                "mode=concat_memory_visual_mask."
+                "mode=concat_memory_visual_mask or residual_cross_attn_visual_mask."
             )
-        if text_recon_mode == "concat_memory_visual_mask" and not visual_memory_mask_enabled:
+        if text_recon_mode in visual_mask_modes and not visual_memory_mask_enabled:
             raise ValueError(
                 "text_recon_conditioning.visual_memory_mask.enabled must be true for "
-                "mode=concat_memory_visual_mask."
+                f"mode={text_recon_mode}."
             )
-        if text_recon_mode in {"residual_head", "residual_pooled_layer", "adaln"} and text_hr_on:
+        if text_recon_mode in {
+            "residual_head",
+            "residual_pooled_layer",
+            "adaln",
+            "residual_cross_attn_visual_mask",
+        } and text_hr_on:
             raise ValueError(
                 f"text_recon_conditioning.mode={text_recon_mode} requires text_hr.enabled=false."
             )
@@ -798,8 +806,14 @@ def main(args):
         adaln_cfg = text_recon_cfg.get("adaln", {}) if text_recon_on else {}
         concat_memory_mode = text_recon_mode in {"concat_memory", "concat_memory_visual_mask"}
         adaln_layers = None
+        residual_cross_attn_layers = None
         if text_recon_on and text_recon_mode == "adaln":
             adaln_layers = parse_text_recon_layers(
+                text_recon_cfg,
+                decoder_num_layers=int(vq_model.s1to2decoder.num_layers),
+            )
+        if text_recon_on and text_recon_mode == "residual_cross_attn_visual_mask":
+            residual_cross_attn_layers = parse_text_recon_layers(
                 text_recon_cfg,
                 decoder_num_layers=int(vq_model.s1to2decoder.num_layers),
             )
@@ -810,7 +824,9 @@ def main(args):
             visual_type_embedding=text_recon_on and concat_memory_mode and bool(text_recon_cfg.get("visual_type_embedding", False)),
             text_gate_enabled=text_recon_on and concat_memory_mode and bool(text_gate_cfg.get("enabled", False)),
             text_gate_init=float(text_gate_cfg.get("init", 0.1)),
-            visual_memory_mask_enabled=text_recon_on and text_recon_mode == "concat_memory_visual_mask",
+            visual_memory_mask_enabled=(
+                text_recon_on and text_recon_mode in {"concat_memory_visual_mask", "residual_cross_attn_visual_mask"}
+            ),
             text_recon_mode=text_recon_mode if text_recon_on else None,
             residual_head_gate_init=float(residual_head_cfg.get("gate_init", 1e-3)),
             residual_head_mlp_hidden_mult=float(residual_head_cfg.get("mlp_hidden_mult", 4.0)),
@@ -819,6 +835,7 @@ def main(args):
             adaln_layers=adaln_layers,
             adaln_mlp_hidden_mult=float(adaln_cfg.get("mlp_hidden_mult", 4.0)),
             adaln_zero_init_last=bool(adaln_cfg.get("zero_init_last", True)),
+            residual_cross_attn_layers=residual_cross_attn_layers,
         )
 
     # create and load model
@@ -941,7 +958,9 @@ def main(args):
                     or name.startswith("text_projection.") \
                     or name.startswith("residual_head_mlp.") \
                     or name.startswith("residual_text_mlp.") \
-                    or name.startswith("adaln_mlps."):
+                    or name.startswith("adaln_mlps.") \
+                    or name.startswith("s1to2decoder.residual_cross_attn_layers.") \
+                    or name.startswith("s1to2decoder.residual_cross_attn_projs."):
                 text_conditioning_missing_keys.append(name)
         for name, _ in vq_model.named_buffers():
             if name in {"text_type_embedding", "visual_type_embedding", "text_gate_logit", "visual_mask_token"} \
@@ -950,7 +969,9 @@ def main(args):
                     or name.startswith("text_projection.") \
                     or name.startswith("residual_head_mlp.") \
                     or name.startswith("residual_text_mlp.") \
-                    or name.startswith("adaln_mlps."):
+                    or name.startswith("adaln_mlps.") \
+                    or name.startswith("s1to2decoder.residual_cross_attn_layers.") \
+                    or name.startswith("s1to2decoder.residual_cross_attn_projs."):
                 text_conditioning_missing_keys.append(name)
     if args.vq_ckpt:
         checkpoint = torch.load(args.vq_ckpt, map_location="cpu")

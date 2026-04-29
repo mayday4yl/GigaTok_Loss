@@ -2067,3 +2067,205 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 ## 下一步
 - Commit 3 已完成并通过 checkpoint load smoke / eval forward smoke / zero-init equivalence smoke / 2-step server smoke。
 - 三个剩余 mode 已全部实现，下一步应先做统一兼容 smoke 或进入 100-step mini smoke，不要继续改新架构。
+
+## 2026-04-29 兼容 smoke 与 100-step mini
+
+## 执行范围
+- 本轮不新增新架构，只做最新代码收尾验证：
+  - 兼容 smoke：matched native、concat_memory + HR、concat_memory_visual_mask + HR、residual_head、residual_pooled_layer、旧 selected-layer gram。
+  - 100-step mini：matched_native、residual_head、residual_pooled_layer。
+  - reconstruction grid：40 张 balanced val 样本，5 个 subset 各 8 张。
+  - sensitivity：correct / empty / shuffled text。
+- AdaLN 暂不长跑。原因是 2-step 后 gamma/beta norm 过大且 Val MSE 明显变差，先记录风险，后续再做 scale 稳定版。
+
+## 兼容 smoke 结果
+- 输出目录：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_recon_compat_smoke_latest`
+- 6 个 2-step 均通过，无 NaN/OOM，checkpoint 均保存成功：
+  - `matched_native_smoke_2step`
+  - `concat_memory_hr_smoke_2step`
+  - `concat_mask_hr_smoke_2step`
+  - `residual_head_smoke_2step`
+  - `residual_pooled_layer_smoke_2step`
+  - `old_selected_gram_smoke_2step`
+- 旧 selected-layer gram 日志仍有 `text_hr_loss`、`text_hr_gram_loss_mean`、`text_hr_text_attention_mass_mean`、`text_hr_visual_attention_mass_mean`。
+- concat_memory 日志仍有 `text_gate`、text memory norm、visual memory norm、text/visual attention mass。
+- concat_memory_visual_mask 日志中 `visual_memory_mask_ratio=0.05`，实际采样约 `0.046`。
+- residual_head 日志确认 shape：
+  - `residual_head_rec_spatial_channels=256`
+  - `residual_head_text_spatial_channels=256`
+  - `residual_head_token_size=256`
+- residual_pooled_layer 日志有 `residual_gate` 和 `residual_norm_mean`。
+
+## 100-step mini 结果
+- 输出目录：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_recon_100step_latest`
+- 统一设置：
+  - checkpoint：`VQ_BL256_dino_disc.pt`
+  - train manifest：`train_materialized_manifest_v2text.jsonl`
+  - val manifest：`val_materialized_manifest_v2text.jsonl`
+  - global batch size：24
+  - seed：0
+  - steps：100
+  - validation：500 张，`val_compute_ssim=True`
+  - freeze：encoder / quantizer / codebook frozen，`freeze_post_quant_conv=False`
+- step 100 指标：
+  - matched_native：Val MSE `0.033686`，PSNR `14.7256`，SSIM `0.6465`
+  - residual_head：Val MSE `0.035148`，PSNR `14.5410`，SSIM `0.6291`
+  - residual_pooled_layer：Val MSE `0.032926`，PSNR `14.8247`，SSIM `0.6533`
+- 初步判断：
+  - residual_pooled_layer 在 100-step mini 的像素指标略优于 matched_native。
+  - residual_head 在 100-step mini 明显不如 matched_native，且 `residual_head_gate` 从约 `1e-3` 增到约 `0.0066`，`residual_head_norm_mean` 增长较快，需要谨慎。
+
+## Reconstruction grid 与 sensitivity
+- balanced manifest：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_recon_100step_latest/recon_eval/balanced_val_40.jsonl`
+- 每个 subset 8 张：
+  - CleanTextSynth
+  - StyledTextSynth
+  - TextVisionBlend
+  - TextScenesHQ
+  - LongWordsSubset-A
+- grid 路径：
+  - correct：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_recon_100step_latest/recon_eval/correct/comparison_grid.png`
+  - empty：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_recon_100step_latest/recon_eval/empty/comparison_grid.png`
+  - shuffled：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_recon_100step_latest/recon_eval/shuffled/comparison_grid.png`
+- 40 张 balanced 样本 overall 指标：
+  - correct / matched_native：MSE `0.033458`，PSNR `15.3000`，SSIM `0.5744`
+  - correct / residual_head：MSE `0.035724`，PSNR `15.0073`，SSIM `0.5567`
+  - correct / residual_pooled：MSE `0.032401`，PSNR `15.4381`，SSIM `0.5817`
+  - empty / residual_pooled：MSE `0.032385`，PSNR `15.4398`，SSIM `0.5819`
+  - shuffled / residual_pooled：MSE `0.032392`，PSNR `15.4393`，SSIM `0.5817`
+- sensitivity 判断：
+  - residual_pooled_layer 的 correct / empty / shuffled 几乎一致。
+  - 说明 100-step mini 的收益暂时不能证明模型已经使用正确文本内容；更像是 text branch / residual adapter 作为额外可学习扰动或正则带来的轻微重建收益。
+  - residual_head 在 correct / empty / shuffled 下都差于 matched_native，暂不建议进入 1000-step。
+
+## 下一步建议
+- 不建议直接跑 AdaLN 1000-step。
+- residual_head 也暂不建议 1000-step。
+- residual_pooled_layer 可以进入更长训练，但必须同时做 sensitivity：
+  - 如果 1000-step 后 correct 仍然约等于 empty / shuffled，则说明该方式还没有学到文本内容条件。
+  - 如果 correct 明显优于 empty / shuffled，再考虑作为主线继续。
+- AdaLN 稳定性修正计划：
+  - `norm_out = norm_out * (1 + adaln_scale * gamma) + adaln_scale * beta`
+  - 先试 `adaln_scale=1e-3`，再试 `1e-2`。
+
+## 2026-04-29 residual_pooled_layer 1000-step
+
+## 执行范围
+- 只跑 `residual_pooled_layer` 1000-step，不跑 `residual_head` 和 AdaLN 长训。
+- 检查服务器上没有同参 `matched_native_1000step` 可复用，因此补跑 matched native 1000-step。
+- 两组训练严格同参：
+  - checkpoint：`/home/ma-user/work/GigaTok_hr/gigatok_persist/checkpoints/VQ_BL256_dino_disc.pt`
+  - train manifest：`train_materialized_manifest_v2text.jsonl`
+  - val manifest：`val_materialized_manifest_v2text.jsonl`
+  - global batch size：24
+  - seed：0
+  - steps：1000
+  - validation：500 张，`val_compute_ssim=True`
+  - freeze：encoder / quantizer / codebook frozen，`freeze_post_quant_conv=False`
+- 输出目录：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_recon_residual_pooled_1000_latest`
+
+## 1000-step 训练结果
+- matched_native：
+  - step 250：Val MSE `0.021540`，PSNR `16.6675`，SSIM `0.7668`
+  - step 500：Val MSE `0.019262`，PSNR `17.1531`，SSIM `0.7898`
+  - step 750：Val MSE `0.018379`，PSNR `17.3568`，SSIM `0.7979`
+  - step 1000：Val MSE `0.018264`，PSNR `17.3841`，SSIM `0.8006`
+- residual_pooled_layer：
+  - step 250：Val MSE `0.021743`，PSNR `16.6268`，SSIM `0.7620`
+  - step 500：Val MSE `0.019414`，PSNR `17.1189`，SSIM `0.7927`
+  - step 750：Val MSE `0.018467`，PSNR `17.3359`，SSIM `0.7966`
+  - step 1000：Val MSE `0.018331`，PSNR `17.3680`，SSIM `0.7997`
+- 训练判断：
+  - residual_pooled_layer 没有超过同参 matched native。
+  - 两者非常接近，但 matched native 在 step 1000 的 MSE / PSNR / SSIM 均略优。
+  - residual_pooled_layer 的 `residual_gate` 最终约 `4.49e-3`，`residual_norm_mean` 约 `1.35e2`，没有 NaN/OOM。
+
+## 1000-step reconstruction grid 与 sensitivity
+- balanced manifest：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_recon_residual_pooled_1000_latest/recon_eval/balanced_val_40.jsonl`
+- 每个 subset 8 张，共 40 张：
+  - CleanTextSynth
+  - StyledTextSynth
+  - TextVisionBlend
+  - TextScenesHQ
+  - LongWordsSubset-A
+- grid 路径：
+  - correct：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_recon_residual_pooled_1000_latest/recon_eval/correct/comparison_grid.png`
+  - empty：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_recon_residual_pooled_1000_latest/recon_eval/empty/comparison_grid.png`
+  - shuffled：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_recon_residual_pooled_1000_latest/recon_eval/shuffled/comparison_grid.png`
+- 40 张 balanced 样本 overall：
+  - matched_native：MSE `0.016347`，PSNR `18.6210`，SSIM `0.7350`
+  - residual_pooled correct：MSE `0.016496`，PSNR `18.5824`，SSIM `0.7332`
+  - residual_pooled empty：MSE `0.016497`，PSNR `18.5828`，SSIM `0.7334`
+  - residual_pooled shuffled：MSE `0.016494`，PSNR `18.5831`，SSIM `0.7332`
+- sensitivity 判断：
+  - correct / empty / shuffled 三者几乎完全一致。
+  - 说明 `residual_pooled_layer` 到 1000-step 仍没有表现出对具体文本内容的依赖。
+  - 当前收益不能归因于正确 text 内容；并且在这次同参 1000-step 中，整体指标也没有超过 matched native。
+
+## 下一步建议
+- 暂不把 `residual_pooled_layer` 作为主线继续放大训练。
+- 下一步应回到机制设计，而不是继续堆步数：
+  - 对 residual 类方法加 text 使用诊断，例如 correct/empty/wrong 的输出差异图、feature delta norm、per-sample delta。
+  - 考虑更强的 text 使用约束或训练目标，而不是只给 pooled residual。
+  - AdaLN 只在加 `adaln_scale=1e-3/1e-2` 稳定项后再做短 smoke，不直接长训。
+
+## 2026-04-29 residual_cross_attn_visual_mask 实现
+
+## 执行范围
+- 本次只新增 `text_recon_conditioning.mode=residual_cross_attn_visual_mask`。
+- 未实现 AdaLN scale，未实现 text-guided bbox mask，未改已有 `concat_memory` / `concat_memory_visual_mask` / `residual_head` / `residual_pooled_layer` / 旧 selected-layer Text-HR 路径。
+
+## 方法结构
+- 保留原 decoder layer 的 visual self-attn / visual cross-attn / FFN 主干。
+- 在 decoder layers 8-15 后额外追加 token-level text cross-attention residual branch：
+  - query：当前 `latent_tokens`，layout `[L, B, C]`
+  - key/value：对应 T5 layer 经过 `text_projection` 后的 text memory，layout `[T, B, C]`
+  - attention weights 使用 `need_weights=True, average_attn_weights=False`，用于得到 `[B, heads, image_queries, T_text]`
+  - `text_context` 经过 zero-init linear projection 后 residual add 回 `latent_tokens`
+- zero-init projection 初始等价原模型，但参数保持 trainable。
+- text path 不加 `text_type_embedding`，不乘 `text_gate`。
+- visual mask 复用当前 random visual memory mask：
+  - train 时启用；
+  - eval / validation / reconstruction grid 关闭；
+  - 只 mask visual memory，不 mask decoder query；
+  - mask token 仍是 valid key，不改变 padding mask。
+
+## 新增配置
+- `configs/vq/VQ_BL256_dino_disc_text_recon_residual_cross_attn_visual_mask_v1.yaml`
+- 关键设置：
+  - `text_conditioning.enabled=True`
+  - `text_recon_conditioning.mode=residual_cross_attn_visual_mask`
+  - `text_recon_conditioning.layer_pairs=[[8,8],...,[15,15]]`
+  - `text_recon_conditioning.visual_memory_mask.enabled=True`
+  - `text_recon_conditioning.visual_memory_mask.ratio=0.05`
+  - `text_hr.enabled=False`
+
+## 日志与诊断
+- 新增 numeric metrics：
+  - `residual_cross_attn_context_norm_mean`
+  - `residual_cross_attn_proj_norm_mean`
+  - `residual_cross_attn_attn_entropy_norm_mean`
+  - `residual_cross_attn_attn_top1_mean`
+  - `visual_memory_mask_ratio`
+  - `visual_memory_mask_actual_ratio`
+- attention entropy/top1 统计时排除 padding text token；valid token 不足时跳过或使用安全默认。
+- eval forward smoke 需要确认两点：
+  - `visual_memory_mask_actual_ratio=0`
+  - residual cross-attn text branch 仍启用并产出 stats。
+
+## 本地检查
+- `python3 -m py_compile tokenizer/tokenizer_image/vq/vq_vit_model.py tokenizer/tokenizer_image/vq/blocks.py tokenizer/tokenizer_image/vq/vq_train.py tokenizer/tokenizer_image/vq/vq_loss.py scripts/stage1/evaluate_textatlas_reconstruction.py`：通过。
+- 本地 Python 环境无 PyYAML，使用 Ruby `YAML.load_file` 读取新增 config：通过。
+- 本地环境无 torch，checkpoint load smoke / eval forward smoke 需要在服务器环境执行。
+
+## 服务器待跑 smoke 命令要点
+- 运行前设置：
+  - `PYTHONPATH=/home/ma-user/work/GigaTok_hr/GigaTok_Loss`
+  - `TORCH_HOME=/home/ma-user/work/GigaTok_hr/gigatok_persist/cache/torch`
+  - `DINOV2_REPO_DIR=/home/ma-user/work/GigaTok_hr/gigatok_persist/cache/torch/hub/facebookresearch_dinov2_main`
+- 2-step smoke 检查：
+  - `text_recon_mode=residual_cross_attn_visual_mask`
+  - train 下 `visual_memory_mask_actual_ratio` 接近 `0.05`
+  - eval / val 下 mask actual ratio 为 `0`
+  - residual cross-attn stats 出现
+  - 无 NaN/OOM，checkpoint 正常保存。

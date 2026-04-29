@@ -1608,6 +1608,9 @@ class ViTDecoder(nn.Module):
 
         self.conv_out = nn.Conv2d(self.width, token_size, kernel_size=3, stride=1, padding=1)
 
+        self.residual_cross_attn_layers = None
+        self.residual_cross_attn_projs = None
+
         self.q_upsample = q_upsample
         if self.q_upsample:
             self.upsampler = QFormerUpsample(
@@ -1626,6 +1629,36 @@ class ViTDecoder(nn.Module):
                     nn.Linear(self.width * 4, out_inner_dim),
                     )
 
+    @staticmethod
+    def _residual_cross_attn_weight_stats(attn_weights, text_key_padding_mask=None, eps=1e-8):
+        if attn_weights is None:
+            return None, None
+        if attn_weights.dim() != 4:
+            raise ValueError(f"residual cross-attn weights must be [B, H, L, T], got {attn_weights.shape}")
+        batch, _, _, text_len = attn_weights.shape
+        entropy_values = []
+        top1_values = []
+        for batch_idx in range(batch):
+            if text_key_padding_mask is None:
+                valid_mask = torch.ones(text_len, device=attn_weights.device, dtype=torch.bool)
+            else:
+                valid_mask = ~text_key_padding_mask[batch_idx].to(device=attn_weights.device, dtype=torch.bool)
+            valid_count = int(valid_mask.sum().item())
+            if valid_count <= 0:
+                continue
+            probs = attn_weights[batch_idx, :, :, valid_mask].float().clamp_min(float(eps))
+            top1_values.append(probs.max(dim=-1).values.mean())
+            if valid_count > 1:
+                entropy = -(probs * probs.log()).sum(dim=-1)
+                entropy_values.append(entropy.mean() / np.log(float(valid_count)))
+            else:
+                entropy_values.append(probs.new_zeros(()))
+        if not top1_values:
+            return None, None
+        entropy_mean = torch.stack(entropy_values).mean() if entropy_values else attn_weights.new_zeros(())
+        top1_mean = torch.stack(top1_values).mean()
+        return entropy_mean.to(device=attn_weights.device), top1_mean.to(device=attn_weights.device)
+
     
     def forward(
             self, 
@@ -1643,6 +1676,7 @@ class ViTDecoder(nn.Module):
             visual_memory_mask_ratio=0.0,
             residual_text_by_layer=None,
             residual_gate=None,
+            residual_cross_attn_text_by_layer=None,
             adaln_params_by_layer=None,
             return_text_recon_stats=False,
             ):
@@ -1744,6 +1778,43 @@ class ViTDecoder(nn.Module):
         else:
             text_injection_layer_set = set()
 
+        residual_cross_attn_lnd_by_layer = None
+        residual_cross_attn_layer_set = set()
+        if residual_cross_attn_text_by_layer is not None:
+            if self.residual_cross_attn_layers is None or self.residual_cross_attn_projs is None:
+                raise RuntimeError("residual_cross_attn_text_by_layer requires configured residual cross-attn modules.")
+            if text_memory_lnd_by_layer is not None:
+                raise RuntimeError("residual_cross_attn_text_by_layer cannot be combined with concat text_memory_by_layer.")
+            if not isinstance(residual_cross_attn_text_by_layer, dict):
+                raise TypeError("residual_cross_attn_text_by_layer must be a dict")
+            residual_cross_attn_lnd_by_layer = {}
+            for layer_idx, layer_text_memory in residual_cross_attn_text_by_layer.items():
+                layer_idx = int(layer_idx)
+                assert layer_text_memory.dim() == 3, \
+                    f"Invalid residual_cross_attn_text_by_layer[{layer_idx}] shape: {layer_text_memory.shape}"
+                assert layer_text_memory.shape[0] == bs, \
+                    f"residual_cross_attn_text_by_layer[{layer_idx}] batch={layer_text_memory.shape[0]} does not match decoder batch={bs}"
+                assert layer_text_memory.shape[2] == self.width, \
+                    f"residual_cross_attn_text_by_layer[{layer_idx}] width={layer_text_memory.shape[2]} does not match decoder width={self.width}"
+                layer_key = str(layer_idx)
+                if layer_key not in self.residual_cross_attn_layers or layer_key not in self.residual_cross_attn_projs:
+                    raise ValueError(f"Residual cross-attn module for decoder layer {layer_idx} is not configured.")
+                residual_cross_attn_lnd_by_layer[layer_idx] = layer_text_memory.to(
+                    device=x.device, dtype=x.dtype).permute(1, 0, 2)
+            residual_cross_attn_layer_set = set(residual_cross_attn_lnd_by_layer.keys())
+            if text_injection_layers is not None:
+                expected_layers = {int(layer_idx) for layer_idx in text_injection_layers}
+                missing_layers = sorted(layer_idx for layer_idx in expected_layers
+                                        if layer_idx not in residual_cross_attn_lnd_by_layer)
+                if missing_layers:
+                    raise ValueError(f"residual_cross_attn_text_by_layer is missing decoder layers: {missing_layers}")
+                residual_cross_attn_layer_set = expected_layers
+            if text_key_padding_mask is not None:
+                text_memory_key_padding_mask = text_key_padding_mask.to(device=x.device, dtype=torch.bool)
+                first_text_memory = next(iter(residual_cross_attn_text_by_layer.values()))
+                assert text_memory_key_padding_mask.shape == first_text_memory.shape[:2], \
+                    f"text_key_padding_mask shape={text_memory_key_padding_mask.shape}, expected={first_text_memory.shape[:2]}"
+
         residual_lnd_by_layer = None
         if residual_text_by_layer is not None:
             if residual_gate is None:
@@ -1810,7 +1881,11 @@ class ViTDecoder(nn.Module):
                 visual_memory_mask_actual_ratio = visual_memory_mask.float().mean()
 
         text_recon_stats = {}
-        if (text_memory_lnd is not None or text_memory_lnd_by_layer is not None) and return_text_recon_stats:
+        if (
+            text_memory_lnd is not None
+            or text_memory_lnd_by_layer is not None
+            or residual_cross_attn_lnd_by_layer is not None
+        ) and return_text_recon_stats:
             visual_memory_for_norm = x
             if visual_type_embedding is not None:
                 visual_memory_for_norm = visual_memory_for_norm + visual_type_embedding.to(
@@ -1828,6 +1903,10 @@ class ViTDecoder(nn.Module):
             layer_pos_embed = pos_embed
             layer_memory_key_padding_mask = None
             inject_text = text_memory_lnd_by_layer is not None and i in text_injection_layer_set
+            residual_cross_attn_active = (
+                residual_cross_attn_lnd_by_layer is not None
+                and i in residual_cross_attn_layer_set
+            )
             if inject_text:
                 layer_visual_memory = x
                 if visual_memory_mask is not None:
@@ -1853,6 +1932,12 @@ class ViTDecoder(nn.Module):
                     text_padding = text_memory_key_padding_mask
                 layer_memory_key_padding_mask = torch.cat(
                     [image_key_padding_mask, text_padding], dim=1)
+            elif residual_cross_attn_active and visual_memory_mask is not None:
+                layer_memory = torch.where(
+                    visual_memory_mask,
+                    visual_mask_token.to(device=x.device, dtype=x.dtype),
+                    x,
+                )
             elif text_memory_lnd is not None and return_cross_attn_weights:
                 layer_memory = torch.cat([x, text_memory_lnd], dim=0)
                 layer_pos_embed = torch.cat([pos_embed, torch.zeros_like(text_memory_lnd)], dim=0)
@@ -1878,6 +1963,32 @@ class ViTDecoder(nn.Module):
                     latent_tokens, layer_memory, pos=layer_pos_embed, query_pos=query_pos,
                     memory_key_padding_mask=layer_memory_key_padding_mask,
                     **adaln_kwargs)
+            if residual_cross_attn_active:
+                layer_key = str(i)
+                layer_text_memory = residual_cross_attn_lnd_by_layer[i]
+                text_context, text_attn = self.residual_cross_attn_layers[layer_key](
+                    query=latent_tokens,
+                    key=layer_text_memory,
+                    value=layer_text_memory,
+                    key_padding_mask=text_memory_key_padding_mask,
+                    need_weights=return_text_recon_stats,
+                    average_attn_weights=False,
+                )
+                projected_context = self.residual_cross_attn_projs[layer_key](text_context)
+                latent_tokens = latent_tokens + projected_context
+                if return_text_recon_stats:
+                    text_recon_stats.setdefault("residual_cross_attn_context_norms", []).append(
+                        text_context.float().norm(dim=-1).mean())
+                    text_recon_stats.setdefault("residual_cross_attn_proj_norms", []).append(
+                        projected_context.float().norm(dim=-1).mean())
+                    entropy, top1 = self._residual_cross_attn_weight_stats(
+                        text_attn,
+                        text_memory_key_padding_mask,
+                    )
+                    if entropy is not None:
+                        text_recon_stats.setdefault("residual_cross_attn_attn_entropy_norms", []).append(entropy)
+                    if top1 is not None:
+                        text_recon_stats.setdefault("residual_cross_attn_attn_top1s", []).append(top1)
             if residual_lnd_by_layer is not None and i in residual_lnd_by_layer:
                 residual = residual_lnd_by_layer[i]
                 assert residual.shape[1] == latent_tokens.shape[1], (
@@ -1901,6 +2012,20 @@ class ViTDecoder(nn.Module):
                 #     f"current latent_tokens.shape={latent_tokens.shape}"\
                 #     f"current x.shape={x.shape}"
                 return None, inner_feat
+
+        if return_text_recon_stats:
+            if "residual_cross_attn_context_norms" in text_recon_stats:
+                text_recon_stats["residual_cross_attn_context_norm_mean"] = torch.stack(
+                    text_recon_stats.pop("residual_cross_attn_context_norms")).mean()
+            if "residual_cross_attn_proj_norms" in text_recon_stats:
+                text_recon_stats["residual_cross_attn_proj_norm_mean"] = torch.stack(
+                    text_recon_stats.pop("residual_cross_attn_proj_norms")).mean()
+            if "residual_cross_attn_attn_entropy_norms" in text_recon_stats:
+                text_recon_stats["residual_cross_attn_attn_entropy_norm_mean"] = torch.stack(
+                    text_recon_stats.pop("residual_cross_attn_attn_entropy_norms")).mean()
+            if "residual_cross_attn_attn_top1s" in text_recon_stats:
+                text_recon_stats["residual_cross_attn_attn_top1_mean"] = torch.stack(
+                    text_recon_stats.pop("residual_cross_attn_attn_top1s")).mean()
 
         latent_tokens = self.ln_post(latent_tokens)
         # L N D -> N D H W
