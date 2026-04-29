@@ -2269,3 +2269,76 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - eval / val 下 mask actual ratio 为 `0`
   - residual cross-attn stats 出现
   - 无 NaN/OOM，checkpoint 正常保存。
+
+## 2026-04-29 8 卡服务器数据迁移口径
+
+## 结论
+- 新服务器只用于当前 Stage-1 pilot 时，不搬全量 TextAtlas5M。
+- 第一批只搬当前固定 5-subset 的本地 materialized 数据和训练必要 manifest：
+  - `textatlas_stage1_fixed_310k/images/train`
+  - `textatlas_stage1_fixed_310k/images/val`
+  - `textatlas_stage1_fixed_310k/manifest`
+- 当前实际使用的是 `textatlas_stage1_fixed_310k`：`300000` train + `10000` val；早期 `240k` 口径不作为迁移目标。
+- hold-out / `manifest_holdout_eval` 不作为第一批必搬内容；除非后续要马上做 hold-out eval。
+- parquet cache、HF cache、旧实验 outputs、checkpoint 历史输出默认不搬；除非确认目标机无法稳定重新下载，才按需补传最小 cache。
+
+## 操作原则
+- 先在源机 `du -sh` 估算上述目录体量。
+- 再用 `rsync --dry-run --stats` 预估真实传输文件数和字节数。
+- 确认体量后再执行正式 `rsync -aH --info=progress2`。
+- baseline 和 HR 必须共用同一份迁移后的 train/val manifest，避免数据差异影响对比。
+
+## 2026-04-29 单样本 fixed block mask / oracle mask 机制验证实现
+
+## 执行范围
+- 目标：验证 `residual_cross_attn_visual_mask` 在单张图上是否具备利用 language feature 的能力。
+- 本次只实现 probe 所需的 mask 机制和诊断日志：
+  - block random visual memory mask；
+  - fixed mask pattern；
+  - eval/validation 可选继续启用 mask；
+  - masked / unmasked region MSE 诊断。
+- 未实现 cosine schedule、bbox/text-region mask、AdaLN scale，也未改变已有默认 `token_random` mask 行为。
+
+## 新增配置
+- `configs/vq/VQ_BL256_dino_disc_text_recon_residual_cross_attn_single_sample_probe_r030_block_v1.yaml`
+  - `mode=residual_cross_attn_visual_mask`
+  - `visual_memory_mask.ratio=0.3`
+  - `visual_memory_mask.strategy=block_random`
+  - `visual_memory_mask.block_size=2`
+  - `visual_memory_mask.fixed_pattern=True`
+  - `visual_memory_mask.apply_in_eval=True`
+- `configs/vq/VQ_BL256_dino_disc_text_recon_residual_cross_attn_single_sample_oracle_r070_block_v1.yaml`
+  - `visual_memory_mask.ratio=0.7`
+  - `visual_memory_mask.block_size=4`
+  - 仅用于 oracle-like 单样本机制验证，不作为正式训练默认设置。
+
+## 代码行为
+- `token_random` 仍是默认策略，旧 config 不加 `strategy` 时行为保持不变。
+- `block_random` 要求 latent token 数是平方数；当前单图 probe 使用 256 tokens，对应 `16x16` grid。
+- 当 `block_size` 能整除 grid 边长时，优先采样不重叠 block 网格，使 actual mask ratio 更接近配置值。
+- `fixed_pattern=True` 时，同一个 seed 生成同一块 mask pattern，correct / empty / shuffled eval 可共享同一视觉缺失区域。
+- `apply_in_eval=True` 只由 probe config 打开；普通 eval 仍默认关闭 actual mask。
+- 训练循环从 decoder stats 中取 `_visual_memory_mask_grid`，计算：
+  - `masked_region_mse`
+  - `unmasked_region_mse`
+  - `masked_unmasked_mse_ratio`
+  这些指标只用于诊断，不参与 loss。
+
+## 检查结果
+- `python3 -m py_compile tokenizer/tokenizer_image/vq/vq_vit_model.py tokenizer/tokenizer_image/vq/blocks.py tokenizer/tokenizer_image/vq/vq_train.py tokenizer/tokenizer_image/vq/vq_loss.py scripts/stage1/evaluate_textatlas_reconstruction.py`：通过。
+- Ruby YAML parse 两个新增 config：通过。
+- `git diff --check` 限定本次相关文件：通过。
+
+## 服务器建议命令
+- 先生成 local T5 config，再用 `scripts/stage1/single_image_debug/run_single_image_overfit.sh` 跑：
+  - `dense_r030_block_500step`
+  - `dense_r070_oracle_block_500step`
+- 推荐参数：
+  - `TAG=dense`
+  - `ITERS=500`
+  - `LOG_EVERY=10`
+  - `VAL_EVERY=50`
+  - `CKPT_EVERY=500`
+- 结论优先级：
+  - 如果 `r070` 下 correct 明显优于 empty / shuffled，说明 text cross-attn 路径机制上可用；
+  - 如果 `r070` 仍无差异，应优先改 text branch scale / gate 或融合位置，而不是继续提高 mask ratio。

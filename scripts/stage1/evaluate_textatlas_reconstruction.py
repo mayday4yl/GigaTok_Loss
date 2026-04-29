@@ -340,6 +340,11 @@ def validate_text_recon_config(config: Mapping[str, Any]) -> None:
         ratio = float(visual_memory_mask_cfg.get("ratio", 0.0))
         if ratio < 0.0 or ratio >= 1.0:
             raise ValueError(f"text_recon_conditioning.visual_memory_mask.ratio must be in [0, 1), got {ratio}")
+        strategy = str(visual_memory_mask_cfg.get("strategy", "token_random"))
+        if strategy not in {"token_random", "block_random"}:
+            raise NotImplementedError("Only visual_memory_mask.strategy=token_random or block_random is implemented.")
+        if int(visual_memory_mask_cfg.get("block_size", 1)) <= 0:
+            raise ValueError("text_recon_conditioning.visual_memory_mask.block_size must be positive.")
     if mode != "residual_head" and not text_recon_cfg.get("layers", None) and not text_recon_cfg.get("layer_pairs", None):
         raise ValueError("text_recon_conditioning.enabled=True requires non-empty layers or layer_pairs.")
     for block_name in ("residual",):
@@ -361,6 +366,13 @@ class TextContext:
             text_injection_layers: Optional[Sequence[int]],
             text_recon_mode: Optional[str],
             head_text_layer: Optional[int],
+            visual_memory_mask_enabled: bool,
+            visual_memory_mask_ratio: float,
+            visual_memory_mask_strategy: str,
+            visual_memory_mask_block_size: int,
+            visual_memory_mask_fixed_pattern: bool,
+            visual_memory_mask_seed: int,
+            visual_memory_mask_apply_in_eval: bool,
             max_length: int,
             pair_index: int,
     ) -> None:
@@ -371,6 +383,13 @@ class TextContext:
         self.text_injection_layers = list(text_injection_layers or [])
         self.text_recon_mode = text_recon_mode
         self.head_text_layer = head_text_layer
+        self.visual_memory_mask_enabled = visual_memory_mask_enabled
+        self.visual_memory_mask_ratio = visual_memory_mask_ratio
+        self.visual_memory_mask_strategy = visual_memory_mask_strategy
+        self.visual_memory_mask_block_size = visual_memory_mask_block_size
+        self.visual_memory_mask_fixed_pattern = visual_memory_mask_fixed_pattern
+        self.visual_memory_mask_seed = visual_memory_mask_seed
+        self.visual_memory_mask_apply_in_eval = visual_memory_mask_apply_in_eval
         self.max_length = max_length
         if pair_index < 0 or pair_index >= len(self.layer_pairs):
             raise ValueError(f"--text-layer-pair-index={pair_index} out of range for {len(self.layer_pairs)} pairs")
@@ -397,6 +416,7 @@ def load_tokenizer_model(
         text_recon_cfg = config.get("text_recon_conditioning", {})
         text_recon_on = bool(text_recon_cfg.get("enabled", False))
         text_recon_mode = str(text_recon_cfg.get("mode", "concat_memory"))
+        visual_memory_mask_cfg = text_recon_cfg.get("visual_memory_mask", {})
         text_gate_cfg = text_recon_cfg.get("text_gate", {}) if text_recon_on else {}
         residual_head_cfg = text_recon_cfg.get("residual_head", {}) if text_recon_on else {}
         residual_pooled_cfg = text_recon_cfg.get("residual_pooled_layer", {}) if text_recon_on else {}
@@ -457,9 +477,11 @@ def load_tokenizer_model(
         text_injection_layers = None
         text_recon_mode = None
         head_text_layer = None
+        visual_memory_mask_cfg = {}
         if bool(config.get("text_recon_conditioning", {}).get("enabled", False)):
             text_recon_cfg = config.get("text_recon_conditioning", {})
             text_recon_mode = str(text_recon_cfg.get("mode", "concat_memory"))
+            visual_memory_mask_cfg = text_recon_cfg.get("visual_memory_mask", {})
             if text_recon_mode == "residual_head":
                 head_text_layer = int(text_recon_cfg.get("head_text_layer", 15))
                 if text_num_layers is not None and (head_text_layer < 0 or head_text_layer >= text_num_layers):
@@ -478,6 +500,13 @@ def load_tokenizer_model(
             text_injection_layers=text_injection_layers,
             text_recon_mode=text_recon_mode,
             head_text_layer=head_text_layer,
+            visual_memory_mask_enabled=bool(visual_memory_mask_cfg.get("enabled", False)),
+            visual_memory_mask_ratio=float(visual_memory_mask_cfg.get("ratio", 0.0)),
+            visual_memory_mask_strategy=str(visual_memory_mask_cfg.get("strategy", "token_random")),
+            visual_memory_mask_block_size=int(visual_memory_mask_cfg.get("block_size", 1)),
+            visual_memory_mask_fixed_pattern=bool(visual_memory_mask_cfg.get("fixed_pattern", False)),
+            visual_memory_mask_seed=int(visual_memory_mask_cfg.get("seed", 0)),
+            visual_memory_mask_apply_in_eval=bool(visual_memory_mask_cfg.get("apply_in_eval", False)),
             max_length=int(config.get("text_conditioning", {}).get("max_length", 128)),
             pair_index=text_layer_pair_index,
         )
@@ -561,6 +590,13 @@ def reconstruct_batch(
                 decoder_head_text_features=decoder_head_text_features,
                 decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                 text_injection_layers=text_context.text_injection_layers or None,
+                visual_memory_mask_enabled=text_context.visual_memory_mask_enabled,
+                visual_memory_mask_ratio=text_context.visual_memory_mask_ratio,
+                visual_memory_mask_strategy=text_context.visual_memory_mask_strategy,
+                visual_memory_mask_block_size=text_context.visual_memory_mask_block_size,
+                visual_memory_mask_fixed_pattern=text_context.visual_memory_mask_fixed_pattern,
+                visual_memory_mask_seed=text_context.visual_memory_mask_seed,
+                visual_memory_mask_apply_in_eval=text_context.visual_memory_mask_apply_in_eval,
             )
         return outputs[0] if isinstance(outputs, (list, tuple)) else outputs
 

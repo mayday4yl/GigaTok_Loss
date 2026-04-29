@@ -858,6 +858,11 @@ class VQVitModelPlus(nn.Module):
             text_injection_layers=None,
             visual_memory_mask_enabled=False,
             visual_memory_mask_ratio=0.0,
+            visual_memory_mask_strategy="token_random",
+            visual_memory_mask_block_size=1,
+            visual_memory_mask_fixed_pattern=False,
+            visual_memory_mask_seed=0,
+            visual_memory_mask_apply_in_eval=False,
             return_text_recon_stats=False,
             ):
         quant = self.post_quant_conv(quant)
@@ -910,6 +915,11 @@ class VQVitModelPlus(nn.Module):
                     visual_mask_token=self.visual_mask_token,
                     visual_memory_mask_enabled=visual_memory_mask_enabled,
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
+                    visual_memory_mask_strategy=visual_memory_mask_strategy,
+                    visual_memory_mask_block_size=visual_memory_mask_block_size,
+                    visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
+                    visual_memory_mask_seed=visual_memory_mask_seed,
+                    visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
                     residual_text_by_layer=residual_text_by_layer,
                     residual_gate=residual_gate,
                     residual_cross_attn_text_by_layer=residual_cross_attn_text_by_layer,
@@ -931,6 +941,11 @@ class VQVitModelPlus(nn.Module):
                     visual_mask_token=self.visual_mask_token,
                     visual_memory_mask_enabled=visual_memory_mask_enabled,
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
+                    visual_memory_mask_strategy=visual_memory_mask_strategy,
+                    visual_memory_mask_block_size=visual_memory_mask_block_size,
+                    visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
+                    visual_memory_mask_seed=visual_memory_mask_seed,
+                    visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
                     residual_text_by_layer=residual_text_by_layer,
                     residual_gate=residual_gate,
                     residual_cross_attn_text_by_layer=residual_cross_attn_text_by_layer,
@@ -980,6 +995,11 @@ class VQVitModelPlus(nn.Module):
                     visual_mask_token=self.visual_mask_token,
                     visual_memory_mask_enabled=visual_memory_mask_enabled,
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
+                    visual_memory_mask_strategy=visual_memory_mask_strategy,
+                    visual_memory_mask_block_size=visual_memory_mask_block_size,
+                    visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
+                    visual_memory_mask_seed=visual_memory_mask_seed,
+                    visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
                     residual_text_by_layer=residual_text_by_layer,
                     residual_gate=residual_gate,
                     residual_cross_attn_text_by_layer=residual_cross_attn_text_by_layer,
@@ -1000,6 +1020,11 @@ class VQVitModelPlus(nn.Module):
                     visual_mask_token=self.visual_mask_token,
                     visual_memory_mask_enabled=visual_memory_mask_enabled,
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
+                    visual_memory_mask_strategy=visual_memory_mask_strategy,
+                    visual_memory_mask_block_size=visual_memory_mask_block_size,
+                    visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
+                    visual_memory_mask_seed=visual_memory_mask_seed,
+                    visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
                     residual_text_by_layer=residual_text_by_layer,
                     residual_gate=residual_gate,
                     residual_cross_attn_text_by_layer=residual_cross_attn_text_by_layer,
@@ -1056,6 +1081,11 @@ class VQVitModelPlus(nn.Module):
             text_injection_layers=None,
             visual_memory_mask_enabled=False,
             visual_memory_mask_ratio=0.0,
+            visual_memory_mask_strategy="token_random",
+            visual_memory_mask_block_size=1,
+            visual_memory_mask_fixed_pattern=False,
+            visual_memory_mask_seed=0,
+            visual_memory_mask_apply_in_eval=False,
             return_text_recon_stats=False,
             ):
         # Text-HR v2: selected_decoder_layer / decoder_text_features keep the
@@ -1085,6 +1115,11 @@ class VQVitModelPlus(nn.Module):
                         text_injection_layers=text_injection_layers,
                         visual_memory_mask_enabled=visual_memory_mask_enabled,
                         visual_memory_mask_ratio=visual_memory_mask_ratio,
+                        visual_memory_mask_strategy=visual_memory_mask_strategy,
+                        visual_memory_mask_block_size=visual_memory_mask_block_size,
+                        visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
+                        visual_memory_mask_seed=visual_memory_mask_seed,
+                        visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
                         return_text_recon_stats=return_text_recon_stats,
                     )
                     if return_text_recon_stats:
@@ -1100,6 +1135,11 @@ class VQVitModelPlus(nn.Module):
                         text_injection_layers=text_injection_layers,
                         visual_memory_mask_enabled=visual_memory_mask_enabled,
                         visual_memory_mask_ratio=visual_memory_mask_ratio,
+                        visual_memory_mask_strategy=visual_memory_mask_strategy,
+                        visual_memory_mask_block_size=visual_memory_mask_block_size,
+                        visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
+                        visual_memory_mask_seed=visual_memory_mask_seed,
+                        visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
                         return_text_recon_stats=return_text_recon_stats,
                     )
                     if return_text_recon_stats:
@@ -1120,6 +1160,11 @@ class VQVitModelPlus(nn.Module):
                         text_injection_layers=text_injection_layers,
                         visual_memory_mask_enabled=visual_memory_mask_enabled,
                         visual_memory_mask_ratio=visual_memory_mask_ratio,
+                        visual_memory_mask_strategy=visual_memory_mask_strategy,
+                        visual_memory_mask_block_size=visual_memory_mask_block_size,
+                        visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
+                        visual_memory_mask_seed=visual_memory_mask_seed,
+                        visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
                         return_text_recon_stats=return_text_recon_stats,
                     )
                     if return_text_recon_stats:
@@ -1136,6 +1181,11 @@ class VQVitModelPlus(nn.Module):
                         text_injection_layers=text_injection_layers,
                         visual_memory_mask_enabled=visual_memory_mask_enabled,
                         visual_memory_mask_ratio=visual_memory_mask_ratio,
+                        visual_memory_mask_strategy=visual_memory_mask_strategy,
+                        visual_memory_mask_block_size=visual_memory_mask_block_size,
+                        visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
+                        visual_memory_mask_seed=visual_memory_mask_seed,
+                        visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
                         return_text_recon_stats=return_text_recon_stats,
                     )
                     if return_text_recon_stats:
@@ -1155,6 +1205,11 @@ class VQVitModelPlus(nn.Module):
                     text_injection_layers=text_injection_layers,
                     visual_memory_mask_enabled=visual_memory_mask_enabled,
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
+                    visual_memory_mask_strategy=visual_memory_mask_strategy,
+                    visual_memory_mask_block_size=visual_memory_mask_block_size,
+                    visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
+                    visual_memory_mask_seed=visual_memory_mask_seed,
+                    visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -1170,6 +1225,11 @@ class VQVitModelPlus(nn.Module):
                     text_injection_layers=text_injection_layers,
                     visual_memory_mask_enabled=visual_memory_mask_enabled,
                     visual_memory_mask_ratio=visual_memory_mask_ratio,
+                    visual_memory_mask_strategy=visual_memory_mask_strategy,
+                    visual_memory_mask_block_size=visual_memory_mask_block_size,
+                    visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
+                    visual_memory_mask_seed=visual_memory_mask_seed,
+                    visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:

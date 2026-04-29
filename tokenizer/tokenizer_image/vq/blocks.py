@@ -1659,6 +1659,70 @@ class ViTDecoder(nn.Module):
         top1_mean = torch.stack(top1_values).mean()
         return entropy_mean.to(device=attn_weights.device), top1_mean.to(device=attn_weights.device)
 
+    @staticmethod
+    def _sample_visual_memory_mask(
+            selected_latent_tokens,
+            batch_size,
+            device,
+            ratio,
+            strategy="token_random",
+            block_size=1,
+            fixed_pattern=False,
+            seed=0):
+        if ratio <= 0.0:
+            return None
+        strategy = str(strategy)
+        if strategy == "token_random":
+            if fixed_pattern:
+                generator = torch.Generator(device="cpu")
+                generator.manual_seed(int(seed))
+                mask = torch.rand((selected_latent_tokens, 1, 1), generator=generator) < ratio
+                return mask.to(device=device).expand(-1, batch_size, -1)
+            return torch.rand((selected_latent_tokens, batch_size, 1), device=device) < ratio
+        if strategy != "block_random":
+            raise ValueError(f"Unsupported visual_memory_mask strategy: {strategy}")
+
+        side = int(round(np.sqrt(selected_latent_tokens)))
+        if side * side != selected_latent_tokens:
+            raise ValueError(
+                f"block_random visual mask requires square token grid, got {selected_latent_tokens} tokens"
+            )
+        block = int(block_size)
+        if block <= 0 or block > side:
+            raise ValueError(f"visual_memory_mask block_size must be in [1, {side}], got {block_size}")
+        tokens_per_block = block * block
+        num_blocks = max(1, int(np.ceil(float(ratio) * selected_latent_tokens / tokens_per_block)))
+        if side % block == 0:
+            rows = side // block
+            cols = side // block
+            block_stride = block
+        else:
+            rows = side - block + 1
+            cols = side - block + 1
+            block_stride = 1
+        num_candidates = rows * cols
+        num_blocks = min(num_blocks, num_candidates)
+
+        def build_one(batch_offset=0):
+            mask_2d = torch.zeros((side, side), dtype=torch.bool)
+            generator = torch.Generator(device="cpu") if fixed_pattern else None
+            if generator is not None:
+                generator.manual_seed(int(seed) + int(batch_offset))
+                perm = torch.randperm(num_candidates, generator=generator)
+            else:
+                perm = torch.randperm(num_candidates)
+            for flat_idx in perm[:num_blocks].tolist():
+                row = (flat_idx // cols) * block_stride
+                col = (flat_idx % cols) * block_stride
+                mask_2d[row:row + block, col:col + block] = True
+            return mask_2d.reshape(selected_latent_tokens)
+
+        if fixed_pattern:
+            mask_1d = build_one(0).to(device=device)
+            return mask_1d[:, None, None].expand(-1, batch_size, -1)
+        masks = [build_one(batch_idx) for batch_idx in range(batch_size)]
+        return torch.stack(masks, dim=1).unsqueeze(-1).to(device=device)
+
     
     def forward(
             self, 
@@ -1674,6 +1738,11 @@ class ViTDecoder(nn.Module):
             visual_mask_token=None,
             visual_memory_mask_enabled=False,
             visual_memory_mask_ratio=0.0,
+            visual_memory_mask_strategy="token_random",
+            visual_memory_mask_block_size=1,
+            visual_memory_mask_fixed_pattern=False,
+            visual_memory_mask_seed=0,
+            visual_memory_mask_apply_in_eval=False,
             residual_text_by_layer=None,
             residual_gate=None,
             residual_cross_attn_text_by_layer=None,
@@ -1872,11 +1941,18 @@ class ViTDecoder(nn.Module):
             ratio = float(visual_memory_mask_ratio)
             if ratio < 0.0 or ratio >= 1.0:
                 raise ValueError(f"visual_memory_mask_ratio must be in [0, 1), got {visual_memory_mask_ratio}")
-            if self.training and ratio > 0.0:
+            if (self.training or bool(visual_memory_mask_apply_in_eval)) and ratio > 0.0:
                 if visual_mask_token is None:
                     raise RuntimeError("visual_mask_token is required when visual memory mask is enabled.")
-                visual_memory_mask = (
-                    torch.rand((selected_latent_tokens, bs, 1), device=x.device) < ratio
+                visual_memory_mask = self._sample_visual_memory_mask(
+                    selected_latent_tokens=selected_latent_tokens,
+                    batch_size=bs,
+                    device=x.device,
+                    ratio=ratio,
+                    strategy=visual_memory_mask_strategy,
+                    block_size=visual_memory_mask_block_size,
+                    fixed_pattern=visual_memory_mask_fixed_pattern,
+                    seed=visual_memory_mask_seed,
                 )
                 visual_memory_mask_actual_ratio = visual_memory_mask.float().mean()
 
@@ -1894,6 +1970,17 @@ class ViTDecoder(nn.Module):
             text_recon_stats["visual_memory_mask_ratio"] = x.new_tensor(
                 float(visual_memory_mask_ratio) if visual_memory_mask_enabled else 0.0)
             text_recon_stats["visual_memory_mask_actual_ratio"] = visual_memory_mask_actual_ratio
+            text_recon_stats["visual_memory_mask_block_size"] = x.new_tensor(
+                float(visual_memory_mask_block_size if visual_memory_mask_enabled else 0))
+            text_recon_stats["visual_memory_mask_fixed_pattern"] = x.new_tensor(
+                1.0 if visual_memory_mask_fixed_pattern and visual_memory_mask_enabled else 0.0)
+            text_recon_stats["visual_memory_mask_apply_in_eval"] = x.new_tensor(
+                1.0 if visual_memory_mask_apply_in_eval and visual_memory_mask_enabled else 0.0)
+            if visual_memory_mask is not None:
+                side = int(round(np.sqrt(selected_latent_tokens)))
+                if side * side == selected_latent_tokens:
+                    text_recon_stats["_visual_memory_mask_grid"] = visual_memory_mask.detach().permute(
+                        1, 2, 0).reshape(bs, 1, side, side)
 
         selected_cross_attn_weights = None
         for i in range(self.num_layers):

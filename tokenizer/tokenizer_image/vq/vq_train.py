@@ -209,6 +209,13 @@ def compute_reconstruction_metrics(
         text_injection_layers=None,
         text_recon_mode=None,
         text_recon_head_text_layer=None,
+        visual_memory_mask_enabled=False,
+        visual_memory_mask_ratio=0.0,
+        visual_memory_mask_strategy="token_random",
+        visual_memory_mask_block_size=1,
+        visual_memory_mask_fixed_pattern=False,
+        visual_memory_mask_seed=0,
+        visual_memory_mask_apply_in_eval=False,
         text_max_length=None,
         mixed_precision_dtype=None,
 ):
@@ -293,6 +300,13 @@ def compute_reconstruction_metrics(
                     decoder_head_text_features=decoder_head_text_features,
                     decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                     text_injection_layers=text_injection_layers,
+                    visual_memory_mask_enabled=visual_memory_mask_enabled,
+                    visual_memory_mask_ratio=visual_memory_mask_ratio,
+                    visual_memory_mask_strategy=visual_memory_mask_strategy,
+                    visual_memory_mask_block_size=visual_memory_mask_block_size,
+                    visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
+                    visual_memory_mask_seed=visual_memory_mask_seed,
+                    visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
                 )
             recons = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
             diff = (recons.float() - imgs.float()) * 0.5
@@ -496,6 +510,11 @@ def main(args):
     visual_memory_mask_cfg = text_recon_cfg.get("visual_memory_mask", {})
     visual_memory_mask_enabled = bool(visual_memory_mask_cfg.get("enabled", False))
     visual_memory_mask_ratio = float(visual_memory_mask_cfg.get("ratio", 0.0))
+    visual_memory_mask_strategy = str(visual_memory_mask_cfg.get("strategy", "token_random"))
+    visual_memory_mask_block_size = int(visual_memory_mask_cfg.get("block_size", 1))
+    visual_memory_mask_fixed_pattern = bool(visual_memory_mask_cfg.get("fixed_pattern", False))
+    visual_memory_mask_seed = int(visual_memory_mask_cfg.get("seed", 0))
+    visual_memory_mask_apply_in_eval = bool(visual_memory_mask_cfg.get("apply_in_eval", False))
     if text_recon_on and not text_conditioning_on:
         raise ValueError("text_recon_conditioning.enabled requires text_conditioning.enabled=True.")
     if text_hr_on and not text_conditioning_on:
@@ -543,6 +562,15 @@ def main(args):
                 raise ValueError(
                     f"text_recon_conditioning.visual_memory_mask.ratio must be in [0, 1), "
                     f"got {visual_memory_mask_ratio}"
+                )
+            if visual_memory_mask_strategy not in {"token_random", "block_random"}:
+                raise NotImplementedError(
+                    "Only visual_memory_mask.strategy=token_random or block_random is implemented."
+                )
+            if visual_memory_mask_block_size <= 0:
+                raise ValueError(
+                    f"text_recon_conditioning.visual_memory_mask.block_size must be positive, "
+                    f"got {visual_memory_mask_block_size}"
                 )
         for block_name in ("residual",):
             block_cfg = text_recon_cfg.get(block_name, {})
@@ -1194,7 +1222,11 @@ def main(args):
             f"text_injection_layers={text_injection_layers}, text_recon_layer_pairs={text_recon_layer_pairs}, "
             f"head_text_layer={text_recon_head_text_layer}, "
             f"visual_memory_mask_enabled={visual_memory_mask_enabled}, "
-            f"visual_memory_mask_ratio={visual_memory_mask_ratio}"
+            f"visual_memory_mask_ratio={visual_memory_mask_ratio}, "
+            f"visual_memory_mask_strategy={visual_memory_mask_strategy}, "
+            f"visual_memory_mask_block_size={visual_memory_mask_block_size}, "
+            f"visual_memory_mask_fixed_pattern={visual_memory_mask_fixed_pattern}, "
+            f"visual_memory_mask_apply_in_eval={visual_memory_mask_apply_in_eval}"
         )
     if args.compile:
         logger.info("compiling the model... (may take several minutes)")
@@ -1469,6 +1501,11 @@ def main(args):
                         text_injection_layers=text_injection_layers if text_recon_on else None,
                         visual_memory_mask_enabled=text_recon_on and visual_memory_mask_enabled,
                         visual_memory_mask_ratio=visual_memory_mask_ratio,
+                        visual_memory_mask_strategy=visual_memory_mask_strategy,
+                        visual_memory_mask_block_size=visual_memory_mask_block_size,
+                        visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
+                        visual_memory_mask_seed=visual_memory_mask_seed,
+                        visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
                         return_text_recon_stats=text_recon_on,
                     )
                     if selected_decoder_layer is not None:
@@ -1502,6 +1539,11 @@ def main(args):
                         text_injection_layers=text_injection_layers if text_recon_on else None,
                         visual_memory_mask_enabled=text_recon_on and visual_memory_mask_enabled,
                         visual_memory_mask_ratio=visual_memory_mask_ratio,
+                        visual_memory_mask_strategy=visual_memory_mask_strategy,
+                        visual_memory_mask_block_size=visual_memory_mask_block_size,
+                        visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
+                        visual_memory_mask_seed=visual_memory_mask_seed,
+                        visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
                         return_text_recon_stats=text_recon_on,
                     )
                     if selected_decoder_layer is not None:
@@ -1518,6 +1560,27 @@ def main(args):
                             recons_imgs, inter_loss_set = vq_outputs
                         hr_attn_weights = None
                     inner_feat = None
+                mask_grid = None
+                if text_recon_stats:
+                    mask_grid = text_recon_stats.pop("_visual_memory_mask_grid", None)
+                if mask_grid is not None:
+                    recon_for_stats = recons_imgs[0] if isinstance(recons_imgs, (list, tuple)) else recons_imgs
+                    mask_img = F.interpolate(
+                        mask_grid.to(device=imgs.device, dtype=torch.float32),
+                        size=imgs.shape[-2:],
+                        mode="nearest",
+                    )
+                    pixel_mse = (recon_for_stats.float() - imgs.float()).pow(2).mean(dim=1, keepdim=True)
+                    masked_denom = mask_img.sum().clamp_min(1.0)
+                    unmasked = 1.0 - mask_img
+                    unmasked_denom = unmasked.sum().clamp_min(1.0)
+                    masked_mse = (pixel_mse * mask_img).sum() / masked_denom
+                    unmasked_mse = (pixel_mse * unmasked).sum() / unmasked_denom
+                    text_recon_stats["masked_region_mse"] = masked_mse.detach()
+                    text_recon_stats["unmasked_region_mse"] = unmasked_mse.detach()
+                    text_recon_stats["masked_unmasked_mse_ratio"] = (
+                        masked_mse / unmasked_mse.clamp_min(1e-8)
+                    ).detach()
                 loss_gen = vq_loss(inter_loss_set, imgs, recons_imgs, exp_dir=exp_dir, optimizer_idx=0, global_step=train_steps+1, 
                                    last_layer=None,
                                    logger=logger, log_every=args.log_every, ckpt_every=args.ckpt_every,
@@ -1649,6 +1712,13 @@ def main(args):
                     text_injection_layers=text_injection_layers if text_recon_on else None,
                     text_recon_mode=text_recon_mode if text_recon_on else None,
                     text_recon_head_text_layer=text_recon_head_text_layer if text_recon_on else None,
+                    visual_memory_mask_enabled=text_recon_on and visual_memory_mask_enabled,
+                    visual_memory_mask_ratio=visual_memory_mask_ratio,
+                    visual_memory_mask_strategy=visual_memory_mask_strategy,
+                    visual_memory_mask_block_size=visual_memory_mask_block_size,
+                    visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
+                    visual_memory_mask_seed=visual_memory_mask_seed,
+                    visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
                     text_max_length=text_max_length if text_conditioning_on else None,
                     mixed_precision_dtype=ptdtype,
                 )
