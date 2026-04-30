@@ -2342,3 +2342,76 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - 结论优先级：
   - 如果 `r070` 下 correct 明显优于 empty / shuffled，说明 text cross-attn 路径机制上可用；
   - 如果 `r070` 仍无差异，应优先改 text branch scale / gate 或融合位置，而不是继续提高 mask ratio。
+
+## 2026-04-30 Glyph-ByT5 text encoder backend 实现
+
+## 执行范围
+- 目标：在不改现有 reconstruction mode 的前提下，把 text feature backend 从 T5 可切换到 Glyph-ByT5。
+- 本次只接入 text encoder / tokenizer backend 和两个单样本 probe config：
+  - `residual_cross_attn_visual_mask + r030 block`
+  - `residual_cross_attn_visual_mask + r070 oracle block`
+- 未改变现有 T5 config、HR loss、AR、数据集 pipeline，也未实现 bbox/text-region mask。
+
+## 新增代码
+- `tokenizer/tokenizer_image/vq/glyph_byt5.py`
+  - 本地封装 Glyph-ByT5，不依赖 Glyph-SDXL pipeline / diffusers / UNet。
+  - 复制并精简官方 `T5EncoderBlockByT5Mapper` 所需结构：
+    - ByT5 encoder 输出 `[B,T,1472]`
+    - mapper 输出 `[B,T,2048]`
+  - 加载顺序：
+    1. `google_byt5-small` tokenizer 和 base model；
+    2. 按 Glyph-SDXL 的 color/font/multilingual 配置添加 special tokens；
+    3. `resize_token_embeddings(len(tokenizer))`；
+    4. 检查 `byt5_model.pt` 的 `embed_tokens.weight` 行数等于 tokenizer 长度；
+    5. 加载 `byt5_model.pt` 和 `byt5_mapper.pt`。
+  - 输出对训练代码表现为一个 1-layer text encoder：`hidden_states=(mapped_feature,)`。
+
+## 训练 / 评估接入
+- `tokenizer/tokenizer_image/vq/vq_train.py`
+  - 新增 `text_conditioning.encoder_backend`，默认 `t5`，旧 config 不变。
+  - `encoder_backend=glyph_byt5` 时使用 Glyph-ByT5 wrapper。
+  - 取 text layer state 改为后端无关：
+    - T5：仍使用 `hidden_states[1:]`；
+    - Glyph-ByT5：使用唯一的 mapped feature，layer index 为 `0`。
+  - 新增 Glyph token 长度诊断：
+    - `glyph_input_tokens_mean`
+    - `glyph_input_tokens_max`
+    - `glyph_truncated_count`
+    - `glyph_truncated_ratio`
+    - `glyph_max_length`
+- `scripts/stage1/evaluate_textatlas_reconstruction.py`
+  - 同步支持 Glyph-ByT5 backend，保证 reconstruction grid 走真实 Glyph text feature。
+
+## 新增配置
+- `configs/vq/VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_single_sample_probe_r030_block_v1.yaml`
+  - `encoder_backend=glyph_byt5`
+  - `max_length=1024`
+  - `layer_pairs=[[0,8],...,[0,15]]`
+  - `visual_memory_mask.ratio=0.3`
+  - `block_size=2`
+- `configs/vq/VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_single_sample_oracle_r070_block_v1.yaml`
+  - 同上，但 `visual_memory_mask.ratio=0.7`
+  - `block_size=4`
+- 两个配置都指向服务器统一模型目录：
+  - `/home/ma-user/work/GigaTok_hr/gigatok_persist/models/Glyph-SDXL-v2`
+  - `/home/ma-user/work/GigaTok_hr/gigatok_persist/models/google_byt5-small`
+
+## 已做检查
+- 本地静态检查：
+  - `python3 -m py_compile tokenizer/tokenizer_image/vq/glyph_byt5.py tokenizer/tokenizer_image/vq/vq_vit_model.py tokenizer/tokenizer_image/vq/blocks.py tokenizer/tokenizer_image/vq/vq_train.py tokenizer/tokenizer_image/vq/vq_loss.py scripts/stage1/evaluate_textatlas_reconstruction.py`
+  - 结果：通过。
+- YAML parse：
+  - 两个 Glyph probe config 均可读。
+  - `encoder_backend=glyph_byt5`、`max_length=1024`、`mode=residual_cross_attn_visual_mask`、`layer_pairs` 为 `0 -> 8..15`。
+- `git diff --check` 限定本次相关文件：通过。
+
+## 待服务器 smoke
+- 在服务器 pull 当前分支后先跑：
+  - Glyph-ByT5 checkpoint load smoke；
+  - `r030` 2-step single-image smoke；
+  - `r070` 2-step single-image smoke。
+- 重点检查：
+  - Glyph tokenizer 长度应匹配 `byt5_model.pt` 的 embedding 行数；
+  - 日志里 `glyph_truncated_ratio` 是否为 0；
+  - 如果出现截断，再考虑把 `max_length` 从 1024 提到 2048；
+  - `text_valid_tokens_mean`、`residual_cross_attn_*` stats 是否正常。

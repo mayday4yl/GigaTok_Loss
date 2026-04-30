@@ -26,6 +26,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from utils.model_init import custom_load, load_model_from_config  # noqa: E402
+from tokenizer.tokenizer_image.vq.glyph_byt5 import (  # noqa: E402
+    get_text_layer_states,
+    load_text_encoder_from_config,
+    tokenize_texts_with_stats,
+)
 
 
 try:
@@ -235,28 +240,10 @@ def text_conditioning_missing_keys(model: torch.nn.Module) -> List[str]:
 
 def load_text_encoder(config: Mapping[str, Any], device: torch.device):
     text_cfg = config.get("text_conditioning", {})
-    if not text_cfg.get("enabled", False):
+    result = load_text_encoder_from_config(text_cfg, device)
+    if result is None:
         return None, None, None, None
-
-    try:
-        from transformers import AutoTokenizer, T5EncoderModel
-    except ImportError as exc:
-        raise ImportError("text_conditioning.enabled=True requires transformers with T5EncoderModel.") from exc
-
-    encoder_name = text_cfg.get("encoder_name", "google/t5-v1_1-xl")
-    pretrained_kwargs = {
-        "cache_dir": text_cfg.get("cache_dir", None),
-        "local_files_only": bool(text_cfg.get("local_files_only", False)),
-    }
-    tokenizer = AutoTokenizer.from_pretrained(encoder_name, **pretrained_kwargs)
-    encoder = T5EncoderModel.from_pretrained(encoder_name, **pretrained_kwargs)
-    encoder.requires_grad_(False)
-    encoder.eval().to(device)
-    text_feature_dim = getattr(encoder.config, "d_model", None)
-    text_num_layers = getattr(encoder.config, "num_layers", None)
-    if text_feature_dim is None:
-        raise ValueError(f"Cannot read d_model from T5 encoder config: {encoder_name}")
-    return tokenizer, encoder, int(text_feature_dim), text_num_layers
+    return result.tokenizer, result.encoder, int(result.feature_dim), result.num_layers
 
 
 def build_layer_pairs_from_cfg(
@@ -531,15 +518,16 @@ def reconstruct_batch(
             raise ValueError("Text-conditioned reconstruction requires rendered text from --manifest-jsonl.")
 
         selected_text_layer, selected_decoder_layer = text_context.selected_pair
-        text_inputs = text_context.tokenizer(
+        text_backend = getattr(text_context.encoder, "encoder_backend", "t5")
+        text_inputs, _ = tokenize_texts_with_stats(
+            text_context.tokenizer,
             [str(text) for text in texts],
-            padding="max_length",
-            truncation=True,
             max_length=text_context.max_length,
-            return_tensors="pt",
+            device=batch.device,
+            backend=text_backend,
         )
-        input_ids = text_inputs["input_ids"].to(batch.device, non_blocking=True)
-        text_attention_mask = text_inputs["attention_mask"].to(batch.device, non_blocking=True)
+        input_ids = text_inputs["input_ids"]
+        text_attention_mask = text_inputs["attention_mask"]
         with autocast_context(device_backend, mixed_precision, dtype=ptdtype):
             text_outputs = text_context.encoder(
                 input_ids=input_ids,
@@ -547,10 +535,7 @@ def reconstruct_batch(
                 output_hidden_states=True,
                 return_dict=True,
             )
-        hidden_states = text_outputs.hidden_states
-        if hidden_states is None:
-            raise RuntimeError("T5 encoder did not return hidden_states.")
-        t5_layer_states = hidden_states[1:]
+        t5_layer_states = get_text_layer_states(text_outputs, text_backend)
         decoder_text_key_padding_mask = ~text_attention_mask.bool()
         decoder_text_features = None
         decoder_text_features_by_layer = None

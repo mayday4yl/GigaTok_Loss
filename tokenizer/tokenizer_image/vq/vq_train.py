@@ -64,6 +64,11 @@ except ImportError:
 from dataset.augmentation import random_crop_arr
 from dataset.build import build_dataset
 from tokenizer.tokenizer_image.vq.vq_loss import VQLoss
+from tokenizer.tokenizer_image.vq.glyph_byt5 import (
+    get_text_layer_states,
+    load_text_encoder_from_config,
+    tokenize_texts_with_stats,
+)
 from tokenizer.tokenizer_image.scheduler import cosine_lr, const_lr, cosine_schedule_with_warmup_v2, wsd_lr
 
 from torchvision.transforms import Normalize
@@ -242,15 +247,16 @@ def compute_reconstruction_metrics(
                 if not isinstance(text_batch, (list, tuple)):
                     raise TypeError("Text-conditioned validation requires the validation dataset to return text strings.")
 
-                text_inputs = text_tokenizer(
+                text_backend = getattr(text_encoder, "encoder_backend", "t5")
+                text_inputs, _ = tokenize_texts_with_stats(
+                    text_tokenizer,
                     [str(text) for text in text_batch],
-                    padding="max_length",
-                    truncation=True,
                     max_length=text_max_length,
-                    return_tensors="pt",
+                    device=device,
+                    backend=text_backend,
                 )
-                input_ids = text_inputs["input_ids"].to(device, non_blocking=True)
-                text_attention_mask = text_inputs["attention_mask"].to(device, non_blocking=True)
+                input_ids = text_inputs["input_ids"]
+                text_attention_mask = text_inputs["attention_mask"]
                 decoder_text_key_padding_mask = ~text_attention_mask.bool()
                 with autocast_context(args.device_backend, args.mixed_precision, dtype=mixed_precision_dtype):
                     text_outputs = text_encoder(
@@ -259,10 +265,7 @@ def compute_reconstruction_metrics(
                         output_hidden_states=True,
                         return_dict=True,
                     )
-                hidden_states = text_outputs.hidden_states
-                if hidden_states is None:
-                    raise RuntimeError("T5 encoder did not return hidden_states during validation.")
-                t5_layer_states = hidden_states[1:]
+                t5_layer_states = get_text_layer_states(text_outputs, text_backend)
                 if text_recon_mode == "residual_head":
                     head_text_layer = int(text_recon_head_text_layer)
                     if head_text_layer >= len(t5_layer_states):
@@ -795,30 +798,21 @@ def main(args):
     text_encoder = None
     text_encoder_num_layers = None
     text_feature_dim = None
+    text_encoder_backend = "t5"
     if text_conditioning_on:
-        # Text-HR v2: T5 is frozen and only provides hidden states for decoder
-        # cross-attention; gradients do not update T5.
-        if AutoTokenizer is None or T5EncoderModel is None:
-            raise ImportError("text_conditioning.enabled=True requires transformers with T5EncoderModel.")
+        # Text-HR/Text-recon: the text encoder is frozen and only provides
+        # hidden states for decoder-side conditioning.
         text_encoder_name = text_conditioning_cfg.get("encoder_name", "google/t5-v1_1-xl")
         text_cache_dir = text_conditioning_cfg.get("cache_dir", None)
         text_local_files_only = bool(text_conditioning_cfg.get("local_files_only", False))
-        pretrained_kwargs = {
-            "cache_dir": text_cache_dir,
-            "local_files_only": text_local_files_only,
-        }
-        text_tokenizer = AutoTokenizer.from_pretrained(text_encoder_name, **pretrained_kwargs)
-        text_encoder = T5EncoderModel.from_pretrained(text_encoder_name, **pretrained_kwargs)
-        text_feature_dim = getattr(text_encoder.config, "d_model", None)
-        text_encoder_num_layers = getattr(text_encoder.config, "num_layers", None)
-        if text_feature_dim is None:
-            raise ValueError(f"Cannot read d_model from T5 encoder config: {text_encoder_name}")
-        if text_conditioning_cfg.get("freeze", True):
-            text_encoder.requires_grad_(False)
-        text_encoder.eval()
-        text_encoder = text_encoder.to(device)
+        text_encoder_result = load_text_encoder_from_config(text_conditioning_cfg, device)
+        text_tokenizer = text_encoder_result.tokenizer
+        text_encoder = text_encoder_result.encoder
+        text_feature_dim = text_encoder_result.feature_dim
+        text_encoder_num_layers = text_encoder_result.num_layers
+        text_encoder_backend = text_encoder_result.backend
         logger.info(
-            f"Text conditioning enabled: encoder={text_encoder_name}, "
+            f"Text conditioning enabled: backend={text_encoder_backend}, encoder={text_encoder_name}, "
             f"d_model={text_feature_dim}, num_layers={text_encoder_num_layers}, "
             f"max_length={text_max_length}, cache_dir={text_cache_dir}, "
             f"local_files_only={text_local_files_only}"
@@ -1377,15 +1371,15 @@ def main(args):
                         "text_conditioning.enabled=True requires the dataset to return a batch of text strings."
                     )
                 texts = [str(text) for text in y]
-                text_inputs = text_tokenizer(
+                text_inputs, glyph_token_stats = tokenize_texts_with_stats(
+                    text_tokenizer,
                     texts,
-                    padding="max_length",
-                    truncation=True,
                     max_length=text_max_length,
-                    return_tensors="pt",
+                    device=device,
+                    backend=text_encoder_backend,
                 )
-                input_ids = text_inputs["input_ids"].to(device, non_blocking=True)
-                text_attention_mask = text_inputs["attention_mask"].to(device, non_blocking=True)
+                input_ids = text_inputs["input_ids"]
+                text_attention_mask = text_inputs["attention_mask"]
                 decoder_text_key_padding_mask = ~text_attention_mask.bool()
                 with torch.no_grad():
                     with autocast_context(args.device_backend, args.mixed_precision, dtype=ptdtype):
@@ -1395,10 +1389,7 @@ def main(args):
                             output_hidden_states=True,
                             return_dict=True,
                         )
-                hidden_states = text_outputs.hidden_states
-                if hidden_states is None:
-                    raise RuntimeError("T5 encoder did not return hidden_states.")
-                t5_layer_states = hidden_states[1:]
+                t5_layer_states = get_text_layer_states(text_outputs, text_encoder_backend)
                 if text_recon_on:
                     if text_recon_mode == "residual_head":
                         if text_recon_head_text_layer >= len(t5_layer_states):
@@ -1432,6 +1423,7 @@ def main(args):
                             float(sum(1 for text in texts if not str(text).strip())), device=device),
                         "text_valid_tokens_mean": text_attention_mask.float().sum(dim=1).mean(),
                     }
+                    text_recon_stats.update(glyph_token_stats)
             elif hr_on:
                 if hr_random_one_layer:
                     layer_rng = random.Random(train_steps + 1 + args.global_seed)
