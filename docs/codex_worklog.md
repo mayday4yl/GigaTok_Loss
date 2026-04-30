@@ -2449,3 +2449,41 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - Glyph-ByT5 文件、special tokens、mapper、训练 forward 均已跑通。
   - 当前 dense 单图文本长度 `409`，`max_length=1024` 无截断；暂不需要提升到 2048。
   - 下一步可以跑 500-step 单图机制验证，并做 correct / empty / wrong 对比。
+
+## 500-step 单图机制验证结果
+- 运行：
+  - `dense_glyph_r030_block_500step`
+  - `dense_glyph_r070_oracle_block_500step`
+- 两个 run 都正常保存 `last.pt`。
+- r030 final：
+  - Val MSE：`0.001342`
+  - Val PSNR：`28.7240`
+  - `glyph_truncated_ratio=0`
+  - `visual_memory_mask_actual_ratio=0.3125`
+  - `masked_region_mse≈5.12e-03`
+  - `residual_cross_attn_proj_norm_mean≈6.93`
+- r070 final：
+  - Val MSE：`0.001027`
+  - Val PSNR：`29.8858`
+  - `glyph_truncated_ratio=0`
+  - `visual_memory_mask_actual_ratio=0.7500`
+  - `masked_region_mse≈4.31e-03`
+  - `residual_cross_attn_proj_norm_mean≈7.70`
+
+## correct / empty / wrong sensitivity
+- Eval 输出目录：
+  - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/glyph_byt5_single_sample_probe/recon_eval/correct`
+  - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/glyph_byt5_single_sample_probe/recon_eval/empty`
+  - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/glyph_byt5_single_sample_probe/recon_eval/wrong`
+- r030：
+  - correct MSE：`0.001293`，PSNR：`28.8849`
+  - empty MSE：`0.008828`，PSNR：`20.5414`
+  - wrong MSE：`0.002054`，PSNR：`26.8740`
+- r070：
+  - correct MSE：`0.000990`，PSNR：`30.0428`
+  - empty MSE：`0.007744`，PSNR：`21.1106`
+  - wrong MSE：`0.001780`，PSNR：`27.4963`
+- 当前判断：
+  - Glyph-ByT5 版本在单图机制验证上出现了 clear text sensitivity：`correct < wrong << empty`。
+  - 这比之前 T5 版本 `correct≈wrong` 更有意义，说明模型不仅利用“有无文本”，也开始对具体文本内容有一定区分。
+  - 但这是单图 overfit 结果，不能直接外推到多图训练；下一步建议至少补 `medium/sparse` 单图，或在小规模多图上验证该趋势是否保留。
