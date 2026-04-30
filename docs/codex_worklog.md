@@ -2415,3 +2415,37 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - 日志里 `glyph_truncated_ratio` 是否为 0；
   - 如果出现截断，再考虑把 `max_length` 从 1024 提到 2048；
   - `text_valid_tokens_mean`、`residual_cross_attn_*` stats 是否正常。
+
+## 服务器 smoke 结果
+- 分支：`codex/glyph-byt5-text-encoder`
+- commit：`4969dec`
+- Glyph encoder load smoke：通过。
+  - tokenizer length：`1510`
+  - feature dim：`2048`
+  - logical text layers：`1`
+  - test output shape：`[1, 32, 2048]`
+- `dense_glyph_r030_block_smoke_2step`：通过。
+  - config：`VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_single_sample_probe_r030_block_v1.yaml`
+  - save root：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/glyph_byt5_single_sample_probe`
+  - step 1 Val MSE：`0.071279`
+  - step 2 Val MSE：`0.073152`
+  - `text_valid_tokens_mean=409`
+  - `glyph_truncated_ratio=0`
+  - `visual_memory_mask_actual_ratio=0.3125`
+  - `residual_cross_attn_context_norm_mean≈11.1`
+  - `residual_cross_attn_proj_norm_mean` 从 `0` 到约 `0.827`
+  - checkpoint saved：`dense_glyph_r030_block_smoke_2step/checkpoints/last.pt`
+- `dense_glyph_r070_oracle_block_smoke_2step`：通过。
+  - config：`VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_single_sample_oracle_r070_block_v1.yaml`
+  - step 1 Val MSE：`0.083931`
+  - step 2 Val MSE：`0.078939`
+  - `text_valid_tokens_mean=409`
+  - `glyph_truncated_ratio=0`
+  - `visual_memory_mask_actual_ratio=0.7500`
+  - `residual_cross_attn_context_norm_mean≈11.1`
+  - `residual_cross_attn_proj_norm_mean` 从 `0` 到约 `0.826`
+  - checkpoint saved：`dense_glyph_r070_oracle_block_smoke_2step/checkpoints/last.pt`
+- 初步判断：
+  - Glyph-ByT5 文件、special tokens、mapper、训练 forward 均已跑通。
+  - 当前 dense 单图文本长度 `409`，`max_length=1024` 无截断；暂不需要提升到 2048。
+  - 下一步可以跑 500-step 单图机制验证，并做 correct / empty / wrong 对比。
