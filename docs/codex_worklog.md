@@ -2611,3 +2611,23 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - `correct ≈ shuffled < wrong/empty`：能区分明显错误文本，但对同分布错配不敏感。
   - `correct ≈ shuffled/wrong < empty`：主要利用“有文本”信号。
   - `correct ≈ shuffled ≈ wrong ≈ empty`：text branch 未形成内容依赖。
+
+## 2026-05-02 dense100 轻量 layer sweep 自动化
+- 目的：在不大幅增加实验成本的情况下验证 decoder 注入层是否影响 text-content alignment。
+- 新增 `scripts/stage1/multi_image_debug/run_layer_sweep.sh`。
+- 默认设置：
+  - 固定 `MASK_RATIO=0.2`、`BLOCK_SIZE=2`。
+  - 默认层组合：
+    - `l20_23: 20,23`
+    - `l16_20_23: 16,20,23`
+    - `l12_16_20_23: 12,16,20,23`
+  - 默认 `SWEEP_ITERS=200`，`EVAL_MASK_TAGS=evalmask`，减少训练和评估成本。
+  - 可通过环境变量覆盖 `LAYER_SPECS`、`SWEEP_ITERS`、`EVAL_MASK_TAGS`。
+- 脚本行为：
+  - 自动生成每组层的 evalmask / nomask config。
+  - 调用现有 `run_multi_image_probe.sh` 训练。
+  - 自动跑 `correct / empty / shuffled / wrong` sensitivity。
+  - 输出 `layer_sweep_summary_*.csv`，直接给出 `empty/shuffled/wrong - correct` gap。
+- 判断口径：
+  - 如果新增层组合扩大 `shuffled/wrong - correct` gap，说明层数对具体文本内容利用有帮助。
+  - 如果只改善 MSE 但 gap 仍小，说明层数主要影响整体重建，text-content alignment 仍未解决。

@@ -219,3 +219,66 @@ done
 - `evalmask` 有 gap、`nomask` 没 gap：说明 mask 是触发 text 使用的关键。
 - r010/r020 比 r030 更好：说明 0.3 mask 可能过强。
 - r070 有 gap、低比例没 gap：说明需要更强遮挡才触发 text 使用。
+
+## 6. 轻量 layer sweep
+
+如果 ratio 消融后仍然是 `correct≈shuffled/wrong<empty`，可以固定当前较稳的 `ratio=0.2`，只扫 decoder 注入层。这个脚本会自动：
+
+1. 为每组层生成 config；
+2. 训练每组层的 Glyph text branch；
+3. 跑 `correct / empty / shuffled / wrong` sensitivity；
+4. 输出 `layer_sweep_summary_*.csv`。
+
+默认是轻量设置：
+
+```text
+mask ratio = 0.2
+layers:
+  l20_23: 20,23
+  l16_20_23: 16,20,23
+  l12_16_20_23: 12,16,20,23
+steps = 200
+eval = evalmask only
+```
+
+运行：
+
+```bash
+cd /home/ma-user/work/GigaTok_hr/GigaTok_Loss
+
+SWEEP_ITERS=200 \
+GLOBAL_BATCH_SIZE=20 \
+ASCEND_RT_VISIBLE_DEVICES=0,1 \
+NPROC_PER_NODE=2 \
+bash scripts/stage1/multi_image_debug/run_layer_sweep.sh
+```
+
+如果想更完整地同时看 `nomask/evalmask`：
+
+```bash
+EVAL_MASK_TAGS="nomask evalmask" \
+SWEEP_ITERS=200 \
+GLOBAL_BATCH_SIZE=20 \
+ASCEND_RT_VISIBLE_DEVICES=0,1 \
+NPROC_PER_NODE=2 \
+bash scripts/stage1/multi_image_debug/run_layer_sweep.sh
+```
+
+如果想临时换层组合：
+
+```bash
+LAYER_SPECS="l20_23:20,23 l16_20_23:16,20,23 l16_23dense:16,17,18,19,20,21,22,23" \
+bash scripts/stage1/multi_image_debug/run_layer_sweep.sh
+```
+
+只检查 config 生成、不训练：
+
+```bash
+DRY_RUN=1 bash scripts/stage1/multi_image_debug/run_layer_sweep.sh
+```
+
+判断口径仍然是：
+
+- `correct` 比 `shuffled/wrong` 明显好：层数改善了具体文本内容利用。
+- 只比 `empty` 好：仍然主要使用“有 text feature”信号。
+- MSE 变好但 sensitivity 不变：层数只改善了整体重建，没有解决 text-content alignment。
