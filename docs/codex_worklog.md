@@ -2487,3 +2487,105 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - Glyph-ByT5 版本在单图机制验证上出现了 clear text sensitivity：`correct < wrong << empty`。
   - 这比之前 T5 版本 `correct≈wrong` 更有意义，说明模型不仅利用“有无文本”，也开始对具体文本内容有一定区分。
   - 但这是单图 overfit 结果，不能直接外推到多图训练；下一步建议至少补 `medium/sparse` 单图，或在小规模多图上验证该趋势是否保留。
+
+## 2026-05-01 四个后续尝试的只读分析
+
+## 当前核心判断
+- 现在最强的机制证据不是继续加 OCR loss，而是 Glyph-ByT5 + residual cross-attn + block visual mask 在 dense 单图上已经出现 `correct < wrong << empty` 的 sensitivity。
+- 这说明“text 分支机制上可用”，但证据还只来自 dense 单图 overfit；下一步应优先验证 medium / sparse 单图和小规模多图，而不是直接扩大到复杂新 loss。
+
+## 尝试 1：高文字占比图像验证随机 block mask 是否遮到文字
+- 值得做，优先级高。
+- 原因：随机 mask 如果没有覆盖文字区域，模型仍能从 visual token 复制文字，text 分支没有必要参与。
+- 当前 r030 / r070 fixed block probe 已经比低比例随机 mask 更接近这个目标；dense r030/r070 的 clear sensitivity 支持继续补 medium / sparse。
+- 如果后续多图仍没有 sensitivity，应考虑 text-region mask / OCR box mask，而不是继续单纯提高随机比例。
+
+## 尝试 2：只在 decoder 后层 20 和 23 加 text
+- 不建议直接只押 20/23 两层。
+- 后层更接近像素重建，可能更影响字形；但只注入两层太稀疏，容易仍被 visual 主干绕开。
+- 更稳的排查顺序是先做 layer sweep：`8-15`、`16-23`、`8-23` 或稀疏层 `{4,8,12,16,20,23}`，用 correct/empty/wrong sensitivity 和 text-attn stats 选层。
+- 当前单图机制已经在 8-15 有信号，因此“层太靠前/太靠后”不是唯一解释；mask 和 text encoder 更关键。
+
+## 尝试 3：新增 text branch 是否需要零初始化
+- 对稳定性有用，但不是当前首要矛盾。
+- 现有 residual_cross_attn 的 output projection 已经 zero-init，AdaLN 也做过 zero-init equivalence；这能避免 step 0 破坏原生重建。
+- 当前主要现象是重建可 overfit、但模型是否依赖 text 不稳定；zero-init 解决的是“不要一开始伤害重建”，不是“强迫使用 text”。
+- 后续若某个新分支导致 matched native 明显变差，再加 gate/zero-init/schedule；否则优先看 sensitivity。
+
+## 尝试 4：重建后接冻结 OCR，算 OCR text loss
+- 暂不建议作为下一步训练主线。
+- 原因 1：DeepSeek-OCR / VLM OCR 的常用 `infer` / vLLM 路径是生成式推理，不是可微 loss；字符串 CER / edit distance 也不能直接反传。
+- 原因 2：即使用 frozen OCR logits 做 teacher-forced CE，工程成本和显存都高，且可能学到 OCR 友好的伪影，不一定提升人眼可读性。
+- 原因 3：如果 visual token 没有有效遮住文字，OCR loss 仍可能只推动 visual reconstruction，不会证明 GT text branch 被使用。
+- 更合理的近期用法：先把 OCR 作为 eval metric，比较 correct / empty / wrong 下 OCR-CER / NED；只有在 visual mask 已确认有效后，再考虑可微 OCR loss。
+
+## 2026-05-01 多图机制验证工具
+
+## 目标
+- 修正多图验证口径：当前只验证 `CleanTextSynth` 中密集文字图片，不做五子集 balanced probe。
+- 不改主训练框架，不新增模型结构，不接 OCR loss。
+- 从 `CleanTextSynth` 里按 rendered text 长度选 100 张，train / val / holdout 三个 manifest 完全复用同一批图片。
+- 训练时边 train 边在同一批图片上 online validation；holdout 也只是机制验证用同批评估，不作为泛化测试。
+
+## 新增文件
+- `scripts/stage1/multi_image_debug/make_multi_image_manifests.py`
+  - 从现有 TextAtlas materialized manifest 构建 dense CleanTextSynth probe manifest。
+  - 默认 `CleanTextSynth` 100 张。
+  - 新增 `--same-eval-as-train`，输出与 train 完全相同的 val / holdout manifest。
+  - 默认 `selection=longest_text`，用 rendered text 字符数作为文字密度代理。
+  - 输出 train / val / holdout JSONL 和 summary JSON。
+- `scripts/stage1/multi_image_debug/run_multi_image_probe.sh`
+  - 复用 `tokenizer/tokenizer_image/vq/vq_train.py` 跑多图 probe。
+  - 支持 `MODE=matched_native`、`MODE=glyph_r030`、`MODE=glyph_r070`。
+  - 默认单卡 NPU、`global_batch_size=20`、`iterations=500`。
+  - `glyph_r030/glyph_r070` 不再直接使用旧单图 8-15 配置；脚本会在 `$SAVE_ROOT/configs/` 下生成本轮专用临时 config：
+    - `layer_pairs=[[0,20],[0,23]]`
+    - `layers=[20,23]`
+    - `fixed_pattern=true`
+    - `apply_in_eval=true`
+    - r030: `ratio=0.3, block_size=2`
+    - r070: `ratio=0.7, block_size=4`
+- `scripts/stage1/multi_image_debug/README.md`
+  - 记录 manifest 构建、matched native / glyph r030 / glyph r070 训练命令。
+  - 记录 nomask / evalmask 两种 correct / empty / shuffled sensitivity 评估命令。
+
+## 推荐第一轮设置
+- manifest：`cleantextsynth_dense_100`
+  - train: `CleanTextSynth` 100 张。
+  - val: 同一批 100 张。
+  - holdout: 同一批 100 张。
+- train：
+  - `matched_native` 500 step。
+  - `glyph_r030` 500 step，Glyph-ByT5 layer 0 接 decoder 20 / 23，fixed block mask ratio 0.3。
+  - `glyph_r070` 500 step，Glyph-ByT5 layer 0 接 decoder 20 / 23，fixed block mask ratio 0.7，作为 oracle-like 强 mask。
+- eval：
+  - 对同批 holdout manifest 分别做 `nomask` 和 `evalmask` 两种口径的 correct / empty / shuffled。
+  - `nomask` 用于观察 text branch 不遮挡 visual 时是否仍影响重建。
+  - `evalmask` 用于观察固定 block mask 强制 visual 缺失时是否拉开 text 内容差异。
+  - 判断口径：
+    - `correct < shuffled << empty`：100 图 overfit 下使用具体文本内容。
+    - `correct ≈ shuffled < empty`：主要使用“有文本”，具体内容依赖不足。
+    - `correct ≈ shuffled ≈ empty`：100 图 overfit 下 text branch 仍未形成内容依赖。
+    - r070 有 gap、r030 没 gap：普通 0.3 mask 不够强，后续应改 mask/schedule。
+
+## 本地检查
+- `python3 -m py_compile scripts/stage1/multi_image_debug/make_multi_image_manifests.py`：通过。
+- `bash -n scripts/stage1/multi_image_debug/run_multi_image_probe.sh`：通过。
+- `python3 scripts/stage1/multi_image_debug/make_multi_image_manifests.py --help`：通过。
+- `git diff --check` 限定新增多图文件：通过。
+
+## 2026-05-01 dense100 第一阶段脚本修订
+- 已核对当前 dense100 相关新增文件仅包含：
+  - `scripts/stage1/multi_image_debug/make_multi_image_manifests.py`
+  - `scripts/stage1/multi_image_debug/run_multi_image_probe.sh`
+  - `scripts/stage1/multi_image_debug/README.md`
+- 本轮没有为了 dense100 改 `vq_train.py`、模型代码或已有 config。
+- 工作区仍有其他无关脏文件 / untracked 拷贝目录，本轮不纳入 dense100 计划。
+- 已把 `run_multi_image_probe.sh` 调整为第一阶段默认：
+  - matched native 保持原 config。
+  - Glyph r030/r070 自动生成后层 20/23 专用 config，不再误用旧单图 8-15 config。
+  - 默认 `global_batch_size=20`，和 100 图 overfit 口径一致。
+  - config 生成默认使用 `PYTHON_BIN=python3`，服务器如需 `python` 可显式覆盖。
+- README 已补充：
+  - dense100 训练命令。
+  - r030/r070 的 `nomask` / `evalmask` sensitivity 命令。
