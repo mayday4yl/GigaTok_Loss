@@ -91,8 +91,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ocr-min-confidence", type=float, default=0.0)
     parser.add_argument("--ocr-jsonl", type=Path, default=None, help="Optional per-sample OCR prediction output JSONL.")
     parser.add_argument("--text-layer-pair-index", type=int, default=0, help="Deterministic [T5 layer, decoder layer] pair index for text-conditioned reconstruction.")
-    parser.add_argument("--text-input-mode", choices=("correct", "empty", "shuffled"), default="correct", help="Text used by text-conditioned runs; use empty/shuffled for sensitivity checks.")
+    parser.add_argument("--text-input-mode", choices=("correct", "empty", "shuffled", "wrong"), default="correct", help="Text used by text-conditioned runs; use empty/shuffled/wrong for sensitivity checks.")
     parser.add_argument("--wrong-text-seed", type=int, default=0, help="Seed for --text-input-mode=shuffled.")
+    parser.add_argument("--fixed-wrong-text", default="THIS IS A FIXED WRONG TEXT 0123456789", help="Text used for --text-input-mode=wrong.")
     parser.add_argument("--strip-punctuation", action="store_true", help="Remove punctuation before CER/NED/exact-match metrics.")
     parser.add_argument("--remove-spaces", action="store_true", help="Remove spaces before CER/NED/exact-match metrics.")
     return parser.parse_args()
@@ -802,6 +803,7 @@ def evaluate_run(
     mixed_precision: str,
     text_input_mode: str,
     wrong_text_seed: int,
+    fixed_wrong_text: str,
     strip_punctuation: bool,
     remove_spaces: bool,
 ) -> Tuple[Dict[str, Any], Dict[int, np.ndarray], Dict[int, np.ndarray], Dict[int, str]]:
@@ -820,6 +822,8 @@ def evaluate_run(
         random.Random(wrong_text_seed).shuffle(text_inputs_for_model)
         if len(text_inputs_for_model) > 1 and text_inputs_for_model == correct_texts:
             text_inputs_for_model = text_inputs_for_model[1:] + text_inputs_for_model[:1]
+    elif text_input_mode == "wrong":
+        text_inputs_for_model = [fixed_wrong_text] * len(image_paths)
     elif text_input_mode == "empty":
         text_inputs_for_model = [""] * len(image_paths)
     else:
@@ -1014,6 +1018,7 @@ def main() -> None:
             mixed_precision=args.mixed_precision,
             text_input_mode=args.text_input_mode,
             wrong_text_seed=args.wrong_text_seed,
+            fixed_wrong_text=args.fixed_wrong_text,
             strip_punctuation=args.strip_punctuation,
             remove_spaces=args.remove_spaces,
         )
@@ -1042,6 +1047,7 @@ def main() -> None:
         "text_layer_pair_index": args.text_layer_pair_index,
         "text_input_mode": args.text_input_mode,
         "wrong_text_seed": args.wrong_text_seed,
+        "fixed_wrong_text": args.fixed_wrong_text,
         "strip_punctuation": args.strip_punctuation,
         "remove_spaces": args.remove_spaces,
         "runs": metrics_by_run,

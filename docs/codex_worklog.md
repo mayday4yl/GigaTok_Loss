@@ -2589,3 +2589,25 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - README 已补充：
   - dense100 训练命令。
   - r030/r070 的 `nomask` / `evalmask` sensitivity 命令。
+
+## 2026-05-02 dense100 mask 比例和 wrong-text sensitivity 扩展
+- 背景：dense100 结果表现为 `correct < empty`，但 `correct ≈ shuffled`；说明 text branch 有作用，但还不能证明模型使用了具体文本内容。
+- 本轮最小扩展：
+  - `scripts/stage1/evaluate_textatlas_reconstruction.py`
+    - `--text-input-mode` 新增 `wrong`。
+    - 新增 `--fixed-wrong-text`，默认使用固定明显错误文本。
+    - `wrong` 与 `shuffled` 区分：
+      - `shuffled` 是同分布错配文本；
+      - `wrong` 是固定强负样本文本。
+  - `scripts/stage1/multi_image_debug/run_multi_image_probe.sh`
+    - 新增 `MODE=glyph_r010` 和 `MODE=glyph_r020`，用于排查 `ratio=0.3` 是否过强。
+    - 保留 `glyph_r030/glyph_r070`。
+    - 支持 `NPROC_PER_NODE`，双卡可直接 `ASCEND_RT_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2`。
+  - `scripts/stage1/multi_image_debug/README.md`
+    - 训练顺序改为优先 `r010/r020/r030`，r070 作为可选强遮挡。
+    - sensitivity 改为 `correct / empty / shuffled / wrong`。
+- 判断口径：
+  - `correct < shuffled/wrong << empty`：使用具体文本内容。
+  - `correct ≈ shuffled < wrong/empty`：能区分明显错误文本，但对同分布错配不敏感。
+  - `correct ≈ shuffled/wrong < empty`：主要利用“有文本”信号。
+  - `correct ≈ shuffled ≈ wrong ≈ empty`：text branch 未形成内容依赖。

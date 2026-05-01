@@ -26,6 +26,7 @@ NUM_WORKERS="${NUM_WORKERS:-2}"
 VAL_NUM_WORKERS="${VAL_NUM_WORKERS:-2}"
 DEVICE_BACKEND="${DEVICE_BACKEND:-npu}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 LOG_EVERY="${LOG_EVERY:-10}"
 VAL_EVERY="${VAL_EVERY:-50}"
 CKPT_EVERY="${CKPT_EVERY:-500}"
@@ -48,7 +49,13 @@ base_config, output_config, mode = sys.argv[1:4]
 with open(base_config, "r", encoding="utf-8") as handle:
     cfg = yaml.safe_load(handle)
 
-if mode == "glyph_r030":
+if mode == "glyph_r010":
+    ratio = 0.1
+    block_size = 2
+elif mode == "glyph_r020":
+    ratio = 0.2
+    block_size = 2
+elif mode == "glyph_r030":
     ratio = 0.3
     block_size = 2
 elif mode == "glyph_r070":
@@ -94,6 +101,16 @@ PY
 
 if [[ -z "${CONFIG:-}" ]]; then
   case "$MODE" in
+    glyph_r010)
+      BASE_CONFIG="configs/vq/VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_single_sample_probe_r030_block_v1.yaml"
+      CONFIG="$CONFIG_WORK_DIR/${MANIFEST_NAME}_${MODE}_${TEXT_LAYER_TAG}_evalmask.yaml"
+      generate_glyph_probe_config "$BASE_CONFIG" "$CONFIG" "$MODE"
+      ;;
+    glyph_r020)
+      BASE_CONFIG="configs/vq/VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_single_sample_probe_r030_block_v1.yaml"
+      CONFIG="$CONFIG_WORK_DIR/${MANIFEST_NAME}_${MODE}_${TEXT_LAYER_TAG}_evalmask.yaml"
+      generate_glyph_probe_config "$BASE_CONFIG" "$CONFIG" "$MODE"
+      ;;
     glyph_r030)
       BASE_CONFIG="configs/vq/VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_single_sample_probe_r030_block_v1.yaml"
       CONFIG="$CONFIG_WORK_DIR/${MANIFEST_NAME}_${MODE}_${TEXT_LAYER_TAG}_evalmask.yaml"
@@ -108,14 +125,14 @@ if [[ -z "${CONFIG:-}" ]]; then
       CONFIG="configs/vq/VQ_BL256_dino_disc_matched_native_v1.yaml"
       ;;
     *)
-      echo "Unsupported MODE=$MODE. Use glyph_r030, glyph_r070, or matched_native; or pass CONFIG=..." >&2
+      echo "Unsupported MODE=$MODE. Use glyph_r010, glyph_r020, glyph_r030, glyph_r070, or matched_native; or pass CONFIG=..." >&2
       exit 1
       ;;
   esac
 fi
 
 if [[ -z "${RUN_NAME:-}" ]]; then
-  if [[ "$MODE" == glyph_r030 || "$MODE" == glyph_r070 ]]; then
+  if [[ "$MODE" == glyph_r010 || "$MODE" == glyph_r020 || "$MODE" == glyph_r030 || "$MODE" == glyph_r070 ]]; then
     RUN_NAME="${MANIFEST_NAME}_${MODE}_${TEXT_LAYER_TAG}_${ITERS}step_seed${GLOBAL_SEED}"
   else
     RUN_NAME="${MANIFEST_NAME}_${MODE}_${ITERS}step_seed${GLOBAL_SEED}"
@@ -145,8 +162,9 @@ echo "  iterations: $ITERS"
 echo "  global_batch_size: $GLOBAL_BATCH_SIZE"
 echo "  val_max_images: $VAL_MAX_IMAGES"
 echo "  visible_devices: $ASCEND_RT_VISIBLE_DEVICES"
+echo "  nproc_per_node: $NPROC_PER_NODE"
 
-torchrun --standalone --nproc_per_node=1 \
+torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" \
   tokenizer/tokenizer_image/vq/vq_train.py \
   --model-config "$CONFIG" \
   --dataset textatlas_image_text \
