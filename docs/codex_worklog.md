@@ -2656,3 +2656,36 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - 本地检查：
   - `python3 -m py_compile tokenizer/tokenizer_image/vq/vq_train.py tokenizer/tokenizer_image/vq/blocks.py tokenizer/tokenizer_image/vq/vq_loss.py tokenizer/tokenizer_image/vq/vq_vit_model.py scripts/stage1/evaluate_textatlas_reconstruction.py`：通过。
   - 新 config YAML parse：通过。
+
+## 2026-05-03 DeepSeek-OCR 离线评估入口
+- 背景：师姐建议在重建之后加冻结 OCR，用 OCR 约束重建图里的文字和 GT text 一致。
+- 先做最小可回滚步骤：只扩展离线评估，不改训练 loss，不把 DeepSeek-OCR 接入 `vq_train.py`。
+- 参考资料：
+  - DeepSeek-OCR GitHub: `https://github.com/deepseek-ai/DeepSeek-OCR`
+  - 官方 README 显示 Transformers 推理使用 `AutoModel.from_pretrained(..., trust_remote_code=True)` 和 `model.infer(...)`。
+  - 官方环境偏 CUDA / torch2.6 / flash-attn；当前服务器是 NPU / torch2.1，因此需要先验证能否加载和推理。
+- 代码改动：
+  - `scripts/stage1/evaluate_textatlas_reconstruction.py`
+    - `--ocr-backend` 新增 `deepseek_ocr`。
+    - 新增 DeepSeek-OCR 相关参数：
+      - `--deepseek-ocr-model`
+      - `--deepseek-ocr-prompt`
+      - `--deepseek-ocr-base-size`
+      - `--deepseek-ocr-image-size`
+      - `--deepseek-ocr-crop-mode`
+      - `--deepseek-ocr-save-results`
+      - `--deepseek-ocr-test-compress`
+      - `--deepseek-ocr-attn-implementation`
+      - `--deepseek-ocr-dtype`
+      - `--deepseek-ocr-output-dir`
+    - DeepSeek-OCR 预测文本会进入现有 `ocr_cer / ocr_ned_similarity / ocr_edit_distance` 指标。
+    - 保留 `ocr_predictions.jsonl` 逐样本输出。
+  - `scripts/stage1/multi_image_debug/README.md`
+    - 新增 `DeepSeek-OCR 离线评估` 小节。
+    - 给出 dense100 r020 的 4 张 smoke 命令。
+- 当前判断：
+  - OCR eval 可以回答“重建图里的文字是否能被 OCR 读对”。
+  - 训练式 OCR loss 不能直接用 `infer()` 输出字符串或 edit distance 反传；后续若要做训练约束，应拆可微 forward，优先考虑 OCR feature loss 或 teacher-forcing CE。
+- 本地检查：
+  - `python3 -m py_compile scripts/stage1/evaluate_textatlas_reconstruction.py`：通过。
+  - `python3 scripts/stage1/evaluate_textatlas_reconstruction.py --help`：本机缺 `torch`，无法完整 import；服务器环境再跑。

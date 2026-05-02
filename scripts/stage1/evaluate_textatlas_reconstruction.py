@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import re
 import sys
+import tempfile
 import unicodedata
 from collections import defaultdict
 from contextlib import nullcontext
@@ -86,10 +88,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid-samples", type=int, default=24)
     parser.add_argument("--grid-seed", type=int, default=0)
     parser.add_argument("--save-per-sample", type=int, default=0, help="Save first N comparison rows as individual PNGs.")
-    parser.add_argument("--ocr-backend", choices=("none", "pytesseract", "paddleocr", "easyocr"), default="none")
+    parser.add_argument("--ocr-backend", choices=("none", "pytesseract", "paddleocr", "easyocr", "deepseek_ocr"), default="none")
     parser.add_argument("--ocr-lang", default="en")
     parser.add_argument("--ocr-min-confidence", type=float, default=0.0)
     parser.add_argument("--ocr-jsonl", type=Path, default=None, help="Optional per-sample OCR prediction output JSONL.")
+    parser.add_argument("--deepseek-ocr-model", default=None, help="Local path or HF id for --ocr-backend=deepseek_ocr. Defaults to DEEPSEEK_OCR_MODEL or deepseek-ai/DeepSeek-OCR.")
+    parser.add_argument("--deepseek-ocr-prompt", default="<image>\n<|grounding|>OCR this image.", help="Prompt passed to DeepSeek-OCR infer().")
+    parser.add_argument("--deepseek-ocr-base-size", type=int, default=1024)
+    parser.add_argument("--deepseek-ocr-image-size", type=int, default=640)
+    parser.add_argument("--deepseek-ocr-crop-mode", action="store_true", help="Enable DeepSeek-OCR crop_mode.")
+    parser.add_argument("--deepseek-ocr-save-results", action="store_true", help="Let DeepSeek-OCR write its own visualized outputs.")
+    parser.add_argument("--deepseek-ocr-test-compress", action="store_true", help="Pass test_compress=True to DeepSeek-OCR infer() when supported.")
+    parser.add_argument("--deepseek-ocr-attn-implementation", default="eager", help="Transformers attention implementation, e.g. eager, sdpa, flash_attention_2, or none.")
+    parser.add_argument("--deepseek-ocr-dtype", choices=("auto", "fp32", "bf16", "fp16"), default="bf16")
+    parser.add_argument("--deepseek-ocr-output-dir", type=Path, default=None, help="Temporary/output dir used by DeepSeek-OCR infer().")
     parser.add_argument("--text-layer-pair-index", type=int, default=0, help="Deterministic [T5 layer, decoder layer] pair index for text-conditioned reconstruction.")
     parser.add_argument("--text-input-mode", choices=("correct", "empty", "shuffled", "wrong"), default="correct", help="Text used by text-conditioned runs; use empty/shuffled/wrong for sensitivity checks.")
     parser.add_argument("--wrong-text-seed", type=int, default=0, help="Seed for --text-input-mode=shuffled.")
@@ -712,12 +724,75 @@ def extract_paddle_texts(result: Any, min_confidence: float) -> List[str]:
     return texts
 
 
+def stringify_deepseek_ocr_result(result: Any) -> str:
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return " ".join(result.split())
+    if isinstance(result, Mapping):
+        for key in ("text", "result", "markdown", "output", "prediction", "pred_text"):
+            if key in result:
+                text = stringify_deepseek_ocr_result(result[key])
+                if text:
+                    return text
+        return " ".join(str(value) for value in result.values() if value is not None)
+    if isinstance(result, (list, tuple)):
+        return " ".join(stringify_deepseek_ocr_result(item) for item in result if item is not None).strip()
+    return " ".join(str(result).split())
+
+
+def read_deepseek_saved_text(output_dir: Path) -> str:
+    candidates = [
+        output_dir / "result.mmd",
+        output_dir / "result_ori.mmd",
+    ]
+    candidates.extend(sorted(output_dir.glob("*.mmd"), key=lambda path: path.stat().st_mtime, reverse=True))
+    for path in candidates:
+        if path.exists() and path.is_file():
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            text = re.sub(r"<\|ref\|>.*?<\|/ref\|>", " ", text, flags=re.DOTALL)
+            text = re.sub(r"<\|det\|>.*?<\|/det\|>", " ", text, flags=re.DOTALL)
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = " ".join(text.split())
+            if text:
+                return text
+    return ""
+
+
 class OCRReader:
-    def __init__(self, backend: str, lang: str, min_confidence: float, device_backend: str) -> None:
+    def __init__(
+        self,
+        backend: str,
+        lang: str,
+        min_confidence: float,
+        device_backend: str,
+        device: torch.device,
+        deepseek_ocr_model: Optional[str],
+        deepseek_ocr_prompt: str,
+        deepseek_ocr_base_size: int,
+        deepseek_ocr_image_size: int,
+        deepseek_ocr_crop_mode: bool,
+        deepseek_ocr_save_results: bool,
+        deepseek_ocr_test_compress: bool,
+        deepseek_ocr_attn_implementation: str,
+        deepseek_ocr_dtype: str,
+        deepseek_ocr_output_dir: Optional[Path],
+    ) -> None:
         self.backend = backend
         self.lang = lang
         self.min_confidence = min_confidence
         self.reader = None
+        self.tokenizer = None
+        self.device = device
+        self.deepseek_ocr_prompt = deepseek_ocr_prompt
+        self.deepseek_ocr_base_size = deepseek_ocr_base_size
+        self.deepseek_ocr_image_size = deepseek_ocr_image_size
+        self.deepseek_ocr_crop_mode = deepseek_ocr_crop_mode
+        self.deepseek_ocr_save_results = deepseek_ocr_save_results
+        self.deepseek_ocr_test_compress = deepseek_ocr_test_compress
+        self.deepseek_ocr_counter = 0
+        self.deepseek_ocr_tmp = tempfile.TemporaryDirectory(prefix="deepseek_ocr_eval_") if backend == "deepseek_ocr" and deepseek_ocr_output_dir is None else None
+        self.deepseek_ocr_output_dir = deepseek_ocr_output_dir or (Path(self.deepseek_ocr_tmp.name) if self.deepseek_ocr_tmp is not None else None)
         if backend == "none":
             return
         if backend == "pytesseract":
@@ -732,6 +807,34 @@ class OCRReader:
             import easyocr  # type: ignore
 
             self.reader = easyocr.Reader([lang], gpu=device_backend != "cpu")
+        elif backend == "deepseek_ocr":
+            try:
+                from transformers import AutoModel, AutoTokenizer  # type: ignore
+            except ImportError as exc:  # pragma: no cover - optional server dependency
+                raise ImportError("Install transformers before using --ocr-backend=deepseek_ocr.") from exc
+
+            model_name_or_path = deepseek_ocr_model or os.environ.get("DEEPSEEK_OCR_MODEL") or "deepseek-ai/DeepSeek-OCR"
+            load_kwargs: Dict[str, Any] = {
+                "trust_remote_code": True,
+                "use_safetensors": True,
+            }
+            if deepseek_ocr_attn_implementation and deepseek_ocr_attn_implementation != "none":
+                load_kwargs["_attn_implementation"] = deepseek_ocr_attn_implementation
+            dtype_map = {
+                "fp32": torch.float32,
+                "bf16": torch.bfloat16,
+                "fp16": torch.float16,
+            }
+            if deepseek_ocr_dtype in dtype_map:
+                load_kwargs["torch_dtype"] = dtype_map[deepseek_ocr_dtype]
+
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
+            self.reader = AutoModel.from_pretrained(model_name_or_path, **load_kwargs)
+            self.reader = self.reader.eval().to(device)  # type: ignore[union-attr]
+            if deepseek_ocr_dtype in dtype_map:
+                self.reader = self.reader.to(dtype_map[deepseek_ocr_dtype])  # type: ignore[union-attr]
+            if self.deepseek_ocr_output_dir is not None:
+                self.deepseek_ocr_output_dir.mkdir(parents=True, exist_ok=True)
         else:
             raise ValueError(f"Unsupported OCR backend: {backend}")
 
@@ -755,6 +858,32 @@ class OCRReader:
                 if len(item) >= 3 and float(item[2]) >= self.min_confidence:
                     texts.append(str(item[1]))
             return " ".join(texts)
+        if self.backend == "deepseek_ocr":
+            if self.reader is None or self.tokenizer is None or self.deepseek_ocr_output_dir is None:
+                return ""
+            self.deepseek_ocr_counter += 1
+            image_path = self.deepseek_ocr_output_dir / f"recon_{self.deepseek_ocr_counter:06d}.png"
+            Image.fromarray(image).save(image_path)
+            infer_kwargs: Dict[str, Any] = {
+                "prompt": self.deepseek_ocr_prompt,
+                "image_file": str(image_path),
+                "output_path": str(self.deepseek_ocr_output_dir),
+                "base_size": self.deepseek_ocr_base_size,
+                "image_size": self.deepseek_ocr_image_size,
+                "crop_mode": self.deepseek_ocr_crop_mode,
+                "save_results": self.deepseek_ocr_save_results,
+                "test_compress": self.deepseek_ocr_test_compress,
+            }
+            try:
+                result = self.reader.infer(self.tokenizer, **infer_kwargs)  # type: ignore[union-attr]
+            except TypeError:
+                infer_kwargs.pop("save_results", None)
+                infer_kwargs.pop("test_compress", None)
+                result = self.reader.infer(self.tokenizer, **infer_kwargs)  # type: ignore[union-attr]
+            text = stringify_deepseek_ocr_result(result)
+            if not text:
+                text = read_deepseek_saved_text(self.deepseek_ocr_output_dir)
+            return text
         raise ValueError(f"Unsupported OCR backend: {self.backend}")
 
 
@@ -978,6 +1107,17 @@ def main() -> None:
         lang=args.ocr_lang,
         min_confidence=args.ocr_min_confidence,
         device_backend=args.device_backend,
+        device=device,
+        deepseek_ocr_model=args.deepseek_ocr_model,
+        deepseek_ocr_prompt=args.deepseek_ocr_prompt,
+        deepseek_ocr_base_size=args.deepseek_ocr_base_size,
+        deepseek_ocr_image_size=args.deepseek_ocr_image_size,
+        deepseek_ocr_crop_mode=args.deepseek_ocr_crop_mode,
+        deepseek_ocr_save_results=args.deepseek_ocr_save_results,
+        deepseek_ocr_test_compress=args.deepseek_ocr_test_compress,
+        deepseek_ocr_attn_implementation=args.deepseek_ocr_attn_implementation,
+        deepseek_ocr_dtype=args.deepseek_ocr_dtype,
+        deepseek_ocr_output_dir=args.deepseek_ocr_output_dir,
     )
     ocr_jsonl = args.ocr_jsonl or (output_dir / "ocr_predictions.jsonl" if ocr_reader.enabled else None)
     if ocr_jsonl is not None and ocr_jsonl.exists():
@@ -1044,6 +1184,16 @@ def main() -> None:
         "ocr_lang": args.ocr_lang,
         "ocr_min_confidence": args.ocr_min_confidence,
         "ocr_jsonl": str(ocr_jsonl) if ocr_jsonl is not None else None,
+        "deepseek_ocr_model": args.deepseek_ocr_model,
+        "deepseek_ocr_prompt": args.deepseek_ocr_prompt,
+        "deepseek_ocr_base_size": args.deepseek_ocr_base_size,
+        "deepseek_ocr_image_size": args.deepseek_ocr_image_size,
+        "deepseek_ocr_crop_mode": args.deepseek_ocr_crop_mode,
+        "deepseek_ocr_save_results": args.deepseek_ocr_save_results,
+        "deepseek_ocr_test_compress": args.deepseek_ocr_test_compress,
+        "deepseek_ocr_attn_implementation": args.deepseek_ocr_attn_implementation,
+        "deepseek_ocr_dtype": args.deepseek_ocr_dtype,
+        "deepseek_ocr_output_dir": str(args.deepseek_ocr_output_dir) if args.deepseek_ocr_output_dir else None,
         "text_layer_pair_index": args.text_layer_pair_index,
         "text_input_mode": args.text_input_mode,
         "wrong_text_seed": args.wrong_text_seed,

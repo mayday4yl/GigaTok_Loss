@@ -220,6 +220,58 @@ done
 - r010/r020 比 r030 更好：说明 0.3 mask 可能过强。
 - r070 有 gap、低比例没 gap：说明需要更强遮挡才触发 text 使用。
 
+## 5.1 DeepSeek-OCR 离线评估
+
+如果要验证“重建图里的文字是否真的可读”，可以在上面的 reconstruction sensitivity 基础上额外打开 OCR backend。这个步骤只做评估，不参与训练，也不会反传梯度。
+
+前提：服务器上已有 DeepSeek-OCR 模型目录，建议放在：
+
+```text
+/home/ma-user/work/GigaTok_hr/gigatok_persist/models/DeepSeek-OCR
+```
+
+如果模型目录不同，用 `DEEPSEEK_OCR_MODEL=/path/to/DeepSeek-OCR` 指定。DeepSeek-OCR 官方 Transformers 示例依赖 CUDA / torch2.6 / flash-attn；当前 NPU 环境不一定能直接加载，因此第一轮建议先用较小图片数做连通性测试。
+
+```bash
+cd /home/ma-user/work/GigaTok_hr/GigaTok_Loss
+
+RUN_ROOT=/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_multi_debug
+HOLDOUT_MANIFEST=$RUN_ROOT/manifests/cleantextsynth_dense_100_holdout.jsonl
+MATCHED_CKPT=$RUN_ROOT/cleantextsynth_dense_100_matched_native_500step_seed0/checkpoints/last.pt
+R020_CKPT=$RUN_ROOT/cleantextsynth_dense_100_glyph_r020_l20_23_500step_seed0/checkpoints/last.pt
+R020_CONFIG=$RUN_ROOT/configs/cleantextsynth_dense_100_glyph_r020_l20_23_evalmask.yaml
+DEEPSEEK_OCR_MODEL=/home/ma-user/work/GigaTok_hr/gigatok_persist/models/DeepSeek-OCR
+
+python3 scripts/stage1/evaluate_textatlas_reconstruction.py \
+  --run matched_native:configs/vq/VQ_BL256_dino_disc_matched_native_v1.yaml:$MATCHED_CKPT \
+  --run glyph_r020:$R020_CONFIG:$R020_CKPT \
+  --manifest-jsonl "$HOLDOUT_MANIFEST" \
+  --output-dir "$RUN_ROOT/ocr_eval/deepseek_ocr_r020_correct_smoke" \
+  --device-backend npu \
+  --mixed-precision bf16 \
+  --batch-size 1 \
+  --max-images 4 \
+  --grid-samples 4 \
+  --text-input-mode correct \
+  --ocr-backend deepseek_ocr \
+  --deepseek-ocr-model "$DEEPSEEK_OCR_MODEL" \
+  --deepseek-ocr-attn-implementation eager \
+  --deepseek-ocr-dtype bf16 \
+  --deepseek-ocr-base-size 1024 \
+  --deepseek-ocr-image-size 640 \
+  --deepseek-ocr-crop-mode \
+  --deepseek-ocr-save-results \
+  --ocr-jsonl "$RUN_ROOT/ocr_eval/deepseek_ocr_r020_correct_smoke/ocr_predictions.jsonl"
+```
+
+连通性通过后，再跑 `correct / empty / shuffled / wrong` 四组。OCR 指标看：
+
+- `ocr_cer`：越低越好。
+- `ocr_ned_similarity`：越高越好。
+- `ocr_predictions.jsonl`：逐样本 GT text / OCR pred text / CER。
+
+如果 DeepSeek-OCR 在当前 NPU 环境无法加载，先保留为离线评估方向；训练式 OCR loss 不要直接接入主训练。
+
 ## 6. 轻量 layer sweep
 
 如果 ratio 消融后仍然是 `correct≈shuffled/wrong<empty`，可以固定当前较稳的 `ratio=0.2`，只扫 decoder 注入层。这个脚本会自动：
