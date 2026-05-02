@@ -22,7 +22,7 @@ import argparse
 import csv
 import json
 from contextlib import nullcontext
-from math import ceil
+from math import ceil, cos, pi
 from glob import glob
 from copy import deepcopy
 from itertools import islice
@@ -190,6 +190,39 @@ def parse_text_recon_layers(text_recon_cfg, decoder_num_layers=None):
                 f"text_recon_conditioning.layers out of range for decoder_num_layers={decoder_num_layers}: {out_of_range}"
             )
     return layers
+
+
+def compute_visual_memory_mask_ratio(base_ratio, schedule_cfg, step, total_steps):
+    """Return the effective visual mask ratio for this training/eval step."""
+    schedule_cfg = schedule_cfg or {}
+    schedule_enabled = bool(schedule_cfg.get("enabled", False))
+    schedule_type = str(schedule_cfg.get("type", "none")).lower()
+    if not schedule_enabled or schedule_type in {"none", "fixed"}:
+        return float(base_ratio), 0.0
+    if schedule_type != "cosine":
+        raise NotImplementedError(f"Unsupported visual_memory_mask.schedule.type={schedule_type}")
+
+    min_ratio = float(schedule_cfg.get("min_ratio", 0.0))
+    max_ratio = float(schedule_cfg.get("max_ratio", base_ratio))
+    warmup_frac = float(schedule_cfg.get("warmup_frac", 0.1))
+    plateau_frac = float(schedule_cfg.get("plateau_frac", 0.2))
+    total_steps = max(1, int(total_steps))
+    step = max(0, int(step))
+    warmup_steps = int(round(total_steps * warmup_frac))
+    plateau_steps = int(round(total_steps * plateau_frac))
+    ramp_steps = max(1, total_steps - warmup_steps - plateau_steps)
+
+    if step <= warmup_steps:
+        progress = 0.0
+        ratio = min_ratio
+    elif step >= warmup_steps + ramp_steps:
+        progress = 1.0
+        ratio = max_ratio
+    else:
+        progress = (step - warmup_steps) / float(ramp_steps)
+        ratio = min_ratio + (max_ratio - min_ratio) * 0.5 * (1.0 - cos(pi * progress))
+    ratio = min(max(ratio, 0.0), 0.999999)
+    return ratio, progress
 
 
 def append_csv_row(path, fieldnames, row):
@@ -518,6 +551,7 @@ def main(args):
     visual_memory_mask_fixed_pattern = bool(visual_memory_mask_cfg.get("fixed_pattern", False))
     visual_memory_mask_seed = int(visual_memory_mask_cfg.get("seed", 0))
     visual_memory_mask_apply_in_eval = bool(visual_memory_mask_cfg.get("apply_in_eval", False))
+    visual_memory_mask_schedule_cfg = visual_memory_mask_cfg.get("schedule", {})
     if text_recon_on and not text_conditioning_on:
         raise ValueError("text_recon_conditioning.enabled requires text_conditioning.enabled=True.")
     if text_hr_on and not text_conditioning_on:
@@ -553,11 +587,19 @@ def main(args):
             "residual_head",
             "residual_pooled_layer",
             "adaln",
-            "residual_cross_attn_visual_mask",
         } and text_hr_on:
             raise ValueError(
                 f"text_recon_conditioning.mode={text_recon_mode} requires text_hr.enabled=false."
             )
+        if text_recon_mode == "residual_cross_attn_visual_mask" and text_hr_on:
+            configured_image_token_len = int(
+                text_hr_cfg.get("image_token_len", config["model"]["init_args"].get("num_latent_tokens", 256))
+            )
+            if configured_image_token_len != 0:
+                raise ValueError(
+                    "residual_cross_attn_visual_mask text_hr uses text-only branch attention, "
+                    "so text_hr.image_token_len must be 0."
+                )
         if visual_memory_mask_enabled:
             if str(visual_memory_mask_cfg.get("mode", "learned_mask_token")) != "learned_mask_token":
                 raise NotImplementedError("Only visual_memory_mask.mode=learned_mask_token is implemented.")
@@ -575,6 +617,19 @@ def main(args):
                     f"text_recon_conditioning.visual_memory_mask.block_size must be positive, "
                     f"got {visual_memory_mask_block_size}"
                 )
+            if bool(visual_memory_mask_schedule_cfg.get("enabled", False)):
+                schedule_type = str(visual_memory_mask_schedule_cfg.get("type", "none")).lower()
+                if schedule_type != "cosine":
+                    raise NotImplementedError(
+                        "Only visual_memory_mask.schedule.type=cosine is implemented."
+                    )
+                max_ratio = float(visual_memory_mask_schedule_cfg.get("max_ratio", visual_memory_mask_ratio))
+                min_ratio = float(visual_memory_mask_schedule_cfg.get("min_ratio", 0.0))
+                if min_ratio < 0.0 or max_ratio < 0.0 or max_ratio >= 1.0 or min_ratio > max_ratio:
+                    raise ValueError(
+                        "visual_memory_mask.schedule requires 0 <= min_ratio <= max_ratio < 1, "
+                        f"got min_ratio={min_ratio}, max_ratio={max_ratio}"
+                    )
         for block_name in ("residual",):
             block_cfg = text_recon_cfg.get(block_name, {})
             if isinstance(block_cfg, dict) and bool(block_cfg.get("enabled", False)):
@@ -1220,7 +1275,8 @@ def main(args):
             f"visual_memory_mask_strategy={visual_memory_mask_strategy}, "
             f"visual_memory_mask_block_size={visual_memory_mask_block_size}, "
             f"visual_memory_mask_fixed_pattern={visual_memory_mask_fixed_pattern}, "
-            f"visual_memory_mask_apply_in_eval={visual_memory_mask_apply_in_eval}"
+            f"visual_memory_mask_apply_in_eval={visual_memory_mask_apply_in_eval}, "
+            f"visual_memory_mask_schedule={visual_memory_mask_schedule_cfg}"
         )
     if args.compile:
         logger.info("compiling the model... (may take several minutes)")
@@ -1334,6 +1390,12 @@ def main(args):
                 break
 
             imgs = x.to(device, non_blocking=True)
+            current_visual_memory_mask_ratio, visual_memory_mask_schedule_progress = compute_visual_memory_mask_ratio(
+                visual_memory_mask_ratio,
+                visual_memory_mask_schedule_cfg,
+                step=train_steps + 1,
+                total_steps=total_steps,
+            )
 
             # dynamic token length training setting, depracated
             if causal_type is not None and dynamic_length_train:
@@ -1492,7 +1554,7 @@ def main(args):
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                         text_injection_layers=text_injection_layers if text_recon_on else None,
                         visual_memory_mask_enabled=text_recon_on and visual_memory_mask_enabled,
-                        visual_memory_mask_ratio=visual_memory_mask_ratio,
+                        visual_memory_mask_ratio=current_visual_memory_mask_ratio,
                         visual_memory_mask_strategy=visual_memory_mask_strategy,
                         visual_memory_mask_block_size=visual_memory_mask_block_size,
                         visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
@@ -1530,7 +1592,7 @@ def main(args):
                         decoder_text_key_padding_mask=decoder_text_key_padding_mask,
                         text_injection_layers=text_injection_layers if text_recon_on else None,
                         visual_memory_mask_enabled=text_recon_on and visual_memory_mask_enabled,
-                        visual_memory_mask_ratio=visual_memory_mask_ratio,
+                        visual_memory_mask_ratio=current_visual_memory_mask_ratio,
                         visual_memory_mask_strategy=visual_memory_mask_strategy,
                         visual_memory_mask_block_size=visual_memory_mask_block_size,
                         visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
@@ -1553,6 +1615,14 @@ def main(args):
                         hr_attn_weights = None
                     inner_feat = None
                 mask_grid = None
+                if text_recon_stats is not None and visual_memory_mask_enabled:
+                    text_recon_stats["visual_memory_mask_config_ratio"] = torch.tensor(
+                        float(visual_memory_mask_ratio), device=device)
+                    text_recon_stats["visual_memory_mask_schedule_enabled"] = torch.tensor(
+                        1.0 if bool(visual_memory_mask_schedule_cfg.get("enabled", False)) else 0.0,
+                        device=device)
+                    text_recon_stats["visual_memory_mask_schedule_progress"] = torch.tensor(
+                        float(visual_memory_mask_schedule_progress), device=device)
                 if text_recon_stats:
                     mask_grid = text_recon_stats.pop("_visual_memory_mask_grid", None)
                 if mask_grid is not None:
@@ -1691,6 +1761,12 @@ def main(args):
                 and train_steps > 0
             ):
                 val_start_time = time.time()
+                val_visual_memory_mask_ratio, _ = compute_visual_memory_mask_ratio(
+                    visual_memory_mask_ratio,
+                    visual_memory_mask_schedule_cfg,
+                    step=train_steps,
+                    total_steps=total_steps,
+                )
                 val_metrics = compute_reconstruction_metrics(
                     vq_model=vq_model,
                     val_loader=val_loader,
@@ -1705,7 +1781,7 @@ def main(args):
                     text_recon_mode=text_recon_mode if text_recon_on else None,
                     text_recon_head_text_layer=text_recon_head_text_layer if text_recon_on else None,
                     visual_memory_mask_enabled=text_recon_on and visual_memory_mask_enabled,
-                    visual_memory_mask_ratio=visual_memory_mask_ratio,
+                    visual_memory_mask_ratio=val_visual_memory_mask_ratio,
                     visual_memory_mask_strategy=visual_memory_mask_strategy,
                     visual_memory_mask_block_size=visual_memory_mask_block_size,
                     visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,

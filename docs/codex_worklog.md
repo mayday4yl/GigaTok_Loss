@@ -2631,3 +2631,28 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - 判断口径：
   - 如果新增层组合扩大 `shuffled/wrong - correct` gap，说明层数对具体文本内容利用有帮助。
   - 如果只改善 MSE 但 gap 仍小，说明层数主要影响整体重建，text-content alignment 仍未解决。
+
+## 2026-05-02 residual cross-attn + cosine mask + HR 接入
+- 目的：在当前最接近师姐建议的结构上试一版更完整的训练设置：
+  - Glyph-ByT5 text encoder。
+  - independent visual-text cross-attn residual branch。
+  - zero-init projection。
+  - block visual mask 的 cosine ratio schedule。
+  - HR loss 加在 residual text cross-attn branch 的 post-softmax attention 上。
+- 代码改动：
+  - `tokenizer/tokenizer_image/vq/blocks.py`
+    - residual text cross-attn branch 在 selected layer 时返回 `[B, heads, image_queries, text_tokens]` attention。
+    - 原 text branch stats 行为保持不变。
+  - `tokenizer/tokenizer_image/vq/vq_train.py`
+    - 允许 `text_recon_conditioning.mode=residual_cross_attn_visual_mask` 开启 `text_hr`。
+    - 该模式要求 `text_hr.image_token_len=0`，因为 branch attention 的 key 只有 text token，没有前置 visual token。
+    - 新增 `visual_memory_mask.schedule`，第一版支持 `type=cosine`。
+    - 训练时按 step 动态计算当前 mask ratio；validation 使用当前 step 的 ratio。
+  - `configs/vq/VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_cosine_hr_l12_18_23_v1.yaml`
+    - layers = `12,18,23`。
+    - `visual_memory_mask.strategy=block_random`，`block_size=2`。
+    - cosine schedule: `0 -> 0.3`，warmup `10%`，plateau `20%`。
+    - `text_hr.enabled=true`，`hr_loss_weight=0.01`，`svd_mode=gram_scaled_identity`。
+- 本地检查：
+  - `python3 -m py_compile tokenizer/tokenizer_image/vq/vq_train.py tokenizer/tokenizer_image/vq/blocks.py tokenizer/tokenizer_image/vq/vq_loss.py tokenizer/tokenizer_image/vq/vq_vit_model.py scripts/stage1/evaluate_textatlas_reconstruction.py`：通过。
+  - 新 config YAML parse：通过。

@@ -2053,17 +2053,20 @@ class ViTDecoder(nn.Module):
             if residual_cross_attn_active:
                 layer_key = str(i)
                 layer_text_memory = residual_cross_attn_lnd_by_layer[i]
+                need_residual_attn_weights = return_text_recon_stats or return_cross_attn_weights
                 text_context, text_attn = self.residual_cross_attn_layers[layer_key](
                     query=latent_tokens,
                     key=layer_text_memory,
                     value=layer_text_memory,
                     key_padding_mask=text_memory_key_padding_mask,
-                    need_weights=return_text_recon_stats,
+                    need_weights=need_residual_attn_weights,
                     average_attn_weights=False,
                 )
                 projected_context = self.residual_cross_attn_projs[layer_key](text_context)
                 latent_tokens = latent_tokens + projected_context
-                if return_text_recon_stats:
+                if return_cross_attn_weights:
+                    selected_cross_attn_weights = text_attn
+                if return_text_recon_stats and text_attn is not None:
                     text_recon_stats.setdefault("residual_cross_attn_context_norms", []).append(
                         text_context.float().norm(dim=-1).mean())
                     text_recon_stats.setdefault("residual_cross_attn_proj_norms", []).append(
