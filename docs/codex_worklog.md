@@ -2689,3 +2689,43 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - 本地检查：
   - `python3 -m py_compile scripts/stage1/evaluate_textatlas_reconstruction.py`：通过。
   - `python3 scripts/stage1/evaluate_textatlas_reconstruction.py --help`：本机缺 `torch`，无法完整 import；服务器环境再跑。
+
+## 2026-05-03 DeepSeek-OCR NPU smoke 和初步 OCR sensitivity
+- 服务器准备：
+  - DeepSeek-OCR 必要文件已下载到 `/home/ma-user/work/GigaTok_hr/gigatok_persist/models/DeepSeek-OCR`。
+  - 目录大小约 `6.3G`。
+  - `AutoTokenizer.from_pretrained(..., trust_remote_code=True)` 可加载，tokenizer size `128827`。
+  - `AutoModel.from_pretrained(..., trust_remote_code=True, _attn_implementation="eager")` 可加载。
+- 兼容性问题：
+  - DeepSeek-OCR 官方 `infer()` 内部硬编码 `.cuda()` 和 `torch.autocast("cuda")`。
+  - 当前服务器是 NPU / torch2.1，不是 CUDA；直接调用会报 `Torch not compiled with CUDA enabled`。
+  - 已在 `evaluate_textatlas_reconstruction.py` 的 `deepseek_ocr` backend 中加入局部 NPU 兼容：
+    - 将 DeepSeek-OCR 推理路径里的 `.cuda()` 映射到 `.npu()`。
+    - 将 `torch.autocast("cuda")` 映射到 `torch.autocast("npu")`。
+    - 给 `generate()` 加 `max_new_tokens` 上限，第一版 smoke 使用 `384`。
+  - 该兼容只在 `--ocr-backend deepseek_ocr` 且 device 为 NPU 时启用，不影响普通训练路径。
+- smoke：
+  - 单张 GT 图直接 DeepSeek-OCR 推理：通过。
+  - `evaluate_textatlas_reconstruction.py` 跑 matched_native 1 张 reconstruction + DeepSeek-OCR：通过。
+  - 输出路径：
+    - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_multi_debug/ocr_eval/deepseek_ocr_matched_native_1img_smoke_v3`
+- dense100 OCR 4 图初步 sensitivity：
+  - 使用 `matched_native` 和 `glyph_r020_l20_23`。
+  - manifest：`cleantextsynth_dense_100_holdout.jsonl` 前 4 张。
+  - OCR backend：DeepSeek-OCR，`base_size=512`，`image_size=512`，`max_new_tokens=384`，`remove_spaces=true`。
+  - 输出路径：
+    - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_multi_debug/ocr_eval/deepseek_ocr_r020_4img_sensitivity`
+  - 初步数值：
+    - `correct/matched_native`: MSE `0.025213`, OCR-CER `0.9313`
+    - `correct/glyph_r020`: MSE `0.024214`, OCR-CER `0.9678`
+    - `empty/glyph_r020`: MSE `0.025432`, OCR-CER `0.9335`
+    - `shuffled/glyph_r020`: MSE `0.024229`, OCR-CER `0.9238`
+    - `wrong/glyph_r020`: MSE `0.024328`, OCR-CER `0.9708`
+  - 解释：
+    - `glyph_r020` 在 correct 下像素 MSE / SSIM 比 matched native 好一点。
+    - 但 OCR-CER 没有同步变好，甚至 correct 的 OCR-CER 比 matched native 和 shuffled 更差。
+    - 这进一步支持当前判断：现有 text branch 可以改善一些图像级重建指标，但还没有稳定提升“文字可读性 / 具体文本正确性”。
+- 注意：
+  - DeepSeek-OCR 在 NPU 上很慢，4 图双 run 评估耗时明显，不适合直接大规模跑 100 图全量 OCR。
+  - 评估过程中发现 DeepSeek-OCR 输出包含 `<|ref|>...<|/ref|><|det|>...` 和截断 bbox 片段；已增强清洗逻辑，后续正式 OCR 指标应使用新清洗版本。
+  - 下一步如果继续推进 OCR 训练 loss，不能使用 `infer()` / 生成字符串 / edit distance 直接反传；应考虑可微的 OCR feature loss 或 teacher-forcing CE。
