@@ -102,6 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deepseek-ocr-attn-implementation", default="eager", help="Transformers attention implementation, e.g. eager, sdpa, flash_attention_2, or none.")
     parser.add_argument("--deepseek-ocr-dtype", choices=("auto", "fp32", "bf16", "fp16"), default="bf16")
     parser.add_argument("--deepseek-ocr-output-dir", type=Path, default=None, help="Temporary/output dir used by DeepSeek-OCR infer().")
+    parser.add_argument("--deepseek-ocr-max-new-tokens", type=int, default=1024, help="Cap DeepSeek-OCR generation length by wrapping generate().")
     parser.add_argument("--text-layer-pair-index", type=int, default=0, help="Deterministic [T5 layer, decoder layer] pair index for text-conditioned reconstruction.")
     parser.add_argument("--text-input-mode", choices=("correct", "empty", "shuffled", "wrong"), default="correct", help="Text used by text-conditioned runs; use empty/shuffled/wrong for sensitivity checks.")
     parser.add_argument("--wrong-text-seed", type=int, default=0, help="Seed for --text-input-mode=shuffled.")
@@ -724,11 +725,19 @@ def extract_paddle_texts(result: Any, min_confidence: float) -> List[str]:
     return texts
 
 
+def clean_deepseek_ocr_text(text: str) -> str:
+    text = re.sub(r"<\|det\|>.*?<\|/det\|>", " ", text, flags=re.DOTALL)
+    text = re.sub(r"</?s>", " ", text)
+    text = re.sub(r"<\|/?ref\|>", " ", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return " ".join(text.split())
+
+
 def stringify_deepseek_ocr_result(result: Any) -> str:
     if result is None:
         return ""
     if isinstance(result, str):
-        return " ".join(result.split())
+        return clean_deepseek_ocr_text(result)
     if isinstance(result, Mapping):
         for key in ("text", "result", "markdown", "output", "prediction", "pred_text"):
             if key in result:
@@ -738,7 +747,7 @@ def stringify_deepseek_ocr_result(result: Any) -> str:
         return " ".join(str(value) for value in result.values() if value is not None)
     if isinstance(result, (list, tuple)):
         return " ".join(stringify_deepseek_ocr_result(item) for item in result if item is not None).strip()
-    return " ".join(str(result).split())
+    return clean_deepseek_ocr_text(str(result))
 
 
 def read_deepseek_saved_text(output_dir: Path) -> str:
@@ -753,10 +762,54 @@ def read_deepseek_saved_text(output_dir: Path) -> str:
             text = re.sub(r"<\|ref\|>.*?<\|/ref\|>", " ", text, flags=re.DOTALL)
             text = re.sub(r"<\|det\|>.*?<\|/det\|>", " ", text, flags=re.DOTALL)
             text = re.sub(r"<[^>]+>", " ", text)
-            text = " ".join(text.split())
+            text = clean_deepseek_ocr_text(text)
             if text:
                 return text
     return ""
+
+
+def enable_deepseek_ocr_npu_cuda_compat() -> None:
+    if getattr(torch, "_deepseek_ocr_npu_cuda_compat", False):
+        return
+    try:
+        import torch_npu  # noqa: F401
+    except Exception as exc:  # pragma: no cover - server optional dependency
+        raise RuntimeError("DeepSeek-OCR NPU mode requires torch_npu because upstream infer() calls .cuda().") from exc
+
+    original_autocast = torch.autocast
+
+    def tensor_cuda_to_npu(self: torch.Tensor, device: Any = None, non_blocking: bool = False, **kwargs: Any) -> torch.Tensor:
+        return self.npu(non_blocking=non_blocking)
+
+    def module_cuda_to_npu(self: torch.nn.Module, device: Any = None) -> torch.nn.Module:
+        return self.npu()
+
+    def autocast_redirect(device_type: str, *args: Any, **kwargs: Any) -> Any:
+        if device_type == "cuda":
+            device_type = "npu"
+        return original_autocast(device_type, *args, **kwargs)
+
+    torch.Tensor.cuda = tensor_cuda_to_npu  # type: ignore[assignment]
+    torch.nn.Module.cuda = module_cuda_to_npu  # type: ignore[assignment]
+    torch.autocast = autocast_redirect  # type: ignore[assignment]
+    torch._deepseek_ocr_npu_cuda_compat = True  # type: ignore[attr-defined]
+
+
+def cap_model_generate(model: torch.nn.Module, max_new_tokens: int) -> None:
+    if max_new_tokens <= 0 or getattr(model, "_deepseek_ocr_generate_capped", False):
+        return
+    original_generate = model.generate
+
+    def generate_with_cap(*args: Any, **kwargs: Any) -> Any:
+        current = kwargs.get("max_new_tokens")
+        if current is None:
+            kwargs["max_new_tokens"] = max_new_tokens
+        else:
+            kwargs["max_new_tokens"] = min(int(current), max_new_tokens)
+        return original_generate(*args, **kwargs)
+
+    model.generate = generate_with_cap  # type: ignore[assignment]
+    model._deepseek_ocr_generate_capped = True  # type: ignore[attr-defined]
 
 
 class OCRReader:
@@ -777,6 +830,7 @@ class OCRReader:
         deepseek_ocr_attn_implementation: str,
         deepseek_ocr_dtype: str,
         deepseek_ocr_output_dir: Optional[Path],
+        deepseek_ocr_max_new_tokens: int,
     ) -> None:
         self.backend = backend
         self.lang = lang
@@ -790,6 +844,7 @@ class OCRReader:
         self.deepseek_ocr_crop_mode = deepseek_ocr_crop_mode
         self.deepseek_ocr_save_results = deepseek_ocr_save_results
         self.deepseek_ocr_test_compress = deepseek_ocr_test_compress
+        self.deepseek_ocr_max_new_tokens = deepseek_ocr_max_new_tokens
         self.deepseek_ocr_counter = 0
         self.deepseek_ocr_tmp = tempfile.TemporaryDirectory(prefix="deepseek_ocr_eval_") if backend == "deepseek_ocr" and deepseek_ocr_output_dir is None else None
         self.deepseek_ocr_output_dir = deepseek_ocr_output_dir or (Path(self.deepseek_ocr_tmp.name) if self.deepseek_ocr_tmp is not None else None)
@@ -808,6 +863,8 @@ class OCRReader:
 
             self.reader = easyocr.Reader([lang], gpu=device_backend != "cpu")
         elif backend == "deepseek_ocr":
+            if device.type == "npu":
+                enable_deepseek_ocr_npu_cuda_compat()
             try:
                 from transformers import AutoModel, AutoTokenizer  # type: ignore
             except ImportError as exc:  # pragma: no cover - optional server dependency
@@ -833,6 +890,7 @@ class OCRReader:
             self.reader = self.reader.eval().to(device)  # type: ignore[union-attr]
             if deepseek_ocr_dtype in dtype_map:
                 self.reader = self.reader.to(dtype_map[deepseek_ocr_dtype])  # type: ignore[union-attr]
+            cap_model_generate(self.reader, deepseek_ocr_max_new_tokens)  # type: ignore[arg-type]
             if self.deepseek_ocr_output_dir is not None:
                 self.deepseek_ocr_output_dir.mkdir(parents=True, exist_ok=True)
         else:
@@ -1118,6 +1176,7 @@ def main() -> None:
         deepseek_ocr_attn_implementation=args.deepseek_ocr_attn_implementation,
         deepseek_ocr_dtype=args.deepseek_ocr_dtype,
         deepseek_ocr_output_dir=args.deepseek_ocr_output_dir,
+        deepseek_ocr_max_new_tokens=args.deepseek_ocr_max_new_tokens,
     )
     ocr_jsonl = args.ocr_jsonl or (output_dir / "ocr_predictions.jsonl" if ocr_reader.enabled else None)
     if ocr_jsonl is not None and ocr_jsonl.exists():
@@ -1194,6 +1253,7 @@ def main() -> None:
         "deepseek_ocr_attn_implementation": args.deepseek_ocr_attn_implementation,
         "deepseek_ocr_dtype": args.deepseek_ocr_dtype,
         "deepseek_ocr_output_dir": str(args.deepseek_ocr_output_dir) if args.deepseek_ocr_output_dir else None,
+        "deepseek_ocr_max_new_tokens": args.deepseek_ocr_max_new_tokens,
         "text_layer_pair_index": args.text_layer_pair_index,
         "text_input_mode": args.text_input_mode,
         "wrong_text_seed": args.wrong_text_seed,
