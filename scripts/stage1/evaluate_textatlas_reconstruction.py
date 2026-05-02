@@ -726,8 +726,9 @@ def extract_paddle_texts(result: Any, min_confidence: float) -> List[str]:
 
 
 def clean_deepseek_ocr_text(text: str) -> str:
-    text = re.sub(r"<\|det\|>.*?<\|/det\|>", " ", text, flags=re.DOTALL)
     text = re.sub(r"<\|ref\|>(.*?)<\|/ref\|>", r" \1 ", text, flags=re.DOTALL)
+    text = re.sub(r"<\|det\|>.*?(?:<\|/det\|>|$)", " ", text, flags=re.DOTALL)
+    text = re.sub(r"\[\[[0-9,\\s\\.-]*(?:\]\])?", " ", text)
     text = re.sub(r"</?s>", " ", text)
     text = re.sub(r"<[^>]+>", " ", text)
     return " ".join(text.split())
