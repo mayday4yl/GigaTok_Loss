@@ -929,6 +929,7 @@ class OCRReader:
                 "crop_mode": self.deepseek_ocr_crop_mode,
                 "save_results": self.deepseek_ocr_save_results,
                 "test_compress": self.deepseek_ocr_test_compress,
+                "eval_mode": True,
             }
             try:
                 result = self.reader.infer(self.tokenizer, **infer_kwargs)  # type: ignore[union-attr]
