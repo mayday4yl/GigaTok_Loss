@@ -326,6 +326,170 @@ class DeepSeekOCRFeatureLoss(torch.nn.Module):
         return loss, stats
 
 
+class DeepSeekOCRTeacherForcingLoss(torch.nn.Module):
+    """Frozen DeepSeek-OCR causal-LM CE against GT text.
+
+    The image token embeddings are inserted manually so the CE loss remains
+    differentiable w.r.t. the reconstructed image.
+    """
+
+    def __init__(
+            self,
+            model_path,
+            device,
+            dtype_name="bf16",
+            image_size=512,
+            attn_implementation="eager",
+            prompt="<image>\n<|grounding|>OCR this image.",
+            target_max_tokens=128,
+            include_eos=False):
+        super().__init__()
+        if AutoModel is None or AutoTokenizer is None:
+            raise ImportError("transformers AutoModel/AutoTokenizer are required for OCR teacher-forcing loss.")
+        if "<image>" not in prompt:
+            raise ValueError("ocr_teacher_forcing_loss.prompt must contain <image>.")
+        dtype_map = {
+            "fp32": torch.float32,
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+        }
+        if dtype_name not in dtype_map:
+            raise ValueError(f"Unsupported OCR dtype={dtype_name}; expected one of {sorted(dtype_map)}")
+        self.tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
+        self.image_size = int(image_size)
+        self.model_dtype = dtype_map[dtype_name]
+        self.prompt = str(prompt)
+        self.target_max_tokens = int(target_max_tokens)
+        self.include_eos = bool(include_eos)
+        kwargs = {
+            "trust_remote_code": True,
+            "use_safetensors": True,
+        }
+        if attn_implementation and str(attn_implementation) != "none":
+            kwargs["_attn_implementation"] = str(attn_implementation)
+        if dtype_name != "fp32":
+            kwargs["torch_dtype"] = self.model_dtype
+        self.ocr_model = AutoModel.from_pretrained(str(model_path), **kwargs).eval().to(device)
+        if dtype_name != "fp32":
+            self.ocr_model = self.ocr_model.to(self.model_dtype)
+        for param in self.ocr_model.parameters():
+            param.requires_grad_(False)
+
+    def _encode_text(self, text, eos=False):
+        token_ids = self.tokenizer.encode(str(text), add_special_tokens=False)
+        if eos:
+            token_ids = token_ids + [1]
+        return token_ids
+
+    def _preprocess(self, images):
+        images = images.clamp(-1, 1)
+        if images.shape[-2:] != (self.image_size, self.image_size):
+            images = F.interpolate(
+                images,
+                size=(self.image_size, self.image_size),
+                mode="bicubic",
+                align_corners=False,
+            )
+        return images.clamp(-1, 1).to(dtype=self.model_dtype)
+
+    def _extract_image_token_features(self, images):
+        core = self.ocr_model.get_model() if hasattr(self.ocr_model, "get_model") else self.ocr_model.model
+        sam_features = core.sam_model(images)
+        vision_features = core.vision_model(images, sam_features)
+        features = torch.cat(
+            (vision_features[:, 1:], sam_features.flatten(2).permute(0, 2, 1)),
+            dim=-1,
+        )
+        features = core.projector(features)
+        batch_size, hw, width = features.shape
+        side = int(math.sqrt(hw))
+        if side * side != hw:
+            raise ValueError(f"DeepSeek-OCR feature token count must be square, got {hw}")
+        features = features.view(batch_size, side, side, width)
+        newline = core.image_newline.to(device=features.device, dtype=features.dtype).view(1, 1, 1, width)
+        newline = newline.expand(batch_size, side, 1, width)
+        features = torch.cat([features, newline], dim=2).reshape(batch_size, side * (side + 1), width)
+        view_separator = core.view_seperator.to(device=features.device, dtype=features.dtype).view(1, 1, width)
+        view_separator = view_separator.expand(batch_size, 1, width)
+        return torch.cat([features, view_separator], dim=1)
+
+    def _build_inputs(self, images, target_texts):
+        image_features = self._extract_image_token_features(self._preprocess(images))
+        batch_size, image_token_count, _ = image_features.shape
+        image_token_id = 128815
+        bos_id = 0
+        eos_id = 1
+        text_before, text_after = self.prompt.split("<image>", 1)
+        before_ids = self._encode_text(text_before, eos=False)
+        after_ids = self._encode_text(text_after, eos=False)
+        prompt_len = 1 + len(before_ids) + image_token_count + len(after_ids)
+
+        input_rows = []
+        label_rows = []
+        target_token_counts = []
+        truncated_count = 0
+        for text in target_texts:
+            target_ids = self._encode_text(text, eos=self.include_eos)
+            if self.target_max_tokens > 0 and len(target_ids) > self.target_max_tokens:
+                target_ids = target_ids[:self.target_max_tokens]
+                truncated_count += 1
+            if not target_ids:
+                target_ids = [eos_id]
+            token_ids = [bos_id] + before_ids + ([image_token_id] * image_token_count) + after_ids + target_ids
+            labels = [-100] * prompt_len + target_ids
+            input_rows.append(token_ids)
+            label_rows.append(labels)
+            target_token_counts.append(len(target_ids))
+
+        max_len = max(len(row) for row in input_rows)
+        pad_id = self.tokenizer.pad_token_id or 0
+        input_ids = torch.full((batch_size, max_len), pad_id, dtype=torch.long, device=images.device)
+        labels = torch.full((batch_size, max_len), -100, dtype=torch.long, device=images.device)
+        attention_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=images.device)
+        image_positions = torch.zeros((batch_size, max_len), dtype=torch.bool, device=images.device)
+        for idx, (tokens, row_labels) in enumerate(zip(input_rows, label_rows)):
+            row_len = len(tokens)
+            input_ids[idx, :row_len] = torch.tensor(tokens, dtype=torch.long, device=images.device)
+            labels[idx, :row_len] = torch.tensor(row_labels, dtype=torch.long, device=images.device)
+            attention_mask[idx, :row_len] = 1
+            image_start = 1 + len(before_ids)
+            image_positions[idx, image_start:image_start + image_token_count] = True
+
+        inputs_embeds = self.ocr_model.get_input_embeddings()(input_ids).clone()
+        for idx in range(batch_size):
+            inputs_embeds[idx, image_positions[idx], :] = image_features[idx].to(dtype=inputs_embeds.dtype)
+
+        stats = {
+            "ocr_tf_prompt_len": torch.tensor(float(prompt_len), device=images.device),
+            "ocr_tf_image_tokens": torch.tensor(float(image_token_count), device=images.device),
+            "ocr_tf_target_tokens_mean": torch.tensor(
+                float(sum(target_token_counts) / max(1, len(target_token_counts))),
+                device=images.device,
+            ),
+            "ocr_tf_truncated_count": torch.tensor(float(truncated_count), device=images.device),
+        }
+        return input_ids, inputs_embeds, attention_mask, labels, stats
+
+    def forward(self, reconstructions, target_texts):
+        input_ids, inputs_embeds, attention_mask, labels, stats = self._build_inputs(reconstructions, target_texts)
+        core = self.ocr_model.get_model() if hasattr(self.ocr_model, "get_model") else self.ocr_model.model
+        original_sam_model = core.sam_model
+        try:
+            core.sam_model = None
+            outputs = self.ocr_model(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                labels=labels,
+                use_cache=False,
+                return_dict=True,
+            )
+        finally:
+            core.sam_model = original_sam_model
+        stats["ocr_tf_ce_loss"] = outputs.loss.detach()
+        return outputs.loss, stats
+
+
 def append_csv_row(path, fieldnames, row):
     exists = os.path.exists(path)
     with open(path, "a", newline="") as handle:
@@ -641,10 +805,12 @@ def main(args):
     text_recon_cfg = config.get("text_recon_conditioning", {})
     text_hr_cfg = config.get("text_hr", {})
     ocr_feature_loss_cfg = config.get("ocr_feature_loss", {})
+    ocr_teacher_forcing_cfg = config.get("ocr_teacher_forcing_loss", {})
     text_conditioning_on = bool(text_conditioning_cfg.get("enabled", False))
     text_recon_on = bool(text_recon_cfg.get("enabled", False))
     text_hr_on = bool(text_hr_cfg.get("enabled", False))
     ocr_feature_loss_on = bool(ocr_feature_loss_cfg.get("enabled", False))
+    ocr_teacher_forcing_on = bool(ocr_teacher_forcing_cfg.get("enabled", False))
     text_recon_mode = str(text_recon_cfg.get("mode", "concat_memory"))
     visual_memory_mask_cfg = text_recon_cfg.get("visual_memory_mask", {})
     visual_memory_mask_enabled = bool(visual_memory_mask_cfg.get("enabled", False))
@@ -753,6 +919,17 @@ def main(args):
             raise ValueError("ocr_feature_loss.weight must be non-negative.")
         if int(ocr_feature_loss_cfg.get("image_size", 512)) <= 0:
             raise ValueError("ocr_feature_loss.image_size must be positive.")
+    if ocr_teacher_forcing_on:
+        if str(ocr_teacher_forcing_cfg.get("backend", "deepseek_ocr")) != "deepseek_ocr":
+            raise NotImplementedError("Only ocr_teacher_forcing_loss.backend=deepseek_ocr is implemented.")
+        if float(ocr_teacher_forcing_cfg.get("weight", 0.0)) < 0.0:
+            raise ValueError("ocr_teacher_forcing_loss.weight must be non-negative.")
+        if int(ocr_teacher_forcing_cfg.get("image_size", 512)) <= 0:
+            raise ValueError("ocr_teacher_forcing_loss.image_size must be positive.")
+        if int(ocr_teacher_forcing_cfg.get("target_max_tokens", 128)) <= 0:
+            raise ValueError("ocr_teacher_forcing_loss.target_max_tokens must be positive.")
+    if ocr_feature_loss_on and ocr_teacher_forcing_on:
+        raise ValueError("Enable only one OCR loss block at a time to avoid loading DeepSeek-OCR twice.")
     freeze_encoder = config["trainer"].get("freeze_encoder", False)
     freeze_quantizer = config["trainer"].get("freeze_quantizer", False)
     freeze_codebook = config["trainer"].get("freeze_codebook", False)
@@ -1074,6 +1251,9 @@ def main(args):
     ocr_feature_loss_module = None
     ocr_feature_loss_weight = 0.0
     ocr_feature_loss_start_step = 0
+    ocr_teacher_forcing_module = None
+    ocr_teacher_forcing_weight = 0.0
+    ocr_teacher_forcing_start_step = 0
     if ocr_feature_loss_on:
         ocr_feature_loss_weight = float(ocr_feature_loss_cfg.get("weight", 0.0))
         ocr_feature_loss_start_step = int(ocr_feature_loss_cfg.get("start_step", 0))
@@ -1092,6 +1272,27 @@ def main(args):
             f"image_size={ocr_feature_loss_cfg.get('image_size', 512)}, "
             f"dtype={ocr_feature_loss_cfg.get('dtype', 'bf16')}, "
             f"loss_type={ocr_feature_loss_cfg.get('loss_type', 'mse')}"
+        )
+    if ocr_teacher_forcing_on:
+        ocr_teacher_forcing_weight = float(ocr_teacher_forcing_cfg.get("weight", 0.0))
+        ocr_teacher_forcing_start_step = int(ocr_teacher_forcing_cfg.get("start_step", 0))
+        ocr_teacher_forcing_module = DeepSeekOCRTeacherForcingLoss(
+            model_path=ocr_teacher_forcing_cfg["model_path"],
+            device=device,
+            dtype_name=str(ocr_teacher_forcing_cfg.get("dtype", "bf16")),
+            image_size=int(ocr_teacher_forcing_cfg.get("image_size", 512)),
+            attn_implementation=str(ocr_teacher_forcing_cfg.get("attn_implementation", "eager")),
+            prompt=str(ocr_teacher_forcing_cfg.get("prompt", "<image>\n<|grounding|>OCR this image.")),
+            target_max_tokens=int(ocr_teacher_forcing_cfg.get("target_max_tokens", 128)),
+            include_eos=bool(ocr_teacher_forcing_cfg.get("include_eos", False)),
+        )
+        logger.info(
+            "Frozen DeepSeek-OCR teacher-forcing CE enabled: "
+            f"model_path={ocr_teacher_forcing_cfg['model_path']}, "
+            f"weight={ocr_teacher_forcing_weight}, start_step={ocr_teacher_forcing_start_step}, "
+            f"image_size={ocr_teacher_forcing_cfg.get('image_size', 512)}, "
+            f"dtype={ocr_teacher_forcing_cfg.get('dtype', 'bf16')}, "
+            f"target_max_tokens={ocr_teacher_forcing_cfg.get('target_max_tokens', 128)}"
         )
 
     # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -1796,6 +1997,29 @@ def main(args):
                         float(ocr_feature_loss_weight),
                         device=device,
                     )
+                ocr_teacher_forcing_loss_value = None
+                if (
+                    ocr_teacher_forcing_module is not None
+                    and train_steps + 1 >= ocr_teacher_forcing_start_step
+                    and ocr_teacher_forcing_weight > 0.0
+                ):
+                    recon_for_ocr = recons_imgs[0] if isinstance(recons_imgs, (list, tuple)) else recons_imgs
+                    ocr_teacher_forcing_loss_value, ocr_tf_stats = ocr_teacher_forcing_module(
+                        recon_for_ocr,
+                        [str(text) for text in texts],
+                    )
+                    if torch.isnan(ocr_teacher_forcing_loss_value).any():
+                        raise RuntimeError("ocr_teacher_forcing_loss contains NaN.")
+                    if text_recon_stats is None:
+                        text_recon_stats = {}
+                    text_recon_stats.update(ocr_tf_stats)
+                    text_recon_stats["weighted_ocr_tf_loss"] = (
+                        ocr_teacher_forcing_weight * ocr_teacher_forcing_loss_value
+                    ).detach()
+                    text_recon_stats["ocr_tf_loss_weight"] = torch.tensor(
+                        float(ocr_teacher_forcing_weight),
+                        device=device,
+                    )
                 loss_gen = vq_loss(inter_loss_set, imgs, recons_imgs, exp_dir=exp_dir, optimizer_idx=0, global_step=train_steps+1, 
                                    last_layer=None,
                                    logger=logger, log_every=args.log_every, ckpt_every=args.ckpt_every,
@@ -1820,6 +2044,8 @@ def main(args):
                                    )
                 if ocr_feature_loss_value is not None:
                     loss_gen = loss_gen + ocr_feature_loss_weight * ocr_feature_loss_value
+                if ocr_teacher_forcing_loss_value is not None:
+                    loss_gen = loss_gen + ocr_teacher_forcing_weight * ocr_teacher_forcing_loss_value
             
             if train_steps + 1 >= int(config["loss"]["params"].get("gen_start", 0)):
                 scaler.scale(loss_gen).backward()

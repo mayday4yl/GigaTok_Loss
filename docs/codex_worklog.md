@@ -2836,3 +2836,40 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - 但 `weight=0.1` 的 feature loss 对具体 text 内容仍没有形成区分：correct 与 shuffled 几乎完全一样。
   - OCR feature loss 当前更像“视觉可读性/特征接近”约束，不是严格的 GT text 内容约束。
   - 如果继续 OCR 路线，优先方向应是 OCR teacher-forcing CE 或显式识别损失，而不是继续只加大 feature loss。
+
+## 2026-05-03 DeepSeek-OCR teacher-forcing CE probe
+- 目的：
+  - 验证冻结 DeepSeek-OCR 的识别 CE 是否能作为“具体文本内容”监督。
+  - 与 feature loss 不同，这里把 GT text token 作为 causal-LM label，而不是只对齐 OCR visual feature。
+- 新增脚本：
+  - `scripts/stage1/ocr_debug/probe_deepseek_ocr_teacher_forcing_loss.py`
+- 做法：
+  - 手动构造 DeepSeek-OCR 的 `<image>` prompt。
+  - 对重建图提取可微 OCR image-token features。
+  - 将 image-token features 写入 `inputs_embeds` 的 image token 位置。
+  - labels 只在 target text token 上计算 CE，prompt/image token 的 labels 为 `-100`。
+  - 不走官方 `infer()` / `generate()`，避免字符串生成不可微。
+- smoke：
+  - 1 图 correct target：
+    - GT 图 CE `0.3622`
+    - matched native 重建 CE `3.6627`
+    - 重建图 CE 对 image gradient norm `0.0927`
+  - 说明 teacher-forcing CE 对重建图可微，且 GT 图和重建图在 OCR 识别损失上差异明显。
+- 内容区分 probe：
+  - 2 图 correct vs shuffled target：
+    - GT 图：correct CE `0.5213`，shuffled CE `3.9215`，gap `+3.4002`
+    - matched native：correct CE `3.7268`，shuffled CE `3.7532`，gap `+0.0265`
+    - glyph_r020：correct CE `3.7242`，shuffled CE `3.7520`，gap `+0.0279`
+  - 结论：
+    - DeepSeek-OCR CE 本身能强区分正确文本和错文本。
+    - 但当前 tokenizer reconstruction 上 correct/shuffled CE gap 仍很小，说明重建图里的文字可读性还不足，OCR 很难读出具体文本。
+- 训练接入：
+  - 在 `vq_train.py` 新增 `DeepSeekOCRTeacherForcingLoss`，默认关闭。
+  - 新增 config：
+    - `configs/vq/VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_ocr_tf_l12_18_23_v1.yaml`
+  - 初始设置：
+    - `ocr_teacher_forcing_loss.enabled=true`
+    - `weight=0.01`
+    - `target_max_tokens=128`
+    - `text_hr.enabled=false`
+  - 待跑：服务器 2-step smoke，确认 CE 可以进入训练且无 NaN/OOM。
