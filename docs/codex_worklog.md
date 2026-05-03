@@ -2807,3 +2807,32 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - 待跑：
   - 本地 `py_compile`。
   - 服务器单卡小 batch 1-2 step smoke，先确认 DeepSeek-OCR feature loss 能进入训练、无 NaN/OOM。
+- 服务器结果：
+  - `py_compile`：通过。
+  - YAML parse：通过。
+  - 2-step smoke：
+    - 运行目录：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_ocr_feature_debug/glyph_ocr_feature_l12_18_23_smoke_2step`
+    - 单卡 `global_batch_size=1`，无 NaN/OOM，checkpoint 保存成功。
+    - 日志确认 OCR feature loss 已进入训练：
+      - `ocr_feature_loss≈1.84e-02~1.95e-02`
+      - `weighted_ocr_feature_loss≈1.84e-03~1.95e-03`
+  - 100-step 小 probe：
+    - 运行目录：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_ocr_feature_debug/glyph_ocr_feature_l12_18_23_100step_gbs1_seed0`
+    - Val 8 张：MSE `0.04849 -> 0.04455`，训练可下降但重建明显弱于之前 dense100 固定 mask probe。
+    - 速度：稳定后约 `1.1 step/s`（单卡 batch=1）。
+  - 100 张 sensitivity：
+    - correct: MSE `0.045331`, PSNR `14.0705`, SSIM `0.2350`
+    - empty: MSE `0.046416`, PSNR `14.0088`, SSIM `0.2613`
+    - shuffled: MSE `0.045330`, PSNR `14.0731`, SSIM `0.2350`
+    - wrong: MSE `0.045499`, PSNR `14.0689`, SSIM `0.2405`
+    - gap：`empty-correct=+0.001085`，`shuffled-correct≈0`，`wrong-correct=+0.000168`
+    - grid：
+      - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_ocr_feature_debug/recon_eval/glyph_ocr_feature_l12_18_23_100step_gbs1_seed0/correct/comparison_grid.png`
+      - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_ocr_feature_debug/recon_eval/glyph_ocr_feature_l12_18_23_100step_gbs1_seed0/empty/comparison_grid.png`
+      - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_ocr_feature_debug/recon_eval/glyph_ocr_feature_l12_18_23_100step_gbs1_seed0/shuffled/comparison_grid.png`
+      - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_ocr_feature_debug/recon_eval/glyph_ocr_feature_l12_18_23_100step_gbs1_seed0/wrong/comparison_grid.png`
+- 当前判断：
+  - 训练接入工程可行，OCR feature loss 可以反传并稳定记录。
+  - 但 `weight=0.1` 的 feature loss 对具体 text 内容仍没有形成区分：correct 与 shuffled 几乎完全一样。
+  - OCR feature loss 当前更像“视觉可读性/特征接近”约束，不是严格的 GT text 内容约束。
+  - 如果继续 OCR 路线，优先方向应是 OCR teacher-forcing CE 或显式识别损失，而不是继续只加大 feature loss。
