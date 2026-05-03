@@ -2872,4 +2872,45 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
     - `weight=0.01`
     - `target_max_tokens=128`
     - `text_hr.enabled=false`
-  - 待跑：服务器 2-step smoke，确认 CE 可以进入训练且无 NaN/OOM。
+  - 服务器 2-step smoke：
+    - 首次运行暴露 `math` import 缺失，已修复并单独提交。
+    - `glyph_ocr_tf_l12_18_23_smoke_2step_v2` 通过，无 NaN/OOM，checkpoint 正常保存。
+    - `ocr_tf_ce_loss` step1 `3.9509`，step2 `3.5198`。
+    - `weighted_ocr_tf_loss` 约 `3.5e-2` 到 `4.0e-2`，已进入总 loss。
+    - 这批 dense 文本样本在 `target_max_tokens=128` 下仍有截断，`ocr_tf_truncated_count` 出现 `1`；短训后需要观察是否要放宽到 `256`。
+    - 输出目录：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_ocr_tf_debug/glyph_ocr_tf_l12_18_23_smoke_2step_v2`
+  - 下一步：
+    - 跑短训 probe，先看 teacher-forcing CE 是否带来 correct / empty / shuffled / wrong 的内容区分。
+
+## 2026-05-03 DeepSeek-OCR teacher-forcing CE 100-step probe
+- 设置：
+  - 数据：`cleantextsynth_dense_100_train/val/holdout`，同批 100 图机制验证。
+  - 模型：Glyph-ByT5 + residual cross-attn visual mask，注入层 `12/18/23`。
+  - mask：cosine schedule，`0 -> 0.3`，block size `2`。
+  - OCR CE：`ocr_teacher_forcing_loss.weight=0.01`，`target_max_tokens=128`，`text_hr.enabled=false`。
+  - 训练：GBS `1`，100 step，val 每 20 step 看 8 张。
+- 训练结果：
+  - 2-step smoke 通过后，100-step 正常完成并保存 checkpoint。
+  - Val MSE：step20 `0.048595`，step40 `0.048285`，step60 `0.046341`，step80 `0.047134`，step100 `0.045395`。
+  - `ocr_tf_ce_loss` 正常进入训练，常见范围约 `1.3 ~ 3.9`，`weighted_ocr_tf_loss` 约 `1.3e-2 ~ 3.9e-2`。
+  - dense 文本仍有明显截断：训练日志里 `glyph_truncated_count` 和 `ocr_tf_truncated_count` 多次为 `1`，说明 `target_max_tokens=128` 只适合 smoke，不适合作为最终 dense 文本监督。
+  - cross-attn residual 输出增长很快，`residual_cross_attn_proj_norm_mean` 后期到 `1.6e2 ~ 1.8e2`，说明新分支对 decoder 扰动仍偏大。
+- reconstruction sensitivity，100 图 holdout，同批机制验证：
+  - `nomask`：
+    - matched native MSE `0.028897`。
+    - glyph OCR-TF correct MSE `0.046204`，empty `0.047498`，shuffled `0.046201`，wrong `0.046386`。
+    - gap：empty-correct `+0.001294`，shuffled-correct `-0.000003`，wrong-correct `+0.000182`。
+  - `evalmask`：
+    - matched native MSE `0.028897`。
+    - glyph OCR-TF correct MSE `0.046087`，empty `0.046916`，shuffled `0.046087`，wrong `0.046158`。
+    - gap：empty-correct `+0.000829`，shuffled-correct `0.000000`，wrong-correct `+0.000071`。
+  - 结论：100-step OCR-TF 后仍主要区分“有无 text”，没有学到 correct vs shuffled/wrong 的具体内容差异；同时整体重建明显弱于 matched native。
+- OCR teacher-forcing CE probe，20 图：
+  - GT 图：correct target CE `0.5982`，shuffled target CE `3.4014`，说明 DeepSeek-OCR CE 本身能强区分正确/错配文本。
+  - matched native：correct CE `3.5514`，shuffled CE `3.5395`。
+  - glyph OCR-TF：correct CE `3.4700`，shuffled CE `3.4687`。
+  - 结论：OCR-TF 训练后 recon 图的 OCR CE 比 matched native 略低，但 correct/shuffled target 几乎无差异，说明重建图仍不可读到足以承载具体文本内容。
+- 当前判断：
+  - DeepSeek-OCR teacher-forcing CE 是可微、可训练的，比 feature loss 更接近“具体文本内容监督”。
+  - 但按当前 `weight=0.01 + target_max_tokens=128 + 无 cross-attn scale` 的设置，短训会牺牲重建质量，且没有形成具体文本内容依赖。
+  - 下一步不建议直接加长这版；应先控制 text branch 扰动，例如给 residual cross-attn 增加可配置 scale/gate，或降低 text branch / OCR CE 的有效强度，再重新做 100-step。
