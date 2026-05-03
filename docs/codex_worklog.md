@@ -2781,3 +2781,29 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - OCR feature loss 可以作为“文字视觉质量 / OCR 感知质量”约束接入训练。
   - 但它不是严格的“GT text 内容正确性”约束，因为 correct / shuffled / wrong 的 OCR feature 距离几乎拉不开。
   - 如果目标是强制具体文本正确，后续仍应考虑 teacher-forcing OCR CE；如果目标是先提升文字可读性和重建质量，可以先小权重接 OCR feature loss 做 100 图 overfit probe。
+
+## 2026-05-03 DeepSeek-OCR feature loss training 接入
+- 目的：
+  - 按师姐建议，在 reconstruction 后接一个冻结 OCR 模块，让重建图在 OCR visual feature 空间靠近 GT 图。
+  - 当前先做可微 feature loss，不做 OCR 字符串生成 / edit distance 反传。
+- 实现范围：
+  - 在 `vq_train.py` 新增 `DeepSeekOCRFeatureLoss`。
+  - 使用冻结 DeepSeek-OCR 的 `sam_model -> vision_model -> projector` 提取 visual tokens。
+  - loss 默认形式：`MSE(ocr_feature(recon), ocr_feature(gt))`。
+  - 只在 `ocr_feature_loss.enabled=true` 时启用；默认旧 config 不受影响。
+  - OCR feature loss 在 `VQLoss` 之后、generator backward 之前加到 `loss_gen`。
+  - 记录日志：
+    - `ocr_feature_loss`
+    - `weighted_ocr_feature_loss`
+    - `ocr_feature_mse`
+    - `ocr_feature_cosine_distance`
+    - `ocr_feature_token_count`
+    - `ocr_feature_loss_weight`
+- 新增 config：
+  - `configs/vq/VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_ocr_feature_l12_18_23_v1.yaml`
+  - 结构：Glyph-ByT5 + residual cross-attn + 12/18/23 层 + cosine block visual mask。
+  - `text_hr.enabled=false`，先隔离 OCR feature loss 的作用。
+  - `ocr_feature_loss.weight=0.1`，`image_size=512`，`dtype=bf16`。
+- 待跑：
+  - 本地 `py_compile`。
+  - 服务器单卡小 batch 1-2 step smoke，先确认 DeepSeek-OCR feature loss 能进入训练、无 NaN/OOM。

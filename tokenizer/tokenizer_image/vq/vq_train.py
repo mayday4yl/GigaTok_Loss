@@ -50,8 +50,9 @@ except Exception:  # noqa: BLE001 - --no-wandb should work even if wandb env is 
     wandb = None
 
 try:
-    from transformers import AutoTokenizer, T5EncoderModel
+    from transformers import AutoModel, AutoTokenizer, T5EncoderModel
 except ImportError:
+    AutoModel = None
     AutoTokenizer = None
     T5EncoderModel = None
 
@@ -223,6 +224,106 @@ def compute_visual_memory_mask_ratio(base_ratio, schedule_cfg, step, total_steps
         ratio = min_ratio + (max_ratio - min_ratio) * 0.5 * (1.0 - cos(pi * progress))
     ratio = min(max(ratio, 0.0), 0.999999)
     return ratio, progress
+
+
+class DeepSeekOCRFeatureLoss(torch.nn.Module):
+    """Frozen DeepSeek-OCR visual feature loss for reconstruction supervision.
+
+    This does not call OCR text generation. It only extracts the projected visual
+    tokens used by DeepSeek-OCR and compares reconstruction vs. GT features.
+    """
+
+    def __init__(
+            self,
+            model_path,
+            device,
+            dtype_name="bf16",
+            image_size=512,
+            attn_implementation="eager",
+            loss_type="mse"):
+        super().__init__()
+        if AutoModel is None:
+            raise ImportError("transformers.AutoModel is required for ocr_feature_loss.backend=deepseek_ocr")
+        dtype_map = {
+            "fp32": torch.float32,
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+        }
+        if dtype_name not in dtype_map:
+            raise ValueError(f"Unsupported OCR dtype={dtype_name}; expected one of {sorted(dtype_map)}")
+        self.image_size = int(image_size)
+        self.loss_type = str(loss_type)
+        self.model_dtype = dtype_map[dtype_name]
+        kwargs = {
+            "trust_remote_code": True,
+            "use_safetensors": True,
+        }
+        if attn_implementation and str(attn_implementation) != "none":
+            kwargs["_attn_implementation"] = str(attn_implementation)
+        if dtype_name != "fp32":
+            kwargs["torch_dtype"] = self.model_dtype
+        self.ocr_model = AutoModel.from_pretrained(str(model_path), **kwargs).eval().to(device)
+        if dtype_name != "fp32":
+            self.ocr_model = self.ocr_model.to(self.model_dtype)
+        for param in self.ocr_model.parameters():
+            param.requires_grad_(False)
+
+    def _preprocess(self, images):
+        images = images.clamp(-1, 1)
+        if images.shape[-2:] != (self.image_size, self.image_size):
+            images = F.interpolate(
+                images,
+                size=(self.image_size, self.image_size),
+                mode="bicubic",
+                align_corners=False,
+            )
+        return images.clamp(-1, 1).to(dtype=self.model_dtype)
+
+    def _extract_features(self, images):
+        core = self.ocr_model.get_model() if hasattr(self.ocr_model, "get_model") else self.ocr_model.model
+        sam_features = core.sam_model(images)
+        vision_features = core.vision_model(images, sam_features)
+        features = torch.cat(
+            (vision_features[:, 1:], sam_features.flatten(2).permute(0, 2, 1)),
+            dim=-1,
+        )
+        return core.projector(features)
+
+    @staticmethod
+    def _cosine_distance(a, b):
+        a_flat = F.normalize(a.float().flatten(1), dim=1)
+        b_flat = F.normalize(b.float().flatten(1), dim=1)
+        return 1.0 - (a_flat * b_flat).sum(dim=1)
+
+    def forward(self, reconstructions, targets):
+        with torch.no_grad():
+            target_features = self._extract_features(self._preprocess(targets)).detach()
+        recon_features = self._extract_features(self._preprocess(reconstructions))
+        feature_mse_per_sample = F.mse_loss(
+            recon_features.float(),
+            target_features.float(),
+            reduction="none",
+        ).flatten(1).mean(dim=1)
+        feature_mse = feature_mse_per_sample.mean()
+        feature_cos = self._cosine_distance(recon_features, target_features).mean()
+        if self.loss_type == "mse":
+            loss = feature_mse
+        elif self.loss_type == "cosine":
+            loss = feature_cos
+        elif self.loss_type in {"mse_cosine", "mse+cosine"}:
+            loss = feature_mse + feature_cos
+        else:
+            raise ValueError(f"Unsupported OCR feature loss_type={self.loss_type}")
+        stats = {
+            "ocr_feature_loss": loss.detach(),
+            "ocr_feature_mse": feature_mse.detach(),
+            "ocr_feature_cosine_distance": feature_cos.detach(),
+            "ocr_feature_token_count": torch.tensor(
+                float(recon_features.shape[1]),
+                device=reconstructions.device,
+            ),
+        }
+        return loss, stats
 
 
 def append_csv_row(path, fieldnames, row):
@@ -539,9 +640,11 @@ def main(args):
     text_conditioning_cfg = config.get("text_conditioning", {})
     text_recon_cfg = config.get("text_recon_conditioning", {})
     text_hr_cfg = config.get("text_hr", {})
+    ocr_feature_loss_cfg = config.get("ocr_feature_loss", {})
     text_conditioning_on = bool(text_conditioning_cfg.get("enabled", False))
     text_recon_on = bool(text_recon_cfg.get("enabled", False))
     text_hr_on = bool(text_hr_cfg.get("enabled", False))
+    ocr_feature_loss_on = bool(ocr_feature_loss_cfg.get("enabled", False))
     text_recon_mode = str(text_recon_cfg.get("mode", "concat_memory"))
     visual_memory_mask_cfg = text_recon_cfg.get("visual_memory_mask", {})
     visual_memory_mask_enabled = bool(visual_memory_mask_cfg.get("enabled", False))
@@ -643,6 +746,13 @@ def main(args):
     text_hr_eps = float(text_hr_cfg.get("eps", 1e-8))
     text_hr_skip_if_valid_tokens_lt = int(text_hr_cfg.get("skip_if_valid_tokens_lt", 2))
     text_max_length = int(text_conditioning_cfg.get("max_length", 128))
+    if ocr_feature_loss_on:
+        if str(ocr_feature_loss_cfg.get("backend", "deepseek_ocr")) != "deepseek_ocr":
+            raise NotImplementedError("Only ocr_feature_loss.backend=deepseek_ocr is implemented.")
+        if float(ocr_feature_loss_cfg.get("weight", 0.0)) < 0.0:
+            raise ValueError("ocr_feature_loss.weight must be non-negative.")
+        if int(ocr_feature_loss_cfg.get("image_size", 512)) <= 0:
+            raise ValueError("ocr_feature_loss.image_size must be positive.")
     freeze_encoder = config["trainer"].get("freeze_encoder", False)
     freeze_quantizer = config["trainer"].get("freeze_quantizer", False)
     freeze_codebook = config["trainer"].get("freeze_codebook", False)
@@ -960,6 +1070,29 @@ def main(args):
     ).to(device)
 
     logger.info(f"Discriminator Parameters: {sum(p.numel() for p in vq_loss.discriminator.parameters()):,}")
+
+    ocr_feature_loss_module = None
+    ocr_feature_loss_weight = 0.0
+    ocr_feature_loss_start_step = 0
+    if ocr_feature_loss_on:
+        ocr_feature_loss_weight = float(ocr_feature_loss_cfg.get("weight", 0.0))
+        ocr_feature_loss_start_step = int(ocr_feature_loss_cfg.get("start_step", 0))
+        ocr_feature_loss_module = DeepSeekOCRFeatureLoss(
+            model_path=ocr_feature_loss_cfg["model_path"],
+            device=device,
+            dtype_name=str(ocr_feature_loss_cfg.get("dtype", "bf16")),
+            image_size=int(ocr_feature_loss_cfg.get("image_size", 512)),
+            attn_implementation=str(ocr_feature_loss_cfg.get("attn_implementation", "eager")),
+            loss_type=str(ocr_feature_loss_cfg.get("loss_type", "mse")),
+        )
+        logger.info(
+            "Frozen DeepSeek-OCR feature loss enabled: "
+            f"model_path={ocr_feature_loss_cfg['model_path']}, "
+            f"weight={ocr_feature_loss_weight}, start_step={ocr_feature_loss_start_step}, "
+            f"image_size={ocr_feature_loss_cfg.get('image_size', 512)}, "
+            f"dtype={ocr_feature_loss_cfg.get('dtype', 'bf16')}, "
+            f"loss_type={ocr_feature_loss_cfg.get('loss_type', 'mse')}"
+        )
 
     # initialize a GradScaler. If enabled=False scaler is a no-op
     scaler = torch.cuda.amp.GradScaler(enabled=(args.device_backend == "cuda" and args.mixed_precision =='fp16'))
@@ -1643,6 +1776,26 @@ def main(args):
                     text_recon_stats["masked_unmasked_mse_ratio"] = (
                         masked_mse / unmasked_mse.clamp_min(1e-8)
                     ).detach()
+                ocr_feature_loss_value = None
+                if (
+                    ocr_feature_loss_module is not None
+                    and train_steps + 1 >= ocr_feature_loss_start_step
+                    and ocr_feature_loss_weight > 0.0
+                ):
+                    recon_for_ocr = recons_imgs[0] if isinstance(recons_imgs, (list, tuple)) else recons_imgs
+                    ocr_feature_loss_value, ocr_feature_stats = ocr_feature_loss_module(recon_for_ocr, imgs)
+                    if torch.isnan(ocr_feature_loss_value).any():
+                        raise RuntimeError("ocr_feature_loss contains NaN.")
+                    if text_recon_stats is None:
+                        text_recon_stats = {}
+                    text_recon_stats.update(ocr_feature_stats)
+                    text_recon_stats["weighted_ocr_feature_loss"] = (
+                        ocr_feature_loss_weight * ocr_feature_loss_value
+                    ).detach()
+                    text_recon_stats["ocr_feature_loss_weight"] = torch.tensor(
+                        float(ocr_feature_loss_weight),
+                        device=device,
+                    )
                 loss_gen = vq_loss(inter_loss_set, imgs, recons_imgs, exp_dir=exp_dir, optimizer_idx=0, global_step=train_steps+1, 
                                    last_layer=None,
                                    logger=logger, log_every=args.log_every, ckpt_every=args.ckpt_every,
@@ -1665,6 +1818,8 @@ def main(args):
                                    text_hr_image_token_len=text_hr_image_token_len,
                                    text_recon_stats=text_recon_stats,
                                    )
+                if ocr_feature_loss_value is not None:
+                    loss_gen = loss_gen + ocr_feature_loss_weight * ocr_feature_loss_value
             
             if train_steps + 1 >= int(config["loss"]["params"].get("gen_start", 0)):
                 scaler.scale(loss_gen).backward()
