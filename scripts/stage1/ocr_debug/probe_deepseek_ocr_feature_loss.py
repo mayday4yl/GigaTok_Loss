@@ -185,11 +185,12 @@ def evaluate_run(
     acc = MetricAccumulator()
     rows_out: List[Dict[str, Any]] = []
     ptdtype = dtype_from_mixed_precision(mixed_precision)
+    all_texts = make_texts(rows, text_input_mode, wrong_text_seed, fixed_wrong_text)
     for start in range(0, len(rows), batch_size):
         batch_rows = rows[start : start + batch_size]
         pil_images = [resize_pad_image(Image.open(str(row["image_path"])), image_size, pad_color) for row in batch_rows]
         gt = torch.stack([pil_to_tensor(img) for img in pil_images]).to(device, non_blocking=True)
-        texts = make_texts(batch_rows, text_input_mode, wrong_text_seed, fixed_wrong_text)
+        texts = all_texts[start : start + len(batch_rows)]
         rec = reconstruct_batch(
             model,
             gt,
