@@ -58,7 +58,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pad-color", default="255,255,255")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-images", type=int, default=4)
-    parser.add_argument("--text-input-mode", choices=("correct", "empty"), default="correct", help="Only used for text-conditioned runs.")
+    parser.add_argument("--text-input-mode", choices=("correct", "empty", "shuffled", "wrong"), default="correct", help="Only used for text-conditioned runs.")
+    parser.add_argument("--wrong-text-seed", type=int, default=0)
+    parser.add_argument("--fixed-wrong-text", default="THIS IS A FIXED WRONG TEXT 0123456789")
     parser.add_argument("--text-layer-pair-index", type=int, default=0)
     parser.add_argument("--attn-implementation", default="eager")
     return parser.parse_args()
@@ -145,10 +147,21 @@ def cosine_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return 1.0 - (a_flat * b_flat).sum(dim=1)
 
 
-def make_texts(rows: Sequence[Mapping[str, Any]], mode: str) -> List[str]:
+def make_texts(rows: Sequence[Mapping[str, Any]], mode: str, wrong_text_seed: int, fixed_wrong_text: str) -> List[str]:
+    import random
+
     if mode == "empty":
         return [""] * len(rows)
-    return [str(row.get("text", "")) for row in rows]
+    if mode == "wrong":
+        return [fixed_wrong_text] * len(rows)
+    texts = [str(row.get("text", "")) for row in rows]
+    if mode == "shuffled":
+        shuffled = list(texts)
+        random.Random(wrong_text_seed).shuffle(shuffled)
+        if len(shuffled) > 1 and shuffled == texts:
+            shuffled = shuffled[1:] + shuffled[:1]
+        return shuffled
+    return texts
 
 
 def evaluate_run(
@@ -166,6 +179,8 @@ def evaluate_run(
     ocr_image_size: int,
     pad_color: Tuple[int, int, int],
     text_input_mode: str,
+    wrong_text_seed: int,
+    fixed_wrong_text: str,
 ) -> Dict[str, Any]:
     acc = MetricAccumulator()
     rows_out: List[Dict[str, Any]] = []
@@ -174,7 +189,7 @@ def evaluate_run(
         batch_rows = rows[start : start + batch_size]
         pil_images = [resize_pad_image(Image.open(str(row["image_path"])), image_size, pad_color) for row in batch_rows]
         gt = torch.stack([pil_to_tensor(img) for img in pil_images]).to(device, non_blocking=True)
-        texts = make_texts(batch_rows, text_input_mode)
+        texts = make_texts(batch_rows, text_input_mode, wrong_text_seed, fixed_wrong_text)
         rec = reconstruct_batch(
             model,
             gt,
@@ -252,6 +267,8 @@ def main() -> None:
         "ocr_dtype": args.ocr_dtype,
         "ocr_image_size": args.ocr_image_size,
         "text_input_mode": args.text_input_mode,
+        "wrong_text_seed": args.wrong_text_seed,
+        "fixed_wrong_text": args.fixed_wrong_text,
         "runs": {},
     }
 
@@ -276,6 +293,8 @@ def main() -> None:
             ocr_image_size=args.ocr_image_size,
             pad_color=pad_color,
             text_input_mode=args.text_input_mode,
+            wrong_text_seed=args.wrong_text_seed,
+            fixed_wrong_text=args.fixed_wrong_text,
         )
         results["runs"][run_name] = result["overall"]
         write_json(output_dir / f"{run_name}_samples.json", result["samples"])
