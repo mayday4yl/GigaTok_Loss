@@ -2729,3 +2729,55 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - DeepSeek-OCR 在 NPU 上很慢，4 图双 run 评估耗时明显，不适合直接大规模跑 100 图全量 OCR。
   - 评估过程中发现 DeepSeek-OCR 输出包含 `<|ref|>...<|/ref|><|det|>...` 和截断 bbox 片段；已增强清洗逻辑，后续正式 OCR 指标应使用新清洗版本。
   - 下一步如果继续推进 OCR 训练 loss，不能使用 `infer()` / 生成字符串 / edit distance 直接反传；应考虑可微的 OCR feature loss 或 teacher-forcing CE。
+
+## 2026-05-03 Frozen DeepSeek-OCR feature loss probe
+- 目的：在不改 `vq_train.py` 的前提下，验证 frozen DeepSeek-OCR visual feature loss 是否可微、数值是否能区分 matched native 和 Glyph text branch。
+- 新增脚本：
+  - `scripts/stage1/ocr_debug/probe_deepseek_ocr_feature_loss.py`
+- 做法：
+  - 加载 GigaTok checkpoint，得到 reconstruction。
+  - 加载冻结 DeepSeek-OCR。
+  - 不走 `infer()` / `generate()`，直接使用：
+    - `sam_model(image)`
+    - `vision_model(image, sam_features)`
+    - `projector(concat(clip_features, sam_features))`
+  - 计算：
+    - `ocr_feature_mse`
+    - `ocr_feature_cosine_distance`
+    - `ocr_feature_grad_norm`
+  - 其中 `ocr_feature_grad_norm` 是对 reconstructed image tensor 的梯度范数，用于验证 loss 是否能反传到重建图。
+- smoke：
+  - `matched_native` 1 张：
+    - `ocr_feature_mse=0.014576`
+    - `ocr_feature_cosine_distance=0.385456`
+    - `ocr_feature_grad_norm=0.002394`
+  - 结论：frozen OCR feature loss 对重建图有非零梯度，可微路径成立。
+- 4 图 matched native vs glyph_r020 correct：
+  - `matched_native`
+    - MSE `0.025300`
+    - SSIM `0.5727`
+    - `ocr_feature_mse=0.015258`
+    - `ocr_feature_cosine_distance=0.401167`
+  - `glyph_r020 correct`
+    - MSE `0.024305`
+    - SSIM `0.5900`
+    - `ocr_feature_mse=0.014894`
+    - `ocr_feature_cosine_distance=0.391085`
+  - 结论：Glyph text branch 的重建在 OCR feature 空间也略接近 GT。
+- 4 图 text sensitivity：
+  - `glyph_r020 correct`
+    - `ocr_feature_mse=0.014894`
+    - `ocr_feature_cosine_distance=0.391085`
+  - `glyph_r020 empty`
+    - `ocr_feature_mse=0.014717`
+    - `ocr_feature_cosine_distance=0.394998`
+  - `glyph_r020 shuffled`
+    - `ocr_feature_mse=0.014898`
+    - `ocr_feature_cosine_distance=0.391242`
+  - `glyph_r020 wrong`
+    - `ocr_feature_mse=0.014829`
+    - `ocr_feature_cosine_distance=0.391632`
+- 当前判断：
+  - OCR feature loss 可以作为“文字视觉质量 / OCR 感知质量”约束接入训练。
+  - 但它不是严格的“GT text 内容正确性”约束，因为 correct / shuffled / wrong 的 OCR feature 距离几乎拉不开。
+  - 如果目标是强制具体文本正确，后续仍应考虑 teacher-forcing OCR CE；如果目标是先提升文字可读性和重建质量，可以先小权重接 OCR feature loss 做 100 图 overfit probe。
