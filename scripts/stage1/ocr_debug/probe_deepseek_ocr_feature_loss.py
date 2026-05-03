@@ -124,6 +124,11 @@ def extract_deepseek_ocr_features(ocr_model: torch.nn.Module, images_norm: torch
     Mirrors the no-crop path in DeepSeek-OCR infer(): SAM features + CLIP features
     are concatenated and projected to the OCR LM hidden width.
     """
+    try:
+        model_dtype = next(ocr_model.parameters()).dtype
+    except StopIteration:
+        model_dtype = images_norm.dtype
+    images_norm = images_norm.to(dtype=model_dtype)
     core = ocr_model.get_model() if hasattr(ocr_model, "get_model") else ocr_model.model
     sam_model = core.sam_model
     vision_model = core.vision_model
