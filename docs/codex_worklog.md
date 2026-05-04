@@ -3092,3 +3092,26 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - 如果 correct 开始明显优于 shuffled/wrong，说明之前 text branch 的有效注入强度确实过弱，后续再调 scale/门控策略。
 - 本地检查：
   - YAML parse 通过，确认 layers=`[6,12,18]`、scale init=`5e-2`、HR weight=`500.0`、OCR weight=`0.005`。
+
+## 2026-05-04 256 GT OCR 可读性诊断脚本
+- 背景：
+  - 当前 TextAtlas materialized manifest 指向的图片文件已经是 `256x256`。
+  - 训练入口对 `textatlas_image_text` 仍会执行 `resize_pad_arr(..., image_size=256)`。
+  - 需要判断当前失败是否可能来自 512 原图缩到 256 后文字已经不可读。
+- 新增脚本：
+  - `scripts/stage1/ocr_debug/diagnose_gt_ocr_readability.py`
+- 功能：
+  - 读取 manifest 中的 GT 图片，不经过 tokenizer/reconstruction。
+  - 使用和训练一致的 resize-pad 到指定 `--image-size`，默认 256。
+  - 调用 OCR backend，默认 `deepseek_ocr`。
+  - 将 OCR 结果和 manifest 中的 rendered text 对比，输出：
+    - `ocr_exact_acc_ci`
+    - `ocr_cer`
+    - `ocr_ned_similarity`
+    - 每张图的 OCR 预测 JSONL
+    - CER 最高的样例列表
+- 判定口径：
+  - 如果 256 GT 的 OCR 可读性较好，说明分辨率下语义信息尚存，当前失败更偏向 text branch 对齐/注入问题。
+  - 如果 256 GT 的 OCR 本身很差，说明整体缩放可能已经破坏文字细节，继续只调 cross-attn 权重收益有限。
+- 本地检查：
+  - `python3 -m py_compile scripts/stage1/ocr_debug/diagnose_gt_ocr_readability.py` 通过。
