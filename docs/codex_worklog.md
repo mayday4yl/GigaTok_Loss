@@ -2941,3 +2941,37 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - 待跑：
   - 服务器 2-step smoke。
   - 如果 scale 日志正常，再跑 100-step dense100，与上一轮 OCR-TF 对比重建是否不再崩。
+
+## 2026-05-04 clean scaled residual cross-attn + HR 配置
+- 目的：
+  - 在不引入 OCR teacher-forcing CE 的情况下，单独测试 `residual_cross_attn` 的可学习 scale 与 text-branch HR loss 是否能改善 attention 分布和训练稳定性。
+  - 对比上一轮 OCR-TF：这版是“干净版”，只保留 Glyph-ByT5 + 独立 text cross-attn + cosine visual mask + HR。
+- 新增配置：
+  - `configs/vq/VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_scaled_hr_l12_18_23_v1.yaml`
+- 关键设置：
+  - `text_conditioning.encoder_backend=glyph_byt5`
+  - `text_recon_conditioning.mode=residual_cross_attn_visual_mask`
+  - text 注入层：`12/18/23`
+  - `residual_cross_attn.scale_init=1e-3`
+  - `residual_cross_attn.scale_learnable=true`
+  - visual mask：`block_random`，`block_size=2`，cosine schedule `0 -> 0.3`
+  - `text_hr.enabled=true`
+  - `text_hr.hr_loss_weight=0.01`
+  - `text_hr.attention_source=residual_cross_attn_post_softmax`
+  - `text_hr.random_one_pair_per_step=true`
+  - `ocr_feature_loss.enabled=false`
+  - `ocr_teacher_forcing_loss.enabled=false`
+- 本地检查：
+  - `py_compile` 通过：
+    - `tokenizer/tokenizer_image/vq/vq_vit_model.py`
+    - `tokenizer/tokenizer_image/vq/blocks.py`
+    - `tokenizer/tokenizer_image/vq/vq_train.py`
+    - `scripts/stage1/evaluate_textatlas_reconstruction.py`
+  - YAML parse 通过，确认：
+    - mode 为 `residual_cross_attn_visual_mask`
+    - layers 为 `[12, 18, 23]`
+    - `text_hr.enabled=true`
+    - OCR feature / OCR teacher-forcing 均关闭
+- 下一步：
+  - 服务器先跑 2-step smoke，确认 `text_hr_loss`、`weighted_text_hr_loss`、`residual_cross_attn_scale_mean`、attention entropy/top1 正常出现。
+  - smoke 通过后再跑 dense100 100-step；如果 Val MSE 不崩，再做 correct / empty / shuffled / wrong sensitivity。
