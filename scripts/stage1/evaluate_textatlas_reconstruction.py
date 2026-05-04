@@ -333,9 +333,20 @@ def validate_text_recon_config(config: Mapping[str, Any]) -> None:
         "residual_head",
         "residual_pooled_layer",
         "adaln",
-        "residual_cross_attn_visual_mask",
     } and bool(config.get("text_hr", {}).get("enabled", False)):
         raise ValueError(f"text_recon_conditioning.mode={mode} requires text_hr.enabled=false.")
+    if mode == "residual_cross_attn_visual_mask" and bool(config.get("text_hr", {}).get("enabled", False)):
+        configured_image_token_len = int(
+            config.get("text_hr", {}).get(
+                "image_token_len",
+                config.get("model", {}).get("init_args", {}).get("num_latent_tokens", 256),
+            )
+        )
+        if configured_image_token_len != 0:
+            raise ValueError(
+                "residual_cross_attn_visual_mask text_hr uses text-only branch attention, "
+                "so text_hr.image_token_len must be 0."
+            )
     if visual_memory_mask_enabled:
         if str(visual_memory_mask_cfg.get("mode", "learned_mask_token")) != "learned_mask_token":
             raise NotImplementedError("Only visual_memory_mask.mode=learned_mask_token is implemented.")

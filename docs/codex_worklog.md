@@ -2975,3 +2975,18 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - 下一步：
   - 服务器先跑 2-step smoke，确认 `text_hr_loss`、`weighted_text_hr_loss`、`residual_cross_attn_scale_mean`、attention entropy/top1 正常出现。
   - smoke 通过后再跑 dense100 100-step；如果 Val MSE 不崩，再做 correct / empty / shuffled / wrong sensitivity。
+
+## 2026-05-04 clean scaled residual cross-attn + HR 评估脚本修正
+- 问题：
+  - 训练脚本已支持 `residual_cross_attn_visual_mask + text_hr.enabled=true`，条件是 `text_hr.image_token_len=0`。
+  - 但 `scripts/stage1/evaluate_textatlas_reconstruction.py` 的 config 校验仍沿用旧规则，直接要求 `residual_cross_attn_visual_mask` 必须 `text_hr.enabled=false`。
+  - 因此 sensitivity 评估在加载 `glyph_scaled_hr` config 时退出：
+    - `ValueError: text_recon_conditioning.mode=residual_cross_attn_visual_mask requires text_hr.enabled=false.`
+- 修正：
+  - 将 eval 脚本的校验规则与 `vq_train.py` 对齐。
+  - 允许 `residual_cross_attn_visual_mask + text_hr.enabled=true`。
+  - 仍要求 `text_hr.image_token_len=0`，因为这一路 HR 用的是 text-only branch attention，不包含 concat visual/text token。
+- 本地检查：
+  - `python3 -m py_compile scripts/stage1/evaluate_textatlas_reconstruction.py` 通过。
+- 结论：
+  - 之前 sensitivity 退出不是内存、端口、VSCode task、C++ main 冲突问题，而是 eval 脚本校验规则过期。
