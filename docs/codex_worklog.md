@@ -3115,3 +3115,18 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - 如果 256 GT 的 OCR 本身很差，说明整体缩放可能已经破坏文字细节，继续只调 cross-attn 权重收益有限。
 - 本地检查：
   - `python3 -m py_compile scripts/stage1/ocr_debug/diagnose_gt_ocr_readability.py` 通过。
+
+## 2026-05-04 OCR-readable 子集 manifest 构建脚本
+- 背景：
+  - 256 GT OCR 可读性诊断显示平均可读性尚可，但少数极密集长文本样本 OCR 几乎不可读。
+  - 为了区分“分辨率导致文字不可恢复”和“text branch 没有学到对齐”，需要在 OCR 可读样本子集上复跑小规模机制验证。
+- 新增脚本：
+  - `scripts/stage1/ocr_debug/make_ocr_readable_manifests.py`
+- 功能：
+  - 读取 `diagnose_gt_ocr_readability.py` 生成的 `gt_ocr_predictions.jsonl`。
+  - 读取原始 source manifest，并按 image path 匹配回完整 TextAtlas row。
+  - 默认用 `ocr_cer <= 0.05` 或 `ocr_ned_similarity >= 0.95` 筛选当前 256 下 OCR 可读的样本。
+  - 输出同批 `train / val / holdout` manifest 和 summary。
+- 判定口径：
+  - 如果 OCR-readable 子集仍然 correct / shuffled / wrong 不拉开，优先判断 text branch 对齐/注入机制有问题。
+  - 如果 OCR-readable 子集能拉开，而 dense100 拉不开，说明 256 缩放下的密集长文本不可读是主要混杂因素。

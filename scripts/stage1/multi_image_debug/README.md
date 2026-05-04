@@ -40,6 +40,52 @@ python3 scripts/stage1/multi_image_debug/make_multi_image_manifests.py \
 - `cleantextsynth_dense_100_holdout.jsonl`
 - `cleantextsynth_dense_100_summary.json`
 
+## 1.1 构建 OCR-readable 子集 manifest
+
+如果要排除“256x256 下文字本身已经不可读”的混杂因素，先用
+`scripts/stage1/ocr_debug/diagnose_gt_ocr_readability.py` 跑 GT OCR 可读性诊断，
+再根据 `gt_ocr_predictions.jsonl` 筛出 OCR 能读准的样本。这个子集仍然是同批
+train / val / holdout，只用于机制验证。
+
+默认筛选规则：
+
+```text
+ocr_cer <= 0.05 或 ocr_ned_similarity >= 0.95
+```
+
+生成 50 张可读子集：
+
+```bash
+cd /home/ma-user/work/GigaTok_hr/GigaTok_Loss
+
+RUN_ROOT=/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_multi_debug
+OCR_DIAG=/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_ocr_readability_debug/cleantextsynth_dense_100_gt256
+
+python3 scripts/stage1/ocr_debug/make_ocr_readable_manifests.py \
+  --source-manifest "$RUN_ROOT/manifests/cleantextsynth_dense_100_holdout.jsonl" \
+  --ocr-predictions-jsonl "$OCR_DIAG/gt_ocr_predictions.jsonl" \
+  --output-dir "$RUN_ROOT/manifests" \
+  --name cleantextsynth_ocr_readable_50 \
+  --max-rows 50 \
+  --max-cer 0.05 \
+  --min-ned 0.95 \
+  --match-mode any \
+  --require-existing-images
+```
+
+如果不足 50 张，先放宽到 `--max-cer 0.10 --min-ned 0.90`，或者加
+`--allow-fewer` 先跑已有样本。输出：
+
+- `cleantextsynth_ocr_readable_50_train.jsonl`
+- `cleantextsynth_ocr_readable_50_val.jsonl`
+- `cleantextsynth_ocr_readable_50_holdout.jsonl`
+- `cleantextsynth_ocr_readable_50_summary.json`
+
+判断口径：
+
+- 如果 OCR-readable 子集上 correct / shuffled 仍然拉不开，说明问题更偏向 text branch 对齐/注入，而不是 256 分辨率本身不可读。
+- 如果这个子集能拉开，而原 dense100 拉不开，说明密集长文本缩到 256 后确实是主要混杂因素，后续要重拿原始分辨率或改 crop 策略。
+
 ## 2. 训练 matched native baseline
 
 这个 baseline 不加 text branch、不加 HR，用来判断 text 分支是否破坏原本 visual reconstruction。
