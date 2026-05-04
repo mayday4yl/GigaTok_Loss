@@ -3072,3 +3072,23 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - 如果 MSE 仍高但 correct 明显优于 shuffled/wrong，说明结构还有救，再回头调权重和训练长度。
 - 本地检查：
   - YAML parse 通过，确认 layers=`[6,12,18]`、HR weight=`500.0`、OCR target weight=`0.005`、OCR start=`50`、warmup=`100`、target tokens=`256`。
+
+## 2026-05-04 scale 放大诊断配置
+- 背景：
+  - `[6,12,18] + HR500 + OCR0.005` 的 200-step 结果仍未拉开 correct / empty / shuffled / wrong。
+  - 日志显示 `residual_cross_attn_scale_mean` 只从约 `0.001` 增长到约 `0.002`，实际注入强度较小。
+  - 需要排查失败是否只是因为 scale 初值太小、text 分支被压得过弱。
+- 新增配置：
+  - `configs/vq/VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_scaled_hr_w500_ocr_tf_warmup_l6_12_18_scale005_v1.yaml`
+- 唯一关键变量：
+  - `text_recon_conditioning.residual_cross_attn.scale_init: 1e-3 -> 5e-2`
+- 保持不变：
+  - text 注入层 `[6,12,18]`。
+  - `text_hr.hr_loss_weight=500.0`。
+  - `ocr_teacher_forcing_loss.weight=0.005`，`start_step=50`，`warmup_steps=100`。
+  - visual mask cosine schedule `0 -> 0.3`，`block_size=2`。
+- 判定口径：
+  - 如果 scale 放大后 correct / shuffled / wrong 仍然不拉开，只是 MSE 变差，说明问题不是单纯 scale 太小。
+  - 如果 correct 开始明显优于 shuffled/wrong，说明之前 text branch 的有效注入强度确实过弱，后续再调 scale/门控策略。
+- 本地检查：
+  - YAML parse 通过，确认 layers=`[6,12,18]`、scale init=`5e-2`、HR weight=`500.0`、OCR weight=`0.005`。
