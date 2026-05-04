@@ -2990,3 +2990,25 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - `python3 -m py_compile scripts/stage1/evaluate_textatlas_reconstruction.py` 通过。
 - 结论：
   - 之前 sensitivity 退出不是内存、端口、VSCode task、C++ main 冲突问题，而是 eval 脚本校验规则过期。
+
+## 2026-05-04 scaled residual cross-attn + HR weight 100 配置
+- 背景：
+  - `hr_loss_weight=0.01` 的 clean scaled HR 版，`text_hr_loss` 约 `1e-7`，`weighted_text_hr_loss` 约 `1e-9`。
+  - 这个量级相对重建 loss 基本可以忽略，sensitivity 结果也显示 correct / empty / shuffled / wrong 完全拉不开。
+- 新增配置：
+  - `configs/vq/VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_scaled_hr_w100_l12_18_23_v1.yaml`
+- 与上一版的唯一实验变量：
+  - `text_hr.hr_loss_weight: 0.01 -> 100.0`
+- 保持不变：
+  - Glyph-ByT5 text encoder。
+  - `mode=residual_cross_attn_visual_mask`。
+  - text 注入层 `12/18/23`。
+  - `residual_cross_attn.scale_init=1e-3`，`scale_learnable=true`。
+  - visual mask cosine schedule `0 -> 0.3`，`block_size=2`。
+  - OCR feature / OCR teacher-forcing 均关闭。
+- 本地检查：
+  - YAML parse 通过，确认 HR 开启、权重为 `100.0`、OCR 关闭。
+- 预期观察：
+  - `weighted_text_hr_loss` 从约 `1e-9` 提高到约 `1e-5`。
+  - 如果 attention 指标仍无变化，说明 `gram_scaled_identity` 这个 HR 约束在当前 text-only cross-attn 分支上影响有限。
+  - 如果 attention 变分散但 correct / shuffled / wrong 仍拉不开，说明 HR 只能改变 attention 形态，不能单独解决具体文本对齐。
