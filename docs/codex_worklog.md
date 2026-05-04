@@ -2914,3 +2914,30 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - DeepSeek-OCR teacher-forcing CE 是可微、可训练的，比 feature loss 更接近“具体文本内容监督”。
   - 但按当前 `weight=0.01 + target_max_tokens=128 + 无 cross-attn scale` 的设置，短训会牺牲重建质量，且没有形成具体文本内容依赖。
   - 下一步不建议直接加长这版；应先控制 text branch 扰动，例如给 residual cross-attn 增加可配置 scale/gate，或降低 text branch / OCR CE 的有效强度，再重新做 100-step。
+
+## 2026-05-04 residual cross-attn scale/gate
+- 目的：
+  - 控制 residual cross-attn text branch 对原 decoder 的扰动。
+  - 解决上一轮 OCR-TF 中 `residual_cross_attn_proj_norm_mean` 后期过大、重建明显弱于 matched native 的问题。
+- 改动：
+  - 在 `residual_cross_attn_visual_mask` 的 text residual add 前新增可配置 scalar：
+    - `latent_tokens = latent_tokens + scale * zero_init_proj(text_context)`
+  - 旧 config 不写 `text_recon_conditioning.residual_cross_attn` 时行为保持不变，等价 `scale=1`。
+  - 新 config：
+    - `configs/vq/VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_ocr_tf_scaled_l12_18_23_v1.yaml`
+    - `residual_cross_attn.scale_init=1e-3`
+    - `residual_cross_attn.scale_learnable=true`
+  - 新增日志：
+    - `residual_cross_attn_raw_proj_norm_mean`：未乘 scale 的 branch 输出。
+    - `residual_cross_attn_proj_norm_mean`：实际加回 decoder 的输出。
+    - `residual_cross_attn_scale_mean`：当前 scale 大小。
+- 本地检查：
+  - `py_compile` 通过：
+    - `tokenizer/tokenizer_image/vq/vq_vit_model.py`
+    - `tokenizer/tokenizer_image/vq/blocks.py`
+    - `tokenizer/tokenizer_image/vq/vq_train.py`
+    - `scripts/stage1/evaluate_textatlas_reconstruction.py`
+  - YAML parse 通过，新 config 确认 OCR-TF 开启、scale init 为 `1e-3`。
+- 待跑：
+  - 服务器 2-step smoke。
+  - 如果 scale 日志正常，再跑 100-step dense100，与上一轮 OCR-TF 对比重建是否不再崩。

@@ -59,6 +59,7 @@ TEXT_CONDITIONING_MISSING_PREFIXES = TEXT_CONDITIONING_MISSING_PREFIXES + (
     "adaln_mlps.",
     "s1to2decoder.residual_cross_attn_layers.",
     "s1to2decoder.residual_cross_attn_projs.",
+    "s1to2decoder.residual_cross_attn_scales.",
 )
 
 
@@ -422,6 +423,7 @@ def load_tokenizer_model(
         residual_head_cfg = text_recon_cfg.get("residual_head", {}) if text_recon_on else {}
         residual_pooled_cfg = text_recon_cfg.get("residual_pooled_layer", {}) if text_recon_on else {}
         adaln_cfg = text_recon_cfg.get("adaln", {}) if text_recon_on else {}
+        residual_cross_attn_cfg = text_recon_cfg.get("residual_cross_attn", {}) if text_recon_on else {}
         concat_memory_mode = text_recon_mode in {"concat_memory", "concat_memory_visual_mask"}
         adaln_layers = None
         residual_cross_attn_layers = None
@@ -454,6 +456,8 @@ def load_tokenizer_model(
             adaln_mlp_hidden_mult=float(adaln_cfg.get("mlp_hidden_mult", 4.0)),
             adaln_zero_init_last=bool(adaln_cfg.get("zero_init_last", True)),
             residual_cross_attn_layers=residual_cross_attn_layers,
+            residual_cross_attn_scale_init=residual_cross_attn_cfg.get("scale_init", None),
+            residual_cross_attn_scale_learnable=bool(residual_cross_attn_cfg.get("scale_learnable", True)),
         )
 
     checkpoint = torch.load(ckpt_path, map_location="cpu")

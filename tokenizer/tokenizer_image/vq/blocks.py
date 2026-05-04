@@ -1610,6 +1610,7 @@ class ViTDecoder(nn.Module):
 
         self.residual_cross_attn_layers = None
         self.residual_cross_attn_projs = None
+        self.residual_cross_attn_scales = None
 
         self.q_upsample = q_upsample
         if self.q_upsample:
@@ -2063,14 +2064,27 @@ class ViTDecoder(nn.Module):
                     average_attn_weights=False,
                 )
                 projected_context = self.residual_cross_attn_projs[layer_key](text_context)
+                raw_projected_context = projected_context
+                if self.residual_cross_attn_scales is not None and layer_key in self.residual_cross_attn_scales:
+                    residual_scale = self.residual_cross_attn_scales[layer_key].to(
+                        device=latent_tokens.device,
+                        dtype=latent_tokens.dtype,
+                    )
+                    projected_context = projected_context * residual_scale
+                else:
+                    residual_scale = latent_tokens.new_tensor(1.0)
                 latent_tokens = latent_tokens + projected_context
                 if return_cross_attn_weights:
                     selected_cross_attn_weights = text_attn
                 if return_text_recon_stats and text_attn is not None:
                     text_recon_stats.setdefault("residual_cross_attn_context_norms", []).append(
                         text_context.float().norm(dim=-1).mean())
+                    text_recon_stats.setdefault("residual_cross_attn_raw_proj_norms", []).append(
+                        raw_projected_context.float().norm(dim=-1).mean())
                     text_recon_stats.setdefault("residual_cross_attn_proj_norms", []).append(
                         projected_context.float().norm(dim=-1).mean())
+                    text_recon_stats.setdefault("residual_cross_attn_scales", []).append(
+                        residual_scale.float().abs().mean())
                     entropy, top1 = self._residual_cross_attn_weight_stats(
                         text_attn,
                         text_memory_key_padding_mask,
@@ -2110,6 +2124,12 @@ class ViTDecoder(nn.Module):
             if "residual_cross_attn_proj_norms" in text_recon_stats:
                 text_recon_stats["residual_cross_attn_proj_norm_mean"] = torch.stack(
                     text_recon_stats.pop("residual_cross_attn_proj_norms")).mean()
+            if "residual_cross_attn_raw_proj_norms" in text_recon_stats:
+                text_recon_stats["residual_cross_attn_raw_proj_norm_mean"] = torch.stack(
+                    text_recon_stats.pop("residual_cross_attn_raw_proj_norms")).mean()
+            if "residual_cross_attn_scales" in text_recon_stats:
+                text_recon_stats["residual_cross_attn_scale_mean"] = torch.stack(
+                    text_recon_stats.pop("residual_cross_attn_scales")).mean()
             if "residual_cross_attn_attn_entropy_norms" in text_recon_stats:
                 text_recon_stats["residual_cross_attn_attn_entropy_norm_mean"] = torch.stack(
                     text_recon_stats.pop("residual_cross_attn_attn_entropy_norms")).mean()

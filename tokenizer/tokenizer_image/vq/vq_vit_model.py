@@ -381,7 +381,9 @@ class VQVitModelPlus(nn.Module):
             adaln_layers=None,
             adaln_mlp_hidden_mult=4.0,
             adaln_zero_init_last=True,
-            residual_cross_attn_layers=None):
+            residual_cross_attn_layers=None,
+            residual_cross_attn_scale_init=None,
+            residual_cross_attn_scale_learnable=True):
         # Text-HR v2: build the small trainable bridge from frozen T5 hidden states
         # to the GigaTok transformer decoder width.
         decoder_width = self.s1to2decoder.width
@@ -485,6 +487,9 @@ class VQVitModelPlus(nn.Module):
                 )
             self.s1to2decoder.residual_cross_attn_layers = nn.ModuleDict()
             self.s1to2decoder.residual_cross_attn_projs = nn.ModuleDict()
+            self.s1to2decoder.residual_cross_attn_scales = None
+            if residual_cross_attn_scale_init is not None:
+                self.s1to2decoder.residual_cross_attn_scales = nn.ParameterDict()
             for layer_idx in residual_cross_attn_layers:
                 layer_key = str(int(layer_idx))
                 self.s1to2decoder.residual_cross_attn_layers[layer_key] = nn.MultiheadAttention(
@@ -497,9 +502,14 @@ class VQVitModelPlus(nn.Module):
                 nn.init.zeros_(proj.weight)
                 nn.init.zeros_(proj.bias)
                 self.s1to2decoder.residual_cross_attn_projs[layer_key] = proj
+                if self.s1to2decoder.residual_cross_attn_scales is not None:
+                    scale = nn.Parameter(torch.tensor(float(residual_cross_attn_scale_init)))
+                    scale.requires_grad_(bool(residual_cross_attn_scale_learnable))
+                    self.s1to2decoder.residual_cross_attn_scales[layer_key] = scale
         else:
             self.s1to2decoder.residual_cross_attn_layers = None
             self.s1to2decoder.residual_cross_attn_projs = None
+            self.s1to2decoder.residual_cross_attn_scales = None
 
     def project_text_memory(self, decoder_text_features):
         # Text-HR v2: decoder_text_features are selected T5 layer features [B, T, d_t5].
