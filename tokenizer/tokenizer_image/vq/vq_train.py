@@ -227,6 +227,22 @@ def compute_visual_memory_mask_ratio(base_ratio, schedule_cfg, step, total_steps
     return ratio, progress
 
 
+def compute_delayed_linear_loss_weight(target_weight, start_step, step, warmup_steps=0, start_weight=0.0):
+    """Return an effective loss weight with optional delayed linear warmup."""
+    target_weight = float(target_weight)
+    start_weight = float(start_weight)
+    start_step = int(start_step)
+    step = int(step)
+    warmup_steps = int(warmup_steps)
+    if target_weight <= 0.0 or step < start_step:
+        return 0.0, 0.0
+    if warmup_steps <= 0:
+        return target_weight, 1.0
+    progress = min(max((step - start_step) / float(warmup_steps), 0.0), 1.0)
+    weight = start_weight + (target_weight - start_weight) * progress
+    return max(weight, 0.0), progress
+
+
 class DeepSeekOCRFeatureLoss(torch.nn.Module):
     """Frozen DeepSeek-OCR visual feature loss for reconstruction supervision.
 
@@ -925,6 +941,10 @@ def main(args):
             raise NotImplementedError("Only ocr_teacher_forcing_loss.backend=deepseek_ocr is implemented.")
         if float(ocr_teacher_forcing_cfg.get("weight", 0.0)) < 0.0:
             raise ValueError("ocr_teacher_forcing_loss.weight must be non-negative.")
+        if float(ocr_teacher_forcing_cfg.get("start_weight", 0.0)) < 0.0:
+            raise ValueError("ocr_teacher_forcing_loss.start_weight must be non-negative.")
+        if int(ocr_teacher_forcing_cfg.get("warmup_steps", 0)) < 0:
+            raise ValueError("ocr_teacher_forcing_loss.warmup_steps must be non-negative.")
         if int(ocr_teacher_forcing_cfg.get("image_size", 512)) <= 0:
             raise ValueError("ocr_teacher_forcing_loss.image_size must be positive.")
         if int(ocr_teacher_forcing_cfg.get("target_max_tokens", 128)) <= 0:
@@ -1258,6 +1278,8 @@ def main(args):
     ocr_teacher_forcing_module = None
     ocr_teacher_forcing_weight = 0.0
     ocr_teacher_forcing_start_step = 0
+    ocr_teacher_forcing_start_weight = 0.0
+    ocr_teacher_forcing_warmup_steps = 0
     if ocr_feature_loss_on:
         ocr_feature_loss_weight = float(ocr_feature_loss_cfg.get("weight", 0.0))
         ocr_feature_loss_start_step = int(ocr_feature_loss_cfg.get("start_step", 0))
@@ -1280,6 +1302,8 @@ def main(args):
     if ocr_teacher_forcing_on:
         ocr_teacher_forcing_weight = float(ocr_teacher_forcing_cfg.get("weight", 0.0))
         ocr_teacher_forcing_start_step = int(ocr_teacher_forcing_cfg.get("start_step", 0))
+        ocr_teacher_forcing_start_weight = float(ocr_teacher_forcing_cfg.get("start_weight", 0.0))
+        ocr_teacher_forcing_warmup_steps = int(ocr_teacher_forcing_cfg.get("warmup_steps", 0))
         ocr_teacher_forcing_module = DeepSeekOCRTeacherForcingLoss(
             model_path=ocr_teacher_forcing_cfg["model_path"],
             device=device,
@@ -1294,6 +1318,8 @@ def main(args):
             "Frozen DeepSeek-OCR teacher-forcing CE enabled: "
             f"model_path={ocr_teacher_forcing_cfg['model_path']}, "
             f"weight={ocr_teacher_forcing_weight}, start_step={ocr_teacher_forcing_start_step}, "
+            f"start_weight={ocr_teacher_forcing_start_weight}, "
+            f"warmup_steps={ocr_teacher_forcing_warmup_steps}, "
             f"image_size={ocr_teacher_forcing_cfg.get('image_size', 512)}, "
             f"dtype={ocr_teacher_forcing_cfg.get('dtype', 'bf16')}, "
             f"target_max_tokens={ocr_teacher_forcing_cfg.get('target_max_tokens', 128)}"
@@ -2004,10 +2030,37 @@ def main(args):
                         device=device,
                     )
                 ocr_teacher_forcing_loss_value = None
+                ocr_teacher_forcing_effective_weight, ocr_teacher_forcing_warmup_progress = (
+                    compute_delayed_linear_loss_weight(
+                        ocr_teacher_forcing_weight,
+                        ocr_teacher_forcing_start_step,
+                        train_steps + 1,
+                        warmup_steps=ocr_teacher_forcing_warmup_steps,
+                        start_weight=ocr_teacher_forcing_start_weight,
+                    )
+                )
+                if ocr_teacher_forcing_module is not None:
+                    if text_recon_stats is None:
+                        text_recon_stats = {}
+                    text_recon_stats["ocr_tf_loss_weight"] = torch.tensor(
+                        float(ocr_teacher_forcing_effective_weight),
+                        device=device,
+                    )
+                    text_recon_stats["ocr_tf_loss_weight_target"] = torch.tensor(
+                        float(ocr_teacher_forcing_weight),
+                        device=device,
+                    )
+                    text_recon_stats["ocr_tf_loss_weight_start"] = torch.tensor(
+                        float(ocr_teacher_forcing_start_weight),
+                        device=device,
+                    )
+                    text_recon_stats["ocr_tf_loss_warmup_progress"] = torch.tensor(
+                        float(ocr_teacher_forcing_warmup_progress),
+                        device=device,
+                    )
                 if (
                     ocr_teacher_forcing_module is not None
-                    and train_steps + 1 >= ocr_teacher_forcing_start_step
-                    and ocr_teacher_forcing_weight > 0.0
+                    and ocr_teacher_forcing_effective_weight > 0.0
                 ):
                     recon_for_ocr = recons_imgs[0] if isinstance(recons_imgs, (list, tuple)) else recons_imgs
                     ocr_teacher_forcing_loss_value, ocr_tf_stats = ocr_teacher_forcing_module(
@@ -2020,12 +2073,8 @@ def main(args):
                         text_recon_stats = {}
                     text_recon_stats.update(ocr_tf_stats)
                     text_recon_stats["weighted_ocr_tf_loss"] = (
-                        ocr_teacher_forcing_weight * ocr_teacher_forcing_loss_value
+                        ocr_teacher_forcing_effective_weight * ocr_teacher_forcing_loss_value
                     ).detach()
-                    text_recon_stats["ocr_tf_loss_weight"] = torch.tensor(
-                        float(ocr_teacher_forcing_weight),
-                        device=device,
-                    )
                 loss_gen = vq_loss(inter_loss_set, imgs, recons_imgs, exp_dir=exp_dir, optimizer_idx=0, global_step=train_steps+1, 
                                    last_layer=None,
                                    logger=logger, log_every=args.log_every, ckpt_every=args.ckpt_every,
@@ -2051,7 +2100,7 @@ def main(args):
                 if ocr_feature_loss_value is not None:
                     loss_gen = loss_gen + ocr_feature_loss_weight * ocr_feature_loss_value
                 if ocr_teacher_forcing_loss_value is not None:
-                    loss_gen = loss_gen + ocr_teacher_forcing_weight * ocr_teacher_forcing_loss_value
+                    loss_gen = loss_gen + ocr_teacher_forcing_effective_weight * ocr_teacher_forcing_loss_value
             
             if train_steps + 1 >= int(config["loss"]["params"].get("gen_start", 0)):
                 scaler.scale(loss_gen).backward()

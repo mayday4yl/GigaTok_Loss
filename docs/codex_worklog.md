@@ -3012,3 +3012,40 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - `weighted_text_hr_loss` 从约 `1e-9` 提高到约 `1e-5`。
   - 如果 attention 指标仍无变化，说明 `gram_scaled_identity` 这个 HR 约束在当前 text-only cross-attn 分支上影响有限。
   - 如果 attention 变分散但 correct / shuffled / wrong 仍拉不开，说明 HR 只能改变 attention 形态，不能单独解决具体文本对齐。
+
+## 2026-05-04 HR + OCR warmup 联合配置
+- 目的：
+  - 在 `scale + HR weight 100` 的基础上，加入延迟启动的 OCR 文本监督。
+  - 避免上一版 OCR 从 step 0 固定权重开启导致重建分支被强扰动。
+- 代码改动：
+  - `vq_train.py` 新增 `compute_delayed_linear_loss_weight()`。
+  - `ocr_teacher_forcing_loss` 支持：
+    - `start_weight`
+    - `warmup_steps`
+  - 训练时记录：
+    - `ocr_tf_loss_weight`：当前实际生效权重。
+    - `ocr_tf_loss_weight_target`：目标权重。
+    - `ocr_tf_loss_weight_start`：warmup 初始权重。
+    - `ocr_tf_loss_warmup_progress`：warmup 进度。
+  - `weighted_ocr_tf_loss` 和实际反传 loss 均使用动态权重，而不是固定 `weight`。
+- 新增配置：
+  - `configs/vq/VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_scaled_hr_w100_ocr_tf_warmup_l12_18_23_v1.yaml`
+- 关键设置：
+  - Glyph-ByT5 text encoder，`max_length=1024`。
+  - text 注入层 `12/18/23`。
+  - `residual_cross_attn.scale_init=1e-3`，`scale_learnable=true`。
+  - visual mask cosine schedule `0 -> 0.3`，`block_size=2`。
+  - `text_hr.enabled=true`，`text_hr.hr_loss_weight=100.0`。
+  - `ocr_teacher_forcing_loss.enabled=true`。
+  - `ocr_teacher_forcing_loss.start_step=50`。
+  - `ocr_teacher_forcing_loss.start_weight=0.0`。
+  - `ocr_teacher_forcing_loss.weight=0.002`。
+  - `ocr_teacher_forcing_loss.warmup_steps=100`。
+  - `ocr_teacher_forcing_loss.target_max_tokens=256`。
+- 本地检查：
+  - `python3 -m py_compile tokenizer/tokenizer_image/vq/vq_train.py scripts/stage1/evaluate_textatlas_reconstruction.py` 通过。
+  - YAML parse 通过，确认 HR=100、OCR 开启、start=50、warmup=100、target tokens=256。
+- 运行建议：
+  - 先 2-step smoke，只确认工程链路，OCR 因 start_step 未启动。
+  - 再 60-step，确认 step 50 后 `ocr_tf_loss_weight` 开始增长、`ocr_tf_ce_loss` 出现。
+  - 如果 60-step 正常，再跑 200-step，并在 100/200 checkpoint 做 sensitivity。
