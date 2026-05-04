@@ -3049,3 +3049,26 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - 先 2-step smoke，只确认工程链路，OCR 因 start_step 未启动。
   - 再 60-step，确认 step 50 后 `ocr_tf_loss_weight` 开始增长、`ocr_tf_ce_loss` 出现。
   - 如果 60-step 正常，再跑 200-step，并在 100/200 checkpoint 做 sensitivity。
+
+## 2026-05-04 前移层位 + 强 HR/OCR 诊断配置
+- 背景：
+  - `[12,18,23] + HR100 + OCR warmup` 的 200-step 结果仍未拉开 correct / empty / shuffled / wrong。
+  - Val MSE 仍明显差于 matched native，说明温和联合约束没有把具体文本内容变成有效重建收益。
+- 新增配置：
+  - `configs/vq/VQ_BL256_dino_disc_glyph_byt5_residual_cross_attn_scaled_hr_w500_ocr_tf_warmup_l6_12_18_v1.yaml`
+- 与上一版相比的诊断变量：
+  - text 注入层从 `[12,18,23]` 前移到 `[6,12,18]`。
+  - `text_hr.hr_loss_weight: 100.0 -> 500.0`。
+  - `ocr_teacher_forcing_loss.weight: 0.002 -> 0.005`，仍保留 `start_step=50` 和 `warmup_steps=100`。
+- 保持不变：
+  - Glyph-ByT5 text encoder，`max_length=1024`。
+  - `mode=residual_cross_attn_visual_mask`。
+  - `residual_cross_attn.scale_init=1e-3`，`scale_learnable=true`。
+  - visual mask cosine schedule `0 -> 0.3`，`block_size=2`。
+  - OCR target tokens 为 `256`。
+- 判定口径：
+  - 这版不是为了训练成最终模型，而是为了确诊 residual cross-attn 路线能否被强约束打开。
+  - 如果 100/200 step 后 shuffled-correct gap 仍为 `1e-5` 级，或 attention top1 仍很高、entropy 很低，则优先判断当前 residual cross-attn 结构难以形成具体文本依赖。
+  - 如果 MSE 仍高但 correct 明显优于 shuffled/wrong，说明结构还有救，再回头调权重和训练长度。
+- 本地检查：
+  - YAML parse 通过，确认 layers=`[6,12,18]`、HR weight=`500.0`、OCR target weight=`0.005`、OCR start=`50`、warmup=`100`、target tokens=`256`。
