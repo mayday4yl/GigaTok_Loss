@@ -3157,3 +3157,21 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - 如果参数梯度非 0 但远小于 MSE，说明 OCR loss 实际约束强度不足；如果参数梯度很大但结果仍差，说明问题更可能是 OCR 梯度方向噪声或缺少空间对齐。
 - 本地检查：
   - `python3 -m py_compile scripts/stage1/ocr_debug/probe_ocr_tf_param_grads.py` 通过。
+
+## 2026-05-07 重建后独立 OCR refiner 诊断脚本
+- 背景：
+  - 师姐建议先分开做：image reconstruction 完成后，单独接一个小网络，只用 OCR loss 去优化这个后处理网络。
+  - 这个实验不改 tokenizer 主训练框架，用来判断 OCR loss 本身能否训练一个图像网络。
+- 新增脚本：
+  - `scripts/stage1/ocr_debug/train_post_recon_ocr_refiner.py`
+- 做法：
+  - 冻结 tokenizer checkpoint，只用它生成 detached reconstruction。
+  - 在 reconstruction 后接一个很小的 residual CNN refiner。
+  - 只训练 refiner 参数。
+  - loss 使用 `ocr_teacher_forcing_loss * ocr_weight + mse(refined, gt) * mse_weight`。
+- 判定口径：
+  - 如果 refiner 的 OCR loss 能明显下降，说明 OCR loss 本身是可用的，当前主模型失败更可能是梯度经过大 tokenizer / text branch 后没有形成有效对齐。
+  - 如果 refiner 都训不动，说明 OCR loss 对当前 256 文本重建图的梯度方向可能太噪，不能直接作为强监督。
+  - 该脚本默认 refiner 不输入 text feature，因此它只验证 OCR loss 的可训练性，不等价于最终 text-conditioned tokenizer。
+- 本地检查：
+  - `python3 -m py_compile scripts/stage1/ocr_debug/train_post_recon_ocr_refiner.py` 通过。
