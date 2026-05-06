@@ -3130,3 +3130,30 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - 判定口径：
   - 如果 OCR-readable 子集仍然 correct / shuffled / wrong 不拉开，优先判断 text branch 对齐/注入机制有问题。
   - 如果 OCR-readable 子集能拉开，而 dense100 拉不开，说明 256 缩放下的密集长文本不可读是主要混杂因素。
+
+## 2026-05-07 OCR loss 参数梯度排查脚本
+- 背景：
+  - 需要确认 DeepSeek-OCR teacher-forcing loss 是否只对重建图有梯度，还是能继续反传到 tokenizer 重建网络的权重。
+  - 已有 `probe_deepseek_ocr_teacher_forcing_loss.py` 只能验证 `OCR loss -> reconstruction image` 的梯度，不直接统计模型参数梯度。
+- 新增脚本：
+  - `scripts/stage1/ocr_debug/probe_ocr_tf_param_grads.py`
+- 功能：
+  - 读取一个 tokenizer checkpoint 和一个小 batch。
+  - 不使用 `torch.inference_mode()`，按训练路径做一次可微重建。
+  - 分别只反传 OCR teacher-forcing loss 和 image MSE。
+  - 按模块统计参数梯度范数：
+    - `cnn_decoder`
+    - `transformer_decoder`
+    - `text_cross_attn_mha`
+    - `text_cross_attn_proj`
+    - `text_cross_attn_scale`
+    - `text_projection`
+    - `post_quant_conv`
+    - frozen encoder / quantizer 等。
+  - 输出 `param_grad_metrics.json`，用于判断 OCR loss 是否到达重建网络，以及 OCR 梯度相对普通 MSE 梯度的量级。
+- 判定口径：
+  - 如果 `reconstruction_grad_norm > 0` 且 decoder/text branch 参数梯度非 0，说明 OCR loss 梯度链路没有断。
+  - 如果只到重建图但对应参数梯度为 0，需要检查模型 forward 中是否有 detach / no_grad / frozen 参数边界。
+  - 如果参数梯度非 0 但远小于 MSE，说明 OCR loss 实际约束强度不足；如果参数梯度很大但结果仍差，说明问题更可能是 OCR 梯度方向噪声或缺少空间对齐。
+- 本地检查：
+  - `python3 -m py_compile scripts/stage1/ocr_debug/probe_ocr_tf_param_grads.py` 通过。
