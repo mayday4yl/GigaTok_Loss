@@ -60,8 +60,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pad-color", default="255,255,255")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--max-images", type=int, default=1)
-    parser.add_argument("--text-input-mode", choices=("correct", "empty", "shuffled", "wrong"), default="correct", help="Text fed into GigaTok text-conditioned runs.")
-    parser.add_argument("--target-text-mode", choices=("correct", "empty", "shuffled", "wrong"), default="correct", help="Target label text for OCR CE.")
+    text_modes = ("correct", "empty", "shuffled", "wrong", "length_matched_wrong")
+    parser.add_argument("--text-input-mode", choices=text_modes, default="correct", help="Text fed into GigaTok text-conditioned runs.")
+    parser.add_argument("--target-text-mode", choices=text_modes, default="correct", help="Target label text for OCR CE.")
     parser.add_argument("--wrong-text-seed", type=int, default=0)
     parser.add_argument("--fixed-wrong-text", default="THIS IS A FIXED WRONG TEXT 0123456789")
     parser.add_argument("--text-layer-pair-index", type=int, default=0)
@@ -93,7 +94,14 @@ def load_manifest_rows(path: Path, max_images: int) -> List[Dict[str, Any]]:
     return rows
 
 
-def make_texts(rows: Sequence[Mapping[str, Any]], mode: str, wrong_text_seed: int, fixed_wrong_text: str) -> List[str]:
+def make_texts(
+        rows: Sequence[Mapping[str, Any]],
+        mode: str,
+        wrong_text_seed: int,
+        fixed_wrong_text: str,
+        *,
+        corpus_rows: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> List[str]:
     if mode == "empty":
         return [""] * len(rows)
     if mode == "wrong":
@@ -105,6 +113,24 @@ def make_texts(rows: Sequence[Mapping[str, Any]], mode: str, wrong_text_seed: in
         if len(shuffled) > 1 and shuffled == texts:
             shuffled = shuffled[1:] + shuffled[:1]
         return shuffled
+    if mode == "length_matched_wrong":
+        candidates = [
+            str(row.get("text", ""))
+            for row in (corpus_rows or rows)
+            if str(row.get("text", "")).strip()
+        ]
+        rng = random.Random(wrong_text_seed)
+        wrong_texts = []
+        for text in texts:
+            valid = [candidate for candidate in candidates if candidate and candidate != text]
+            if not valid:
+                wrong_texts.append(fixed_wrong_text)
+                continue
+            target_len = len(text)
+            best_delta = min(abs(len(candidate) - target_len) for candidate in valid)
+            nearest = [candidate for candidate in valid if abs(len(candidate) - target_len) == best_delta]
+            wrong_texts.append(rng.choice(nearest))
+        return wrong_texts
     return texts
 
 

@@ -3175,3 +3175,76 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - 该脚本默认 refiner 不输入 text feature，因此它只验证 OCR loss 的可训练性，不等价于最终 text-conditioned tokenizer。
 - 本地检查：
   - `python3 -m py_compile scripts/stage1/ocr_debug/train_post_recon_ocr_refiner.py` 通过。
+
+## 2026-05-07 post-recon OCR refiner 200-step 远端诊断
+- 目的：
+  - 按“image reconstruction 完成后，单独接一个小网络，用 OCR loss 优化这个网络”的思路，验证 OCR loss 本身是否能训练一个图像后处理网络。
+- 远端设置：
+  - 数据：OCR-readable 50 张，同批 train / val。
+  - tokenizer：冻结已有 readable50 scale005 checkpoint，只生成 detached reconstruction。
+  - refiner：小 residual CNN，只训练 refiner 参数。
+  - loss：`0.005 * OCR teacher-forcing loss + 1.0 * image MSE`。
+  - 步数：200 step，`target_max_tokens=256`。
+  - 输出目录：
+    - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/post_recon_ocr_refiner_debug/readable50_200step_w005_mse1_seed0_run1`
+- 结果：
+  - 训练能正常跑完，并保存 `refiner_last.pt`。
+  - refiner 参数有梯度，`refiner_scale` 从约 `0.1000` 增到约 `0.1101`，说明这个独立小网络确实在被更新。
+  - val MSE 从 step 1 的约 `0.15320` 到 step 200 的约 `0.15239`，变化很小。
+  - val OCR CE 从 step 1 的约 `3.5029` 到 step 200 的约 `3.5052`，没有形成下降趋势。
+- 结论：
+  - 这次不是“完全没梯度”或“跑不通”的问题；独立 refiner 能被优化。
+  - 但当前 `ocr_weight=0.005` 下，OCR 项没有明显拉动文字语义，整体更像被 MSE anchor 主导。
+  - 下一步如果继续这条诊断，应尝试更强 OCR 权重或 OCR feature/perceptual loss，并输出 refined 图和 OCR 结果，判断是权重太弱还是 OCR CE 梯度方向太噪。
+
+## 2026-05-09 OCR/Text Branch 干净变量排查第一步
+- 背景：
+  - 已确认 OCR teacher-forcing loss 是 active 的，权重后期到 `0.005`，并且 OCR 梯度能到 reconstruction、decoder、text projection 和 residual cross-attn 参数。
+  - 下一步不再排查“有没有开”，而是排查 OCR 有效影响是否足够、是否被 visual path 绕过、以及 text injection 是否太弱。
+- 修改：
+  - 扩展 `scripts/stage1/ocr_debug/probe_ocr_tf_param_grads.py`。
+  - `weighted_ocr` probe 使用真实训练里的 `ocr_weight * raw_ocr_tf_loss`，不再只看 raw CE。
+  - 同一 batch 支持比较：
+    - `weighted_ocr`
+    - `mse`
+    - `full_no_ocr`
+    - `full_with_ocr`
+  - 梯度统计模块改成更贴近当前结构的名字：
+    - `s1to2decoder`
+    - `decoder`
+    - `text_projection`
+    - `residual_cross_attn_projs`
+    - `residual_cross_attn_scales`
+    - `residual_cross_attn_layers`
+  - 对 text/cross-attn 小模块额外输出 weighted OCR 梯度和 MSE/full 梯度的 cosine。
+  - 对所有模块输出 `grad_over_full_with_ocr` 和 `grad_over_mse`。
+  - `make_texts` 支持 `length_matched_wrong`，用于后续更严格的 wrong text 构造；同时修正 Python 3.9 类型注解兼容。
+- 本地检查：
+  - `python3 -m py_compile scripts/stage1/ocr_debug/probe_deepseek_ocr_teacher_forcing_loss.py scripts/stage1/ocr_debug/probe_ocr_tf_param_grads.py` 通过。
+- 远端真实 probe：
+  - 输出：
+    - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/ocr_grad_probe_debug/weighted_full_probe_readable50_fix_20260509_215656/param_grad_metrics.json`
+  - weighted OCR loss：约 `0.0139`，full loss with OCR：约 `1.6950`。
+  - weighted OCR grad / full grad：
+    - `s1to2decoder`: `0.0029`
+    - `decoder`: `0.0069`
+    - `text_projection`: `0.0084`
+    - `residual_cross_attn_projs`: `0.0032`
+    - `residual_cross_attn_scales`: `0.0095`
+    - `residual_cross_attn_layers`: `0.0083`
+  - weighted OCR grad / MSE grad：
+    - `s1to2decoder`: `0.0314`
+    - `decoder`: `0.0261`
+    - `text_projection`: `0.0503`
+    - `residual_cross_attn_projs`: `0.0317`
+    - `residual_cross_attn_scales`: `0.0126`
+    - `residual_cross_attn_layers`: `0.0485`
+  - 小模块 cosine：
+    - `text_projection`: OCR vs full-with-OCR 约 `-0.336`
+    - `residual_cross_attn_projs`: OCR vs full-with-OCR 约 `0.0069`
+    - `residual_cross_attn_scales`: OCR vs full-with-OCR 约 `-0.609`
+    - `residual_cross_attn_layers`: OCR vs full-with-OCR 约 `-0.303`
+- 结论：
+  - 当前 `ocr_weight=0.005` 下，OCR 是 active 的，但对实际总梯度贡献很弱，多数关键模块只有 full grad 的约 `0.3%~1%`。
+  - text/cross-attn 小模块上 OCR 梯度和 full/MSE 梯度方向不稳定，部分为负 cosine。
+  - 这支持下一步先做“纯 OCR weight sweep”，不要同时改 mask 或 scale。
