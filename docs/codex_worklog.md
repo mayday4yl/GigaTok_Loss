@@ -3277,3 +3277,12 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - 下一步：
   - 同步到远端后，先用 `WEIGHTS="0.005" ITERS=2` 做 smoke。
   - smoke 通过后再跑完整 `0.005 / 0.01 / 0.02 / 0.05` sweep。
+- 远端 smoke：
+  - 命令核心：
+    - `SAVE_ROOT=.../text_hr_ocr_weight_sweep_smoke_debug WEIGHTS="0.005" ITERS=2 RUN_GRAD_PROBE=0 RUN_RECON_EVAL=0 RUN_OCR_TF_EVAL=0 RUN_IMAGE_DIFF=0 bash scripts/stage1/ocr_debug/run_ocr_weight_sweep.sh`
+  - 结果：
+    - 训练正常完成并保存 checkpoint：
+      - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_ocr_weight_sweep_smoke_debug/glyph_ocr_weight_sweep_smoke_ocrw0p005_2step_gbs8_seed0/checkpoints/last.pt`
+    - summary CSV 正常写出：
+      - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_ocr_weight_sweep_smoke_debug/ocr_weight_sweep_summary.csv`
+    - smoke 关闭了 eval/probe，所以 summary 中 eval 字段为空是预期行为。
