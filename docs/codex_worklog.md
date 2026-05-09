@@ -3248,3 +3248,32 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - 当前 `ocr_weight=0.005` 下，OCR 是 active 的，但对实际总梯度贡献很弱，多数关键模块只有 full grad 的约 `0.3%~1%`。
   - text/cross-attn 小模块上 OCR 梯度和 full/MSE 梯度方向不稳定，部分为负 cosine。
   - 这支持下一步先做“纯 OCR weight sweep”，不要同时改 mask 或 scale。
+
+## 2026-05-09 OCR weight sweep 工具
+- 目的：
+  - 按干净变量排查计划进入第二步，只改变 `ocr_teacher_forcing_loss.weight`，不同时改变 visual mask、scale_init 或注入层。
+  - 在 OCR-readable 50 张图上短程 overfit，判断问题是 OCR 有效强度太弱，还是 OCR loss 本身不能绑定输入 text branch。
+- 修改：
+  - 新增 `scripts/stage1/ocr_debug/run_ocr_weight_sweep.sh`。
+    - 从当前 scale005 / HR500 / OCR warmup 配置生成四个临时 config。
+    - 默认 sweep：`0.005 / 0.01 / 0.02 / 0.05`。
+    - 每组默认跑 200 step，数据固定为 `cleantextsynth_ocr_readable_50`。
+    - 训练后可自动跑：
+      - weighted OCR/MSE/full 梯度 probe；
+      - correct / empty / shuffled / length-matched-wrong reconstruction eval；
+      - OCR teacher-forcing CE eval；
+      - correct-vs-wrong 图像差异度量。
+  - 新增 `scripts/stage1/ocr_debug/measure_text_mode_image_diff.py`。
+    - 同一个 checkpoint 下，只改变输入文本，计算 correct reconstruction 和 empty/shuffled/length-matched-wrong reconstruction 的差异。
+    - 输出 full-image mean abs diff、top-5% pixel diff、max pixel diff，避免文字区域太小导致全图平均被稀释。
+  - 新增 `scripts/stage1/ocr_debug/summarize_ocr_weight_sweep.py`。
+    - 汇总训练日志、reconstruction eval、OCR CE eval、梯度 probe 和 image diff 到一个 CSV。
+  - 扩展 `scripts/stage1/evaluate_textatlas_reconstruction.py`。
+    - `--text-input-mode` 新增 `length_matched_wrong`。
+    - wrong text 从同一个 manifest 里选择长度接近但不是当前样本的文本，作为更严格的主错误文本。
+- 本地检查：
+  - `python3 -m py_compile scripts/stage1/evaluate_textatlas_reconstruction.py scripts/stage1/ocr_debug/measure_text_mode_image_diff.py scripts/stage1/ocr_debug/summarize_ocr_weight_sweep.py` 通过。
+  - `bash -n scripts/stage1/ocr_debug/run_ocr_weight_sweep.sh` 通过。
+- 下一步：
+  - 同步到远端后，先用 `WEIGHTS="0.005" ITERS=2` 做 smoke。
+  - smoke 通过后再跑完整 `0.005 / 0.01 / 0.02 / 0.05` sweep。

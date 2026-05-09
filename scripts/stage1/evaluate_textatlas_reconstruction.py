@@ -105,7 +105,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deepseek-ocr-output-dir", type=Path, default=None, help="Temporary/output dir used by DeepSeek-OCR infer().")
     parser.add_argument("--deepseek-ocr-max-new-tokens", type=int, default=1024, help="Cap DeepSeek-OCR generation length by wrapping generate().")
     parser.add_argument("--text-layer-pair-index", type=int, default=0, help="Deterministic [T5 layer, decoder layer] pair index for text-conditioned reconstruction.")
-    parser.add_argument("--text-input-mode", choices=("correct", "empty", "shuffled", "wrong"), default="correct", help="Text used by text-conditioned runs; use empty/shuffled/wrong for sensitivity checks.")
+    parser.add_argument("--text-input-mode", choices=("correct", "empty", "shuffled", "wrong", "length_matched_wrong"), default="correct", help="Text used by text-conditioned runs; use empty/shuffled/length_matched_wrong for sensitivity checks.")
     parser.add_argument("--wrong-text-seed", type=int, default=0, help="Seed for --text-input-mode=shuffled.")
     parser.add_argument("--fixed-wrong-text", default="THIS IS A FIXED WRONG TEXT 0123456789", help="Text used for --text-input-mode=wrong.")
     parser.add_argument("--strip-punctuation", action="store_true", help="Remove punctuation before CER/NED/exact-match metrics.")
@@ -986,6 +986,42 @@ def select_grid_indices(num_images: int, grid_samples: int, seed: int) -> List[i
     return sorted(rng.sample(range(num_images), grid_samples))
 
 
+def make_text_inputs_for_mode(
+        correct_texts: Sequence[str],
+        mode: str,
+        wrong_text_seed: int,
+        fixed_wrong_text: str,
+) -> List[str]:
+    if mode == "correct":
+        return list(correct_texts)
+    if mode == "empty":
+        return [""] * len(correct_texts)
+    if mode == "wrong":
+        return [fixed_wrong_text] * len(correct_texts)
+    if mode == "shuffled":
+        shuffled = list(correct_texts)
+        random.Random(wrong_text_seed).shuffle(shuffled)
+        if len(shuffled) > 1 and shuffled == list(correct_texts):
+            shuffled = shuffled[1:] + shuffled[:1]
+        return shuffled
+    if mode == "length_matched_wrong":
+        texts = [str(text or "") for text in correct_texts]
+        non_empty = [(idx, text) for idx, text in enumerate(texts) if text.strip()]
+        rng = random.Random(wrong_text_seed)
+        wrong_texts: List[str] = []
+        for idx, text in enumerate(texts):
+            candidates = [(other_idx, other_text) for other_idx, other_text in non_empty if other_idx != idx]
+            if not text.strip() or not candidates:
+                wrong_texts.append(fixed_wrong_text)
+                continue
+            target_len = len(text)
+            candidates.sort(key=lambda item: abs(len(item[1]) - target_len))
+            nearest = candidates[: min(8, len(candidates))]
+            wrong_texts.append(rng.choice(nearest)[1])
+        return wrong_texts
+    raise ValueError(f"unsupported text_input_mode: {mode}")
+
+
 def evaluate_run(
     *,
     run_name: str,
@@ -1019,17 +1055,12 @@ def evaluate_run(
         metadata_by_path.get(str(path.resolve()), {}).get("text", "")
         for path in image_paths
     ]
-    if text_input_mode == "shuffled":
-        text_inputs_for_model = list(correct_texts)
-        random.Random(wrong_text_seed).shuffle(text_inputs_for_model)
-        if len(text_inputs_for_model) > 1 and text_inputs_for_model == correct_texts:
-            text_inputs_for_model = text_inputs_for_model[1:] + text_inputs_for_model[:1]
-    elif text_input_mode == "wrong":
-        text_inputs_for_model = [fixed_wrong_text] * len(image_paths)
-    elif text_input_mode == "empty":
-        text_inputs_for_model = [""] * len(image_paths)
-    else:
-        text_inputs_for_model = correct_texts
+    text_inputs_for_model = make_text_inputs_for_mode(
+        correct_texts,
+        text_input_mode,
+        wrong_text_seed,
+        fixed_wrong_text,
+    )
 
     for start in range(0, len(image_paths), batch_size):
         batch_paths = image_paths[start : start + batch_size]
