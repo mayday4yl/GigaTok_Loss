@@ -74,6 +74,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid-samples", type=int, default=12)
     parser.add_argument("--grid-seed", type=int, default=0)
     parser.add_argument("--checkpoint-weight-key", choices=("auto", "model", "ema", "state_dict"), default="model", help="Use model by default to match training validation metrics; auto preserves historical EMA preference.")
+    parser.add_argument("--skip-reconstruction-eval", action="store_true", help="Do not forward checkpoints for reconstruction metrics. Intended for --image-metric-source=train_val_csv table repair.")
+    parser.add_argument("--reuse-deepseek-predictions", type=Path, default=None, help="Reuse an existing DeepSeek OCR JSONL instead of rerunning DeepSeek-OCR.")
     parser.add_argument("--python-bin", default=sys.executable)
     parser.add_argument("--skip-deepseek-ocr", action="store_true")
     parser.add_argument("--deepseek-ocr-model", default="/home/ma-user/work/GigaTok_hr/gigatok_persist/models/DeepSeek-OCR")
@@ -113,6 +115,11 @@ def write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False))
             handle.write("\n")
+
+
+def copy_jsonl(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
 
 
 def write_csv(path: Path, fields: Sequence[str], rows: Sequence[Mapping[str, Any]]) -> None:
@@ -250,7 +257,7 @@ def normalize_ocr_predictions(raw_path: Path, flat_path: Path) -> Dict[str, Dict
     if not raw_path.exists():
         return {}
     for row in iter_jsonl(raw_path):
-        metrics = row.get("metrics") or {}
+        metrics = row.get("metrics") or row
         run = str(row.get("run") or "")
         flat = {
             "run": run,
@@ -276,6 +283,15 @@ def normalize_ocr_predictions(raw_path: Path, flat_path: Path) -> Dict[str, Dict
         }
         for run, values in by_run.items()
     }
+
+
+def manifest_image_count(path: Path, max_images: int) -> int:
+    count = 0
+    for _ in iter_jsonl(path):
+        count += 1
+        if max_images > 0 and count >= max_images:
+            break
+    return count
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -581,24 +597,36 @@ def main() -> None:
     if not args.manifest_jsonl.exists():
         raise FileNotFoundError(f"manifest not found: {args.manifest_jsonl}")
 
-    recon_dir = args.output_dir / "reconstruction"
-    recon_metrics_path = run_evaluate(
-        args=args,
-        runs=runs,
-        output_dir=recon_dir,
-        ocr_backend="none",
-        ocr_jsonl=None,
-        grid_samples=args.grid_samples,
-    )
-    recon_metrics = read_json(recon_metrics_path)
-    grid_src = recon_dir / "comparison_grid.png"
-    if grid_src.exists():
-        shutil.copy2(grid_src, args.output_dir / "qual_grid_5000.png")
+    if args.skip_reconstruction_eval:
+        if args.image_metric_source != "train_val_csv":
+            raise ValueError("--skip-reconstruction-eval requires --image-metric-source train_val_csv")
+        recon_metrics = {"num_images": manifest_image_count(args.manifest_jsonl, args.max_images), "runs": {}}
+    else:
+        recon_dir = args.output_dir / "reconstruction"
+        recon_metrics_path = run_evaluate(
+            args=args,
+            runs=runs,
+            output_dir=recon_dir,
+            ocr_backend="none",
+            ocr_jsonl=None,
+            grid_samples=args.grid_samples,
+        )
+        recon_metrics = read_json(recon_metrics_path)
+        grid_src = recon_dir / "comparison_grid.png"
+        if grid_src.exists():
+            shutil.copy2(grid_src, args.output_dir / "qual_grid_5000.png")
 
     deepseek_metrics: Dict[str, Dict[str, float | None]] = {}
     deepseek_note = "skipped"
     deepseek_model = Path(str(args.deepseek_ocr_model))
-    if args.skip_deepseek_ocr:
+    if args.reuse_deepseek_predictions is not None:
+        if not args.reuse_deepseek_predictions.exists():
+            raise FileNotFoundError(f"--reuse-deepseek-predictions not found: {args.reuse_deepseek_predictions}")
+        deepseek_flat = args.output_dir / "ocr_predictions_deepseek.jsonl"
+        copy_jsonl(args.reuse_deepseek_predictions, deepseek_flat)
+        deepseek_metrics = normalize_ocr_predictions(args.reuse_deepseek_predictions, deepseek_flat)
+        deepseek_note = f"reused DeepSeek OCR predictions from {args.reuse_deepseek_predictions}"
+    elif args.skip_deepseek_ocr:
         deepseek_note = "disabled by --skip-deepseek-ocr"
     elif not deepseek_model.exists():
         deepseek_note = f"DeepSeek OCR model not found: {deepseek_model}"
