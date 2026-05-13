@@ -23,6 +23,8 @@ SETTING_FIELDS = [
     "ocr_loss",
     "step",
     "num_images",
+    "image_metric_source",
+    "image_metric_mse",
     "psnr",
     "ssim",
     "lpips",
@@ -57,6 +59,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest-jsonl", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--step", type=int, default=5000)
+    parser.add_argument(
+        "--image-metric-source",
+        choices=("setting_eval", "train_val_csv"),
+        default="setting_eval",
+        help="Where to read PSNR/SSIM from. train_val_csv matches the historical training summary; setting_eval uses the freshly recomputed reconstruction metrics.",
+    )
     parser.add_argument("--device-backend", choices=("cuda", "npu", "cpu"), default="npu")
     parser.add_argument("--device-id", type=int, default=0)
     parser.add_argument("--mixed-precision", choices=("none", "bf16", "fp16"), default="bf16")
@@ -286,6 +294,27 @@ def final_train_value(run_dir: Path, field: str) -> str:
     return ""
 
 
+def final_validation_metrics(run_dir: Path) -> dict[str, Any]:
+    candidates = [
+        run_dir / "val.csv",
+        run_dir / "metrics" / "val_metrics.csv",
+    ]
+    for path in candidates:
+        rows = read_csv_rows(path)
+        if not rows:
+            continue
+        final = rows[-1]
+        return {
+            "source": str(path),
+            "step": parse_float(final.get("step")),
+            "val_mse": parse_float(final.get("val_mse")),
+            "val_psnr": parse_float(final.get("val_psnr")),
+            "val_ssim": parse_float(final.get("val_ssim")),
+            "val_images": parse_float(final.get("val_images")),
+        }
+    return {"source": None, "step": None, "val_mse": None, "val_psnr": None, "val_ssim": None, "val_images": None}
+
+
 def thirdparty_backend(requested: str) -> tuple[str | None, str]:
     if requested == "none":
         return None, "disabled by --thirdparty-ocr-backend none"
@@ -312,6 +341,7 @@ def build_setting_rows(
     args: argparse.Namespace,
     runs: Mapping[str, Mapping[str, Any]],
     recon_metrics: Mapping[str, Any],
+    image_metric_source: str,
     deepseek_metrics: Mapping[str, Mapping[str, float | None]],
     thirdparty_metrics: Mapping[str, Mapping[str, float | None]],
     thirdparty_name: str | None,
@@ -320,8 +350,13 @@ def build_setting_rows(
     rows = []
     for name, spec in runs.items():
         overall = ((recon_metrics.get("runs") or {}).get(name) or {}).get("overall") or {}
+        train = final_validation_metrics(Path(str(spec["run_dir"]))) if image_metric_source == "train_val_csv" else {}
         deep = deepseek_metrics.get(name, {})
         third = thirdparty_metrics.get(name, {})
+        psnr = train.get("val_psnr") if image_metric_source == "train_val_csv" else overall.get("psnr")
+        ssim = train.get("val_ssim") if image_metric_source == "train_val_csv" else overall.get("ssim")
+        mse = train.get("val_mse") if image_metric_source == "train_val_csv" else overall.get("mse")
+        image_metric_note = "training val.csv" if image_metric_source == "train_val_csv" else "setting_eval reconstruction"
         rows.append(
             {
                 "run": name,
@@ -330,8 +365,8 @@ def build_setting_rows(
                 "ocr_loss": bool(spec.get("ocr_loss")),
                 "step": args.step,
                 "num_images": num_images,
-                "psnr": overall.get("psnr"),
-                "ssim": overall.get("ssim"),
+                "psnr": psnr,
+                "ssim": ssim,
                 "lpips": "",
                 "deepseek_ocr_cer": deep.get("cer"),
                 "deepseek_ocr_ned": deep.get("ned"),
@@ -342,6 +377,8 @@ def build_setting_rows(
                 "thirdparty_ocr_exact": third.get("exact"),
                 "final_rec_loss": final_train_value(Path(str(spec["run_dir"])), "rec_loss"),
                 "final_ocr_tf_ce_loss": final_train_value(Path(str(spec["run_dir"])), "ocr_tf_ce_loss") if spec.get("ocr_loss") else "",
+                "image_metric_source": image_metric_note,
+                "image_metric_mse": mse,
             }
         )
     return rows
@@ -459,10 +496,13 @@ def write_setting_md(
     thirdparty_available: bool,
     thirdparty_note: str,
     lpips_note: str,
+    image_metric_source: str,
 ) -> None:
+    image_metric_note = "training val.csv" if image_metric_source == "train_val_csv" else "setting_eval reconstruction"
     lines = [
         "# Setting Metrics",
         "",
+        f"- Image metrics source: {image_metric_note}.",
         f"- Best image PSNR: {best_by_metric(rows, 'psnr', True)}.",
         f"- Best image SSIM: {best_by_metric(rows, 'ssim', True)}.",
         f"- Best third-party OCR CER: {best_by_metric(rows, 'thirdparty_ocr_cer', False)}.",
@@ -603,6 +643,7 @@ def main() -> None:
         args=args,
         runs=runs,
         recon_metrics=recon_metrics,
+        image_metric_source=args.image_metric_source,
         deepseek_metrics=deepseek_metrics,
         thirdparty_metrics=thirdparty_metrics,
         thirdparty_name=thirdparty_name,
@@ -637,6 +678,7 @@ def main() -> None:
         thirdparty_available=thirdparty_available,
         thirdparty_note=thirdparty_note,
         lpips_note=lpips_status(),
+        image_metric_source=args.image_metric_source,
     )
     plot_outputs(args.output_dir, rows, thirdparty_available=thirdparty_available)
     write_json(
@@ -645,6 +687,7 @@ def main() -> None:
             "runs_json": str(args.runs_json),
             "manifest_jsonl": str(args.manifest_jsonl),
             "step": args.step,
+            "image_metric_source": args.image_metric_source,
             "deepseek_note": deepseek_note,
             "thirdparty_note": thirdparty_note,
             "recommended_setting": best,

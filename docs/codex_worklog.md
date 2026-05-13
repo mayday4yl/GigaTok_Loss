@@ -3286,3 +3286,215 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
     - summary CSV 正常写出：
       - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_hr_ocr_weight_sweep_smoke_debug/ocr_weight_sweep_summary.csv`
     - smoke 关闭了 eval/probe，所以 summary 中 eval 字段为空是预期行为。
+
+## 2026-05-10 训练曲线与 OCR loss 影响评估
+- 本次只检查代码和评估方案，未改训练代码。
+- 训练中曲线现状：
+  - `tokenizer/tokenizer_image/vq/vq_train.py` 已支持在线 reconstruction validation：传 `--val-json-path` 与 `--val-every` 后，会周期性计算 `val_mse / val_mae / val_psnr / val_ssim` 并写入 `metrics/val_metrics.csv`。
+  - `metrics/train_metrics.csv` 目前只写 `train_loss / steps_per_sec / lr / lr_disc`，没有把 `rec_loss / perceptual_loss / text_hr_loss / ocr_tf_ce_loss / weighted_ocr_tf_loss` 等组件列写进去。
+  - 各 loss 组件会每 `--log-every` 写入训练 log；`scripts/stage1/plot_stage1_training_curves.py` 可解析 log 生成曲线，但目前默认只画 train、reconstruction、HR 指标，未专门画 OCR loss 组件。
+  - wandb 路径存在，但当前实现主要先写 `wandb_cache.json`，到 `--ckpt-every` 时才 upload，因此不是严格每步实时刷新。
+- OCR loss 影响现状：
+  - `DeepSeekOCRFeatureLoss` 和 `DeepSeekOCRTeacherForcingLoss` 都冻结 OCR 模型参数，但保留 reconstruction 到 OCR 输出 loss 的计算图，梯度可回传到 tokenizer decoder。
+  - OCR loss 在主循环中会加到 `loss_gen`，不是只记录：`loss_gen += weight * ocr_loss`。
+  - OCR 相关数值会进入 `text_recon_stats`，并通过 log/wandb cache 记录；但当前 CSV 和默认 plot 对 OCR 不够直观。
+- 建议：
+  - 短期不改模型，先用现有 `--val-every` 训练中看重建曲线，用 log/plot 脚本观察 loss 曲线。
+  - 为严格证明 OCR loss 有用，需要同时看：`weighted_ocr_tf_loss` 是否达到非忽略量级、OCR 梯度占比、correct vs wrong/empty text reconstruction 差异、离线 OCR eval 指标。
+  - 如果要边训边看 OCR 曲线，下一步最小改动应只扩展日志/CSV/plot，不碰模型结构。
+
+## 2026-05-11 OCR TF readable50 重建作用 sweep 工具
+- 目的：
+  - 只比较 OCR-off baseline、OCR weight 0.02、OCR weight 0.05 三组。
+  - 固定 readable50、GBS=8、500 step、log_every=10、val_every=50。
+  - 强制关闭 `text_hr.enabled` 与 `trainer.hr_on`，不做 ranking loss、clean OCR ablation、visual mask ablation 或 scale_init 改动。
+- 新增：
+  - `scripts/stage1/ocr_debug/run_ocr_recon_effect_sweep.sh`
+    - 生成 `noocr / w002 / w005` 三组 config。
+    - `noocr` 是 OCR-off baseline，不是纯 GigaTok baseline。
+    - 默认输出根目录：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/ocr_w_sweep`。
+  - `scripts/stage1/ocr_debug/plot_ocr_recon_effect_sweep.py`
+    - 解析每组 `log.txt` 为 `train.csv`。
+    - 标准化 `metrics/val_metrics.csv` 为 `val.csv`。
+    - 输出每组 `recon.png / ocr.png / giga.png / all_loss.png`。
+    - 检查 `0000050.pt / 0000250.pt / 0000500.pt`，存在时调用 reconstruction eval 生成 `grid_050.png / grid_250.png / grid_500.png`；缺失写入 `summary.md`。
+    - 输出 `summary/cmp_recon.png / cmp_ocr.png / cmp_giga.png / cmp_loss_scale.png / summary.csv / summary.md`。
+- 设计细节：
+  - 缺失字段保持空值，不填 0。
+  - `proj_loss` 保留 raw signed value，图中允许为负。
+  - `summary.md` 明确说明 readable50 是诊断实验，不代表泛化。
+- 本地检查：
+  - `bash -n scripts/stage1/ocr_debug/run_ocr_recon_effect_sweep.sh` 通过。
+  - `py_compile` 到 `/private/tmp/plot_ocr_recon_effect_sweep.pyc` 通过。
+  - 本地 config smoke 通过：三组均生成 config，且 `text_hr.enabled=false`、`trainer.hr_on=false`、`ocr_feature_loss.enabled=false`；`w002/w005` warmup 配置为 `start_step=0/start_weight=0.005/warmup_steps=50`。
+  - 本机缺少 matplotlib，未在本地完成 fake plot smoke；远端 `python3 -c "import matplotlib"` 确认为 `3.7.3`。
+- 远端检查：
+  - 已同步两个新脚本到 `/home/ma-user/work/GigaTok_hr/GigaTok_Loss/scripts/stage1/ocr_debug/`。
+  - 远端 `bash -n scripts/stage1/ocr_debug/run_ocr_recon_effect_sweep.sh` 通过。
+  - 远端 `python3 -m py_compile scripts/stage1/ocr_debug/plot_ocr_recon_effect_sweep.py` 通过。
+  - 远端 noocr 2-step smoke 完成：
+    - `SAVE_ROOT=/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/ocr_w_sweep_smoke`
+    - `RUN_GROUPS=noocr ITERS=2 GLOBAL_BATCH_SIZE=8 NPROC_PER_NODE=1 CKPT_EVERY=2 RUN_POSTPROCESS=0`
+    - 产出 `checkpoints/0000002.pt` 与 `checkpoints/last.pt`。
+  - 远端 fake log 后处理 smoke 通过，确认能生成 `train.csv / val.csv / recon.png / ocr.png / giga.png / all_loss.png` 以及 summary 图和 `summary.csv/summary.md`。
+
+## 2026-05-11 OCR TF sweep 后验 OCR 评估脚本
+- 目的：
+  - 不重新训练，不改 `vq_train.py`，只基于 `ocr_w_sweep/noocr / w002 / w005` 的 step500 checkpoint 做 DeepSeek-OCR 后验识别。
+  - 判断训练时 OCR teacher-forcing CE 是否转化为真实 OCR 可读性指标改善。
+- 新增：
+  - `scripts/stage1/ocr_debug/eval_ocr_w_sweep_posthoc.sh`
+    - 自动查找每组 `SAVE_ROOT/configs/{run}.yaml` 和 `SAVE_ROOT/{run}/checkpoints/0000500.pt`。
+    - 调用 `scripts/stage1/evaluate_textatlas_reconstruction.py`，固定 `--text-input-mode correct` 与 `--ocr-backend deepseek_ocr`。
+    - 每组输出到 `post_ocr/{run}/`。
+  - `scripts/stage1/ocr_debug/summarize_ocr_w_sweep_posthoc.py`
+    - 将评估脚本原始 `ocr_predictions.raw.jsonl` 扁平化为 `ocr_preds.jsonl`。
+    - 生成每组 `ocr_summary.json`。
+    - 合并原 `ocr_w_sweep/summary/summary.csv` 的重建和训练 OCR loss 字段。
+    - 输出 `post_ocr/summary/post_ocr_summary.csv / post_ocr_summary.md / cmp_post_ocr.png`。
+- 设计细节：
+  - OCR 读空、乱码、无关文本都保留并计入指标；空输出通过 `empty_pred_rate` 记录。
+  - `summary.md` 写明实际使用的 config 和 checkpoint 路径。
+  - 不做 empty/wrong/shuffled sensitivity，不做 crop、visual mask、scale、ranking ablation。
+- 检查与运行：
+  - 本地 `bash -n scripts/stage1/ocr_debug/eval_ocr_w_sweep_posthoc.sh` 通过。
+  - 本地 `python3 -m py_compile scripts/stage1/ocr_debug/summarize_ocr_w_sweep_posthoc.py` 通过。
+  - 远端 `bash -n` 与 `py_compile` 通过。
+  - smoke：`RUN_GROUPS=noocr MAX_IMAGES=2` 生成 `post_ocr_smoke/noocr/ocr_preds.jsonl` 与 `ocr_summary.json`。
+  - 正式：`RUN_GROUPS="noocr w002 w005" MAX_IMAGES=50` 跑完三组，每组 50 行 OCR 预测。
+- 正式结果：
+  - 输出根目录：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/ocr_w_sweep/post_ocr`
+  - `noocr`: CER 0.9268，exact_ci 0.0，NED 0.1100，empty rate 0.0。
+  - `w002`: CER 0.9404，exact_ci 0.0，NED 0.0971，empty rate 0.0。
+  - `w005`: CER 0.9937，exact_ci 0.0，NED 0.0927，empty rate 0.0。
+  - 结论：`w002` 没有比 `noocr` 好；`w005` 没有比 `w002` 好。`w005` 训练 OCR CE 更低，但没有转化为后验 OCR CER/exact/NED 改善；结合 reconstruction 指标，当前更像只优化了自己的 CE，并且重建变差。
+
+## 2026-05-12 text-aware tokenizer 后续排查准备
+- 本次不改 OCR loss 主线，不做 ranking loss，不启动新的大规模实验。
+- Text feature 审计：
+  - 新增 `docs/text_feature_injection_audit.md`。
+  - 当前 backend 是 `glyph_byt5`，不是普通 `t5`。
+  - `GlyphByT5Encoder.forward()` 只返回一个 `hidden_states=(mapped,)`。
+  - 因此 config 里的 text layer `0` 不是 ByT5 第 0 层，而是 `ByT5 encoder last_hidden_state -> Glyph mapper` 后的 mapped output。
+  - 当前 text feature shape 是 `[B, T, 2048]`，进入 decoder 前经 `Linear+LayerNorm` 投影为 `[B, T, 1024]`。
+  - text encoder 和 mapper 均 frozen。
+- Text feature layer 改造方案：
+  - 文档中记录方案 A：保持当前 mapped output。
+  - 方案 B：新增 `text_conditioning.glyph_feature_mode: mapped | byt5_last`，`byt5_last` 使用 ByT5 encoder `last_hidden_state`，同步 `feature_dim=encoder.config.d_model`。
+  - 方案 C：设计 `glyph_feature_mode: byt5_last_k_avg` 与 `glyph_last_k`，后续再实现。
+- Text injection strength configs：
+  - 新增：
+    - `configs/vq/ablation_text_injection/scale005_current.yaml`
+    - `configs/vq/ablation_text_injection/scale010.yaml`
+    - `configs/vq/ablation_text_injection/scale020.yaml`
+  - 三份 config 只改 `text_recon_conditioning.residual_cross_attn.scale_init`：0.05 / 0.10 / 0.20。
+  - 固定 OCR TF weight=0.02，`start_weight=0.005`，`warmup_steps=50`。
+  - 保持 visual mask ratio=0.3、layers `[6, 12, 18]`，关闭 `text_hr.enabled`、`trainer.hr_on`、`ocr_feature_loss.enabled`。
+- 远端 smoke：
+  - 输出根目录：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_injection_scale_smoke`
+  - 三份 config 均完成 2-step smoke，并保存 `checkpoints/0000002.pt` 与 `last.pt`。
+  - 日志确认有 `residual_cross_attn_scale_mean`、`residual_cross_attn_context_norm_mean`、`residual_cross_attn_proj_norm_mean`、`residual_cross_attn_raw_proj_norm_mean`。
+  - scale mean 分别约为 0.0500 / 0.1001 / 0.2002。
+- Longer run 计划：
+  - 新增 `docs/longer_run_plan.md`。
+  - 建议先只跑 noocr 1500/2000 step；如果文字仍糊，不急着加 OCR；如果 noocr 长训后文字可见，再跑 w002 对照；暂不跑 w005 长训。
+- Text feature cache 设计：
+  - 新增 `docs/text_feature_cache_plan.md`。
+  - 建议先 cache frozen text encoder output，而不是 projected feature，因为 `text_projection` 是 trainable。
+  - 记录 cache input/output、cache key、`.pt` shard 格式、训练读取路径和失效规则。
+- Post-hoc OCR 总结：
+  - `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/ocr_w_sweep/post_ocr/summary/post_ocr_summary.md` 已生成。
+  - OCR CE：w005 低于 w002，但不是稳定转化。
+  - Reconstruction：noocr 最好，w002 略差，w005 更差。
+  - Post-hoc OCR：noocr CER 0.9268 / NED 0.1100；w002 CER 0.9404 / NED 0.0971；w005 CER 0.9937 / NED 0.0927；exact 全为 0。
+  - 当前结论：OCR loss 没有帮助重建，0.05 有伤重建趋势，更像是优化了自身 CE 但没有转化为真实可读性。
+
+## 2026-05-12 noocr 长训进度同步
+- 用户已完成第一段长训：
+  - `SAVE_ROOT=/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/ocr_w_sweep_long_noocr_2000`
+  - `RUN_GROUPS=noocr`
+  - `ITERS=2000`
+  - `GLOBAL_BATCH_SIZE=8`
+  - `LOG_EVERY=10`
+  - `VAL_EVERY=100`
+  - `CKPT_EVERY=250`
+  - `RUN_POSTPROCESS=1`
+- 当前第二段长训正在运行：
+  - `SAVE_ROOT=/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/ocr_w_sweep_long_noocr_5000`
+  - `RUN_GROUPS=noocr`
+  - `ITERS=5000`
+  - `GLOBAL_BATCH_SIZE=8`
+  - `LOG_EVERY=10`
+  - `VAL_EVERY=100`
+  - `CKPT_EVERY=500`
+  - `RUN_POSTPROCESS=1`
+- 当前只做进度同步，不提前下结论；等 5000 step 跑完再看 readable50 的 reconstruction / OCR 后验指标是否继续改善。
+
+## 2026-05-12 w005 cached text feature 训练准备
+- 实现 frozen Glyph-ByT5 mapped feature cache：
+  - 新增 `scripts/stage1/ocr_debug/cache_text_features.py`。
+  - 新增 `scripts/stage1/ocr_debug/text_feature_cache.py`。
+  - cache 内容是每个 unique text 的 frozen Glyph-ByT5 mapped output `[T, 2048]` 和 `attention_mask [T]`。
+  - 不 cache GigaTok 侧 `text_projection` 后的 `[T, 1024]`，因此 `text_projection` 仍随训练更新。
+- `vq_train.py` 接入：
+  - 新增 `--text-feature-cache` 参数，同时兼容 `TEXT_FEATURE_CACHE` 环境变量。
+  - train 和 validation 都支持从 cache 取 `t5_layer_states=(cached_features,)` 和 `text_attention_mask`。
+  - cache miss 直接报错，不 silent fallback。
+  - OCR loss 主线未改。
+- sweep/postprocess：
+  - `run_ocr_recon_effect_sweep.sh` 支持 `TEXT_FEATURE_CACHE` 和 `GRID_EVERY`。
+  - `plot_ocr_recon_effect_sweep.py` 支持按实际存在 checkpoint 自动生成每 `GRID_EVERY` step 的 grid，输出到 `grid_{step}.png`，完整 eval 输出到 `eval_{step}/`。
+  - 每个 run 增加 `train_loss.png`、`val_metrics.png`、`train_val_recon.png`、`giga_losses.png`、`ocr_losses.png`。
+- 静态检查：
+  - 远端 `python3 -m py_compile scripts/stage1/ocr_debug/cache_text_features.py scripts/stage1/ocr_debug/text_feature_cache.py scripts/stage1/ocr_debug/plot_ocr_recon_effect_sweep.py tokenizer/tokenizer_image/vq/vq_train.py` 通过。
+  - 远端 `bash -n scripts/stage1/ocr_debug/run_ocr_recon_effect_sweep.sh` 通过。
+- cache 生成与 verify：
+  - 输出：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_feature_cache/readable50_glyph_mapped/text_features.pt`。
+  - metadata：`num_unique_texts=50`，`feature_dim=2048`，`num_layers=1`，`max_length=1024`，`dtype=bf16`。
+  - verify：`max_abs_diff=0`，`mean_abs_diff=0`，`attention_mask_equal=True`。
+- w005 2-step smoke：
+  - 输出：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/ocr_w_sweep_long_w005_cache_smoke`。
+  - 日志确认 `Using cached text features`。
+  - 日志确认 `ocr_tf_ce_loss`、`weighted_ocr_tf_loss`、`Val MSE/PSNR/SSIM` 均出现。
+  - 后处理生成 `grid_2.png`、`eval_2/comparison_grid.png` 和所有新增曲线图。
+- 未启动正式 5000 step。
+
+## 2026-05-12 w005 cached + orig sequential 5000 启动
+- 新增 sequential 后台脚本：
+  - `scripts/stage1/ocr_debug/run_w005_then_orig_5000_bg.sh`
+  - 顺序：先跑 `w005`，成功后再跑 `orig`；如果 `w005` 失败，脚本因 `set -euo pipefail` 停止，`orig` 不启动。
+- `run_ocr_recon_effect_sweep.sh` 增加 `orig` group：
+  - `text_conditioning.enabled=false`
+  - `text_recon_conditioning.enabled=false`
+  - `text_hr.enabled=false`
+  - `trainer.hr_on=false`
+  - `trainer.hr_loss_weight=0.0`
+  - `ocr_teacher_forcing_loss.enabled=false`
+  - `ocr_feature_loss.enabled=false`
+  - 如果 `TEXT_FEATURE_CACHE` 被设置，`orig` 会打印 warning 并忽略 cache。
+- 启动前检查：
+  - cache 文件存在：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/text_feature_cache/readable50_glyph_mapped/text_features.pt`。
+  - 远端磁盘 `/home/ma-user/work` 剩余约 145G。
+  - `bash -n scripts/stage1/ocr_debug/run_ocr_recon_effect_sweep.sh` 通过。
+  - `bash -n scripts/stage1/ocr_debug/run_w005_then_orig_5000_bg.sh` 通过。
+  - `python3 -m py_compile` 相关脚本和 `vq_train.py` 通过。
+- 后台启动：
+  - 远端无可用 `tmux`，使用 `nohup`。
+  - 实际脚本 PID 写入：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/run_w005_then_orig_5000.pid`，当前为 `2632246`。
+  - 总日志：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/run_w005_then_orig_5000.log`。
+  - 当前已进入 `w005` 阶段，日志确认 `Using cached text features`。
+- 输出目录：
+  - `w005`: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/ocr_w_sweep_long_w005_5000_cache/w005/`
+  - `orig`: `/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/ocr_w_sweep_long_orig_5000/orig/`
+
+## 2026-05-14 fixed eval PSNR 口径切换
+- 现象确认：
+  - `setting_eval` 的重算图像指标与当前 `vq_train.compute_reconstruction_metrics()` 一致。
+  - 但两者都与历史训练产物里的 `val.csv` / `metrics/val_metrics.csv` 不一致，历史 `val_mse` 明显更低。
+- 修复方向：
+  - 在 `scripts/stage1/ocr_debug/evaluate_setting_metrics.py` 增加 `--image-metric-source`。
+  - 支持 `setting_eval` 和 `train_val_csv` 两种图像指标源。
+  - `train_val_csv` 用各 run 的训练 `val.csv` / `metrics/val_metrics.csv` 作为 fixed eval 的图像质量列，OCR 仍然保留 setting_eval 的后验结果。
+- 代码状态：
+  - `python3 -m py_compile scripts/stage1/ocr_debug/evaluate_setting_metrics.py` 通过。
+  - 未重训，未改 checkpoint。
