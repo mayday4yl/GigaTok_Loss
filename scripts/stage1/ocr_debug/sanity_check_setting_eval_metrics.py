@@ -22,11 +22,13 @@ import math
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
 from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -49,7 +51,9 @@ from tokenizer.tokenizer_image.vq.glyph_byt5 import (  # noqa: E402
     get_text_layer_states,
     tokenize_texts_with_stats,
 )
+from tokenizer.tokenizer_image.vq import vq_train as vq_train_module  # noqa: E402
 from tokenizer.tokenizer_image.vq.vq_train import resize_pad_arr  # noqa: E402
+from scripts.stage1.ocr_debug.text_feature_cache import TextFeatureCache  # noqa: E402
 from scripts.stage1.ocr_debug.evaluate_setting_metrics import (  # noqa: E402
     PAPER_FIELDS,
     csv_value,
@@ -72,8 +76,13 @@ SANITY_FIELDS = [
     "train_final_val_ssim",
     "setting_eval_tensor_mse",
     "setting_eval_psnr_from_mse",
+    "vq_train_compute_mse",
+    "vq_train_compute_psnr",
     "ratio",
     "psnr_gap",
+    "vq_train_ratio",
+    "vq_train_psnr_gap",
+    "setting_vs_vq_train_mse_ratio",
     "gt_tensor_min",
     "gt_tensor_max",
     "gt_tensor_mean",
@@ -108,7 +117,37 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-weight-key", choices=("model", "ema", "auto", "state_dict"), default="model")
     parser.add_argument("--text-layer-pair-index", type=int, default=0)
     parser.add_argument("--debug-dir", type=Path, default=None)
+    parser.add_argument("--text-feature-cache", type=Path, default=None, help="Optional cache used to mirror cached text validation.")
     return parser.parse_args()
+
+
+class ManifestTensorDataset(Dataset):
+    def __init__(
+        self,
+        image_paths: Sequence[Path],
+        metadata_by_path: Mapping[str, Mapping[str, str]],
+        *,
+        image_size: int,
+        pad_color: str,
+    ) -> None:
+        self.image_paths = list(image_paths)
+        self.metadata_by_path = metadata_by_path
+        self.image_size = int(image_size)
+        color = parse_color(pad_color)
+        if color[0] != color[1] or color[0] != color[2]:
+            raise ValueError("vq_train resize_pad_arr supports grayscale fill only; use equal RGB pad_color.")
+        self.fill = int(color[0])
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def __getitem__(self, index: int):
+        path = self.image_paths[index]
+        with Image.open(path) as img:
+            img = resize_pad_arr(img, self.image_size, fill=self.fill)
+        tensor = pil_to_tensor(img)
+        text = self.metadata_by_path.get(str(path.resolve()), {}).get("text", "")
+        return tensor, str(text)
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -239,6 +278,141 @@ def legacy_setting_reconstruct_batch(
         return outputs[0] if isinstance(outputs, (list, tuple)) else outputs
 
 
+def train_val_like_reconstruct_batch(
+    model: torch.nn.Module,
+    batch: torch.Tensor,
+    texts: Sequence[str] | None,
+    text_context: Any,
+    *,
+    device_backend: str,
+    mixed_precision: str,
+    causal_type: str | None,
+) -> torch.Tensor:
+    """Mirror the forward path inside vq_train.compute_reconstruction_metrics for one batch."""
+    ptdtype = dtype_from_mixed_precision(mixed_precision)
+    selected_decoder_layer = None
+    decoder_text_features = None
+    decoder_text_features_by_layer = None
+    decoder_head_text_features = None
+    decoder_text_key_padding_mask = None
+
+    if text_context is not None:
+        if texts is None:
+            raise ValueError("Text-conditioned validation requires text strings.")
+        text_backend = getattr(text_context.encoder, "encoder_backend", "t5")
+        text_inputs, _ = tokenize_texts_with_stats(
+            text_context.tokenizer,
+            [str(text) for text in texts],
+            max_length=text_context.max_length,
+            device=batch.device,
+            backend=text_backend,
+        )
+        input_ids = text_inputs["input_ids"]
+        text_attention_mask = text_inputs["attention_mask"]
+        with autocast_context(device_backend, mixed_precision, dtype=ptdtype):
+            text_outputs = text_context.encoder(
+                input_ids=input_ids,
+                attention_mask=text_attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        t5_layer_states = get_text_layer_states(text_outputs, text_backend)
+        decoder_text_key_padding_mask = ~text_attention_mask.bool()
+        if text_context.text_recon_mode == "residual_head":
+            decoder_head_text_features = t5_layer_states[int(text_context.head_text_layer)].detach()
+        elif text_context.text_recon_layer_pairs:
+            decoder_text_features_by_layer = {
+                int(decoder_layer): t5_layer_states[text_layer].detach()
+                for text_layer, decoder_layer in text_context.text_recon_layer_pairs
+            }
+        else:
+            selected_text_layer, selected_decoder_layer = text_context.selected_pair
+            decoder_text_features = t5_layer_states[selected_text_layer].detach()
+
+    with torch.inference_mode():
+        with autocast_context(device_backend, mixed_precision, dtype=ptdtype):
+            outputs = model(
+                batch,
+                causal_type=causal_type,
+                selected_decoder_layer=selected_decoder_layer,
+                decoder_text_features=decoder_text_features,
+                decoder_text_features_by_layer=decoder_text_features_by_layer,
+                decoder_head_text_features=decoder_head_text_features,
+                decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                text_injection_layers=(text_context.text_injection_layers if text_context is not None else None) or None,
+                visual_memory_mask_enabled=bool(getattr(text_context, "visual_memory_mask_enabled", False)),
+                visual_memory_mask_ratio=float(getattr(text_context, "visual_memory_mask_ratio", 0.0)),
+                visual_memory_mask_strategy=str(getattr(text_context, "visual_memory_mask_strategy", "token_random")),
+                visual_memory_mask_block_size=int(getattr(text_context, "visual_memory_mask_block_size", 1)),
+                visual_memory_mask_fixed_pattern=bool(getattr(text_context, "visual_memory_mask_fixed_pattern", False)),
+                visual_memory_mask_seed=int(getattr(text_context, "visual_memory_mask_seed", 0)),
+                visual_memory_mask_apply_in_eval=bool(getattr(text_context, "visual_memory_mask_apply_in_eval", False)),
+            )
+    return outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+
+
+def compute_vq_train_metrics_local(
+    *,
+    model: torch.nn.Module,
+    text_context: Any,
+    text_feature_cache: TextFeatureCache | None,
+    image_paths: Sequence[Path],
+    metadata_by_path: Mapping[str, Mapping[str, str]],
+    device: torch.device,
+    args: argparse.Namespace,
+    causal_type: str | None,
+) -> dict[str, float]:
+    dataset = ManifestTensorDataset(
+        image_paths,
+        metadata_by_path,
+        image_size=args.image_size,
+        pad_color=args.pad_color,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
+    )
+    local_args = SimpleNamespace(
+        device_backend=args.device_backend,
+        mixed_precision=args.mixed_precision,
+        val_compute_ssim=True,
+    )
+
+    original_all_reduce = vq_train_module.dist.all_reduce
+    vq_train_module.dist.all_reduce = lambda tensor, op=None: tensor
+    try:
+        return vq_train_module.compute_reconstruction_metrics(
+            vq_model=model,
+            val_loader=loader,
+            device=device,
+            args=local_args,
+            causal_type=causal_type,
+            text_tokenizer=(text_context.tokenizer if text_context is not None and text_feature_cache is None else None),
+            text_encoder=(text_context.encoder if text_context is not None and text_feature_cache is None else None),
+            text_feature_cache=(text_feature_cache if text_context is not None else None),
+            text_layer_pairs=(text_context.layer_pairs if text_context is not None else None),
+            text_recon_layer_pairs=(text_context.text_recon_layer_pairs if text_context is not None else None),
+            text_injection_layers=(text_context.text_injection_layers if text_context is not None else None),
+            text_recon_mode=(text_context.text_recon_mode if text_context is not None else None),
+            text_recon_head_text_layer=(text_context.head_text_layer if text_context is not None else None),
+            visual_memory_mask_enabled=bool(getattr(text_context, "visual_memory_mask_enabled", False)),
+            visual_memory_mask_ratio=float(getattr(text_context, "visual_memory_mask_ratio", 0.0)),
+            visual_memory_mask_strategy=str(getattr(text_context, "visual_memory_mask_strategy", "token_random")),
+            visual_memory_mask_block_size=int(getattr(text_context, "visual_memory_mask_block_size", 1)),
+            visual_memory_mask_fixed_pattern=bool(getattr(text_context, "visual_memory_mask_fixed_pattern", False)),
+            visual_memory_mask_seed=int(getattr(text_context, "visual_memory_mask_seed", 0)),
+            visual_memory_mask_apply_in_eval=bool(getattr(text_context, "visual_memory_mask_apply_in_eval", False)),
+            text_max_length=(text_context.max_length if text_context is not None else None),
+            mixed_precision_dtype=dtype_from_mixed_precision(args.mixed_precision),
+        )
+    finally:
+        vq_train_module.dist.all_reduce = original_all_reduce
+
+
 def evaluate_tensor_metrics(
     *,
     run_name: str,
@@ -256,6 +430,10 @@ def evaluate_tensor_metrics(
         checkpoint_weight_key=args.checkpoint_weight_key,
     )
     causal_type = causal_type_from_config(config)
+    text_feature_cache = None
+    if text_context is not None and args.text_feature_cache is not None:
+        text_feature_cache = TextFeatureCache(args.text_feature_cache)
+        text_feature_cache.validate_config(config.get("text_conditioning", {}))
     pad_color = parse_color(args.pad_color)
     correct_texts = [
         metadata_by_path.get(str(path.resolve()), {}).get("text", "")
@@ -287,7 +465,17 @@ def evaluate_tensor_metrics(
             causal_type=causal_type,
         )
         legacy_rec = None
+        train_like_rec = None
         if start == 0 and args.debug_dir is not None:
+            train_like_rec = train_val_like_reconstruct_batch(
+                model,
+                batch,
+                batch_texts if text_context is not None else None,
+                text_context,
+                device_backend=args.device_backend,
+                mixed_precision=args.mixed_precision,
+                causal_type=causal_type,
+            )
             legacy_rec = legacy_setting_reconstruct_batch(
                 model,
                 batch,
@@ -319,8 +507,10 @@ def evaluate_tensor_metrics(
                 "recon_metric_image_max": rec_metric["max"],
                 "recon_metric_image_mean": rec_metric["mean"],
             }
-            if legacy_rec is not None and args.debug_dir is not None:
+            if legacy_rec is not None and train_like_rec is not None and args.debug_dir is not None:
                 fixed_mse = float(diff.pow(2).mean().item())
+                train_like_diff = (train_like_rec.float() - batch.float()) * 0.5
+                train_like_mse = float(train_like_diff.pow(2).mean().item())
                 legacy_diff = (legacy_rec.float() - batch.float()) * 0.5
                 legacy_mse = float(legacy_diff.pow(2).mean().item())
                 compare_lines = [
@@ -335,12 +525,21 @@ def evaluate_tensor_metrics(
                     f"visual_memory_mask_enabled: {getattr(text_context, 'visual_memory_mask_enabled', None)}",
                     f"visual_memory_mask_ratio: {getattr(text_context, 'visual_memory_mask_ratio', None)}",
                     f"visual_memory_mask_apply_in_eval: {getattr(text_context, 'visual_memory_mask_apply_in_eval', None)}",
+                    f"uses_text_feature_cache_for_vq_train_compute: {text_feature_cache is not None}",
+                    f"gt_tensor_min/max/mean: {gt_tensor['min']:.8g} {gt_tensor['max']:.8g} {gt_tensor['mean']:.8g}",
+                    f"setting_recon_tensor_min/max/mean: {rec_tensor['min']:.8g} {rec_tensor['max']:.8g} {rec_tensor['mean']:.8g}",
+                    f"train_like_recon_tensor_min/max/mean: {tensor_stats(train_like_rec)['min']:.8g} {tensor_stats(train_like_rec)['max']:.8g} {tensor_stats(train_like_rec)['mean']:.8g}",
+                    f"legacy_recon_tensor_min/max/mean: {tensor_stats(legacy_rec)['min']:.8g} {tensor_stats(legacy_rec)['max']:.8g} {tensor_stats(legacy_rec)['mean']:.8g}",
                     f"gt_tensor_max_abs_diff_A_vs_B: 0.0",
-                    f"recon_tensor_max_abs_diff_train_like_vs_legacy: {float((rec.float() - legacy_rec.float()).abs().max().item()):.8g}",
-                    f"mse_A_train_like: {fixed_mse:.10g}",
+                    f"recon_tensor_max_abs_diff_vq_train_like_vs_setting_eval: {float((train_like_rec.float() - rec.float()).abs().max().item()):.8g}",
+                    f"recon_tensor_max_abs_diff_setting_eval_vs_legacy: {float((rec.float() - legacy_rec.float()).abs().max().item()):.8g}",
+                    f"recon_tensor_max_abs_diff_vq_train_like_vs_legacy: {float((train_like_rec.float() - legacy_rec.float()).abs().max().item()):.8g}",
+                    f"mse_A_vq_train_like_batch: {train_like_mse:.10g}",
+                    f"mse_B_setting_eval_batch: {fixed_mse:.10g}",
                     f"mse_B_legacy_setting: {legacy_mse:.10g}",
-                    f"psnr_A_train_like: {-10.0 * math.log10(max(fixed_mse, 1e-12)):.8g}",
-                    f"psnr_B_legacy_setting: {-10.0 * math.log10(max(legacy_mse, 1e-12)):.8g}",
+                    f"psnr_A_vq_train_like_batch: {-10.0 * math.log10(max(train_like_mse, 1e-12)):.8g}",
+                    f"psnr_B_setting_eval_batch: {-10.0 * math.log10(max(fixed_mse, 1e-12)):.8g}",
+                    f"psnr_C_legacy_setting: {-10.0 * math.log10(max(legacy_mse, 1e-12)):.8g}",
                 ]
                 args.debug_dir.mkdir(parents=True, exist_ok=True)
                 (args.debug_dir / f"path_compare_{run_name}.txt").write_text(
@@ -356,12 +555,24 @@ def evaluate_tensor_metrics(
 
     mse = mse_sum / max(1, elem_count)
     psnr = -10.0 * math.log10(max(mse, 1e-12))
+    vq_train_metrics = compute_vq_train_metrics_local(
+        model=model,
+        text_context=text_context,
+        text_feature_cache=text_feature_cache,
+        image_paths=image_paths,
+        metadata_by_path=metadata_by_path,
+        device=device,
+        args=args,
+        causal_type=causal_type,
+    )
     out = {
         "run": run_name,
         "checkpoint_weight_key": args.checkpoint_weight_key,
         "num_images": len(image_paths),
         "setting_eval_tensor_mse": mse,
         "setting_eval_psnr_from_mse": psnr,
+        "vq_train_compute_mse": vq_train_metrics.get("val_mse"),
+        "vq_train_compute_psnr": vq_train_metrics.get("val_psnr"),
     }
     if range_stats:
         out.update(range_stats)
@@ -378,24 +589,29 @@ def write_sanity_md(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     lines = [
         "# Setting Eval Metric Sanity Check",
         "",
-        "| run | train val_mse | tensor mse | ratio | train PSNR | tensor PSNR | gap |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| run | train val_mse | setting tensor mse | setting ratio | vq_train mse | vq_train ratio | train PSNR | setting PSNR | setting gap | vq_train PSNR | vq_train gap |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         lines.append(
-            "| {run} | {train_mse} | {tensor_mse} | {ratio} | {train_psnr} | {tensor_psnr} | {gap} |".format(
+            "| {run} | {train_mse} | {tensor_mse} | {ratio} | {vq_mse} | {vq_ratio} | {train_psnr} | {tensor_psnr} | {gap} | {vq_psnr} | {vq_gap} |".format(
                 run=row.get("run", ""),
                 train_mse=fmt(row.get("train_final_val_mse"), 6),
                 tensor_mse=fmt(row.get("setting_eval_tensor_mse"), 6),
                 ratio=fmt(row.get("ratio"), 3),
+                vq_mse=fmt(row.get("vq_train_compute_mse"), 6),
+                vq_ratio=fmt(row.get("vq_train_ratio"), 3),
                 train_psnr=fmt(row.get("train_final_val_psnr"), 4),
                 tensor_psnr=fmt(row.get("setting_eval_psnr_from_mse"), 4),
                 gap=fmt(row.get("psnr_gap"), 4),
+                vq_psnr=fmt(row.get("vq_train_compute_psnr"), 4),
+                vq_gap=fmt(row.get("vq_train_psnr_gap"), 4),
             )
         )
     lines.extend([
         "",
         "The tensor metric uses `diff = (reconstruction - gt) * 0.5`, matching `vq_train.py` validation.",
+        "`vq_train mse/PSNR` is computed by calling `vq_train.compute_reconstruction_metrics()` in this script with distributed all-reduce patched to a no-op.",
         "If the ratio is still far from 1, inspect checkpoint weight key, preprocessing, and text-conditioning path.",
     ])
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -581,8 +797,14 @@ def main() -> None:
         row["train_final_val_ssim"] = train["val_ssim"]
         if train["val_mse"] is not None:
             row["ratio"] = row["setting_eval_tensor_mse"] / train["val_mse"]
+            if row.get("vq_train_compute_mse") is not None:
+                row["vq_train_ratio"] = row["vq_train_compute_mse"] / train["val_mse"]
+            if row.get("vq_train_compute_mse") is not None and row["vq_train_compute_mse"] != 0:
+                row["setting_vs_vq_train_mse_ratio"] = row["setting_eval_tensor_mse"] / row["vq_train_compute_mse"]
         if train["val_psnr"] is not None:
             row["psnr_gap"] = row["setting_eval_psnr_from_mse"] - train["val_psnr"]
+            if row.get("vq_train_compute_psnr") is not None:
+                row["vq_train_psnr_gap"] = row["vq_train_compute_psnr"] - train["val_psnr"]
         rows.append(row)
 
     write_sanity_csv(args.output_dir / "metric_sanity.csv", rows)

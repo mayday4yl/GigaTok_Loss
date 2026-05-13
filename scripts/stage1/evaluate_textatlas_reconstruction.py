@@ -157,8 +157,6 @@ def parse_color(value: str) -> Tuple[int, int, int]:
 def resize_pad_image(img: Image.Image, image_size: int, pad_color: Tuple[int, int, int]) -> Image.Image:
     img = img.convert("RGB")
     width, height = img.size
-    if width == image_size and height == image_size:
-        return img
     scale = min(image_size / width, image_size / height)
     resized_size = (max(1, round(width * scale)), max(1, round(height * scale)))
     resized = img.resize(resized_size, resample=Image.Resampling.BICUBIC)
