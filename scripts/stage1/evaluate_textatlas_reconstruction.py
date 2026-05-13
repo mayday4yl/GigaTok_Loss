@@ -105,6 +105,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deepseek-ocr-output-dir", type=Path, default=None, help="Temporary/output dir used by DeepSeek-OCR infer().")
     parser.add_argument("--deepseek-ocr-max-new-tokens", type=int, default=1024, help="Cap DeepSeek-OCR generation length by wrapping generate().")
     parser.add_argument("--text-layer-pair-index", type=int, default=0, help="Deterministic [T5 layer, decoder layer] pair index for text-conditioned reconstruction.")
+    parser.add_argument("--checkpoint-weight-key", choices=("auto", "model", "ema", "state_dict"), default="auto", help="Checkpoint weights to evaluate. auto preserves the historical preference: ema, then model, then state_dict.")
     parser.add_argument("--text-input-mode", choices=("correct", "empty", "shuffled", "wrong", "length_matched_wrong"), default="correct", help="Text used by text-conditioned runs; use empty/shuffled/length_matched_wrong for sensitivity checks.")
     parser.add_argument("--wrong-text-seed", type=int, default=0, help="Seed for --text-input-mode=shuffled.")
     parser.add_argument("--fixed-wrong-text", default="THIS IS A FIXED WRONG TEXT 0123456789", help="Text used for --text-input-mode=wrong.")
@@ -418,6 +419,7 @@ def load_tokenizer_model(
         ckpt_path: Path,
         device: torch.device,
         text_layer_pair_index: int,
+        checkpoint_weight_key: str = "auto",
 ) -> Tuple[torch.nn.Module, Mapping[str, Any], Optional[TextContext]]:
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
@@ -472,7 +474,11 @@ def load_tokenizer_model(
         )
 
     checkpoint = torch.load(ckpt_path, map_location="cpu")
-    if "ema" in checkpoint:
+    if checkpoint_weight_key != "auto":
+        if checkpoint_weight_key not in checkpoint:
+            raise KeyError(f"checkpoint weight key {checkpoint_weight_key!r} not found in {ckpt_path}")
+        weights = checkpoint[checkpoint_weight_key]
+    elif "ema" in checkpoint:
         weights = checkpoint["ema"]
     elif "model" in checkpoint:
         weights = checkpoint["model"]
@@ -1242,6 +1248,7 @@ def main() -> None:
             ckpt_path,
             device,
             text_layer_pair_index=args.text_layer_pair_index,
+            checkpoint_weight_key=args.checkpoint_weight_key,
         )
         if text_context is not None:
             print(f"[{run_name}] text-conditioned reconstruction uses pair {text_context.selected_pair}")

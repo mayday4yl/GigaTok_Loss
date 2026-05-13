@@ -65,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-images", type=int, default=0, help="0 means all rows in manifest.")
     parser.add_argument("--grid-samples", type=int, default=12)
     parser.add_argument("--grid-seed", type=int, default=0)
+    parser.add_argument("--checkpoint-weight-key", choices=("auto", "model", "ema", "state_dict"), default="model", help="Use model by default to match training validation metrics; auto preserves historical EMA preference.")
     parser.add_argument("--python-bin", default=sys.executable)
     parser.add_argument("--skip-deepseek-ocr", action="store_true")
     parser.add_argument("--deepseek-ocr-model", default="/home/ma-user/work/GigaTok_hr/gigatok_persist/models/DeepSeek-OCR")
@@ -194,6 +195,8 @@ def run_evaluate(
         str(grid_samples),
         "--grid-seed",
         str(args.grid_seed),
+        "--checkpoint-weight-key",
+        args.checkpoint_weight_key,
         "--text-input-mode",
         "correct",
         "--ocr-backend",
