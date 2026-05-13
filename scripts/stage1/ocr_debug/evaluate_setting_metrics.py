@@ -259,14 +259,25 @@ def normalize_ocr_predictions(raw_path: Path, flat_path: Path) -> Dict[str, Dict
     for row in iter_jsonl(raw_path):
         metrics = row.get("metrics") or row
         run = str(row.get("run") or "")
+        cer = parse_float(metrics.get("ocr_cer"))
+        if cer is None:
+            cer = parse_float(metrics.get("cer"))
+        ned = parse_float(metrics.get("ocr_ned_similarity"))
+        if ned is None:
+            ned = parse_float(metrics.get("ned"))
+        exact = parse_float(metrics.get("ocr_exact_acc_ci"))
+        if exact is None:
+            exact = parse_float(metrics.get("ocr_exact_acc"))
+        if exact is None:
+            exact = parse_float(metrics.get("exact"))
         flat = {
             "run": run,
             "image_path": row.get("image_path", ""),
             "gt_text": row.get("gt_text", ""),
             "pred_text": row.get("pred_text", ""),
-            "cer": parse_float(metrics.get("ocr_cer")),
-            "ned": parse_float(metrics.get("ocr_ned_similarity")),
-            "exact": parse_float(metrics.get("ocr_exact_acc_ci")),
+            "cer": cer,
+            "ned": ned,
+            "exact": exact,
         }
         flat_rows.append(flat)
         acc = by_run.setdefault(run, {"cer": [], "ned": [], "exact": []})
