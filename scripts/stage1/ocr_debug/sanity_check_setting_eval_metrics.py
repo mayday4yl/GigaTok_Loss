@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Sequence
@@ -43,6 +45,11 @@ from scripts.stage1.evaluate_textatlas_reconstruction import (  # noqa: E402
     reconstruct_batch,
     resize_pad_image,
 )
+from tokenizer.tokenizer_image.vq.glyph_byt5 import (  # noqa: E402
+    get_text_layer_states,
+    tokenize_texts_with_stats,
+)
+from tokenizer.tokenizer_image.vq.vq_train import resize_pad_arr  # noqa: E402
 from scripts.stage1.ocr_debug.evaluate_setting_metrics import (  # noqa: E402
     PAPER_FIELDS,
     csv_value,
@@ -100,6 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fixed-wrong-text", default="THIS IS A FIXED WRONG TEXT 0123456789")
     parser.add_argument("--checkpoint-weight-key", choices=("model", "ema", "auto", "state_dict"), default="model")
     parser.add_argument("--text-layer-pair-index", type=int, default=0)
+    parser.add_argument("--debug-dir", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -148,6 +156,89 @@ def tensor_stats(x: torch.Tensor) -> dict[str, float]:
     }
 
 
+def tensor_hash(x: torch.Tensor) -> str:
+    arr = x.detach().cpu().contiguous().numpy()
+    return hashlib.sha256(arr.tobytes()).hexdigest()
+
+
+def causal_type_from_config(config: Mapping[str, Any]) -> str | None:
+    return (config.get("model", {}).get("causal_settings", {}) or {}).get("causal_type", None)
+
+
+def legacy_setting_reconstruct_batch(
+    model: torch.nn.Module,
+    batch: torch.Tensor,
+    texts: Sequence[str] | None,
+    text_context: Any,
+    *,
+    device_backend: str,
+    mixed_precision: str,
+) -> torch.Tensor:
+    """Reproduce the old setting_eval path before causal_type alignment."""
+    ptdtype = dtype_from_mixed_precision(mixed_precision)
+    with torch.inference_mode():
+        if text_context is None:
+            latent, _, info = model.encode(batch)
+            indices = info[2]
+            return model.decode_code(indices, latent.shape)
+        if texts is None:
+            raise ValueError("Text-conditioned reconstruction requires text.")
+
+        selected_text_layer, selected_decoder_layer = text_context.selected_pair
+        text_backend = getattr(text_context.encoder, "encoder_backend", "t5")
+        text_inputs, _ = tokenize_texts_with_stats(
+            text_context.tokenizer,
+            [str(text) for text in texts],
+            max_length=text_context.max_length,
+            device=batch.device,
+            backend=text_backend,
+        )
+        input_ids = text_inputs["input_ids"]
+        text_attention_mask = text_inputs["attention_mask"]
+        with autocast_context(device_backend, mixed_precision, dtype=ptdtype):
+            text_outputs = text_context.encoder(
+                input_ids=input_ids,
+                attention_mask=text_attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        t5_layer_states = get_text_layer_states(text_outputs, text_backend)
+        decoder_text_key_padding_mask = ~text_attention_mask.bool()
+        decoder_text_features = None
+        decoder_text_features_by_layer = None
+        decoder_head_text_features = None
+        call_selected_decoder_layer = selected_decoder_layer
+        if text_context.text_recon_mode == "residual_head":
+            decoder_head_text_features = t5_layer_states[int(text_context.head_text_layer)].detach()
+            call_selected_decoder_layer = None
+        elif text_context.text_recon_layer_pairs:
+            decoder_text_features_by_layer = {
+                int(decoder_layer): t5_layer_states[text_layer].detach()
+                for text_layer, decoder_layer in text_context.text_recon_layer_pairs
+            }
+            call_selected_decoder_layer = None
+        else:
+            decoder_text_features = t5_layer_states[selected_text_layer].detach()
+        with autocast_context(device_backend, mixed_precision, dtype=ptdtype):
+            outputs = model(
+                batch,
+                selected_decoder_layer=call_selected_decoder_layer,
+                decoder_text_features=decoder_text_features,
+                decoder_text_features_by_layer=decoder_text_features_by_layer,
+                decoder_head_text_features=decoder_head_text_features,
+                decoder_text_key_padding_mask=decoder_text_key_padding_mask,
+                text_injection_layers=text_context.text_injection_layers or None,
+                visual_memory_mask_enabled=text_context.visual_memory_mask_enabled,
+                visual_memory_mask_ratio=text_context.visual_memory_mask_ratio,
+                visual_memory_mask_strategy=text_context.visual_memory_mask_strategy,
+                visual_memory_mask_block_size=text_context.visual_memory_mask_block_size,
+                visual_memory_mask_fixed_pattern=text_context.visual_memory_mask_fixed_pattern,
+                visual_memory_mask_seed=text_context.visual_memory_mask_seed,
+                visual_memory_mask_apply_in_eval=text_context.visual_memory_mask_apply_in_eval,
+            )
+        return outputs[0] if isinstance(outputs, (list, tuple)) else outputs
+
+
 def evaluate_tensor_metrics(
     *,
     run_name: str,
@@ -157,13 +248,14 @@ def evaluate_tensor_metrics(
     device: torch.device,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    model, _, text_context = load_tokenizer_model(
+    model, config, text_context = load_tokenizer_model(
         Path(str(spec["config"])),
         Path(str(spec["ckpt"])),
         device,
         text_layer_pair_index=args.text_layer_pair_index,
         checkpoint_weight_key=args.checkpoint_weight_key,
     )
+    causal_type = causal_type_from_config(config)
     pad_color = parse_color(args.pad_color)
     correct_texts = [
         metadata_by_path.get(str(path.resolve()), {}).get("text", "")
@@ -192,7 +284,18 @@ def evaluate_tensor_metrics(
             text_context,
             device_backend=args.device_backend,
             mixed_precision=args.mixed_precision,
+            causal_type=causal_type,
         )
+        legacy_rec = None
+        if start == 0 and args.debug_dir is not None:
+            legacy_rec = legacy_setting_reconstruct_batch(
+                model,
+                batch,
+                batch_texts if text_context is not None else None,
+                text_context,
+                device_backend=args.device_backend,
+                mixed_precision=args.mixed_precision,
+            )
         diff = (rec.float() - batch.float()) * 0.5
         mse_sum += float(diff.pow(2).sum().item())
         elem_count += int(diff.numel())
@@ -216,6 +319,34 @@ def evaluate_tensor_metrics(
                 "recon_metric_image_max": rec_metric["max"],
                 "recon_metric_image_mean": rec_metric["mean"],
             }
+            if legacy_rec is not None and args.debug_dir is not None:
+                fixed_mse = float(diff.pow(2).mean().item())
+                legacy_diff = (legacy_rec.float() - batch.float()) * 0.5
+                legacy_mse = float(legacy_diff.pow(2).mean().item())
+                compare_lines = [
+                    f"run: {run_name}",
+                    f"config: {spec['config']}",
+                    f"ckpt: {spec['ckpt']}",
+                    f"causal_type: {causal_type}",
+                    f"text_context: {text_context is not None}",
+                    f"text_recon_mode: {getattr(text_context, 'text_recon_mode', None)}",
+                    f"text_injection_layers: {getattr(text_context, 'text_injection_layers', None)}",
+                    f"text_recon_layer_pairs: {getattr(text_context, 'text_recon_layer_pairs', None)}",
+                    f"visual_memory_mask_enabled: {getattr(text_context, 'visual_memory_mask_enabled', None)}",
+                    f"visual_memory_mask_ratio: {getattr(text_context, 'visual_memory_mask_ratio', None)}",
+                    f"visual_memory_mask_apply_in_eval: {getattr(text_context, 'visual_memory_mask_apply_in_eval', None)}",
+                    f"gt_tensor_max_abs_diff_A_vs_B: 0.0",
+                    f"recon_tensor_max_abs_diff_train_like_vs_legacy: {float((rec.float() - legacy_rec.float()).abs().max().item()):.8g}",
+                    f"mse_A_train_like: {fixed_mse:.10g}",
+                    f"mse_B_legacy_setting: {legacy_mse:.10g}",
+                    f"psnr_A_train_like: {-10.0 * math.log10(max(fixed_mse, 1e-12)):.8g}",
+                    f"psnr_B_legacy_setting: {-10.0 * math.log10(max(legacy_mse, 1e-12)):.8g}",
+                ]
+                args.debug_dir.mkdir(parents=True, exist_ok=True)
+                (args.debug_dir / f"path_compare_{run_name}.txt").write_text(
+                    "\n".join(compare_lines) + "\n",
+                    encoding="utf-8",
+                )
 
     del model
     if args.device_backend == "cuda":
@@ -309,6 +440,114 @@ def write_valpsnr_tables(
     )
 
 
+def extract_logged_val_manifest(run_dir: Path) -> str:
+    """Best-effort extraction of the validation manifest used during training."""
+    log_path = run_dir / "log.txt"
+    if not log_path.exists():
+        return ""
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    match = re.search(r"Validation dataset contains [^\n]*\(([^)]+)\)", text)
+    if match:
+        return match.group(1)
+    match = re.search(r"val_json_path=['\"]([^'\"]+)['\"]", text)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def write_manifest_check(
+    path: Path,
+    manifest_jsonl: Path,
+    image_paths: Sequence[Path],
+    metadata_by_path: Mapping[str, Mapping[str, str]],
+    runs: Mapping[str, Mapping[str, Any]],
+) -> None:
+    lines = [
+        f"setting_eval manifest path: {manifest_jsonl}",
+        f"num images: {len(image_paths)}",
+        "",
+        "training val manifest paths from run logs:",
+    ]
+    for run, spec in runs.items():
+        run_dir = Path(str(spec["run_dir"]))
+        logged = extract_logged_val_manifest(run_dir)
+        lines.append(f"{run}: {logged or '<not found in log.txt>'}")
+    lines.extend([
+        "",
+        "first 5 image_path/text:",
+    ])
+    for idx, image_path in enumerate(image_paths[:5]):
+        meta = metadata_by_path.get(str(image_path.resolve()), {})
+        lines.append(f"{idx}: image_path={image_path}")
+        lines.append(f"{idx}: text={meta.get('text', '')}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_preprocess_check(path: Path, image_paths: Sequence[Path], image_size: int, pad_color: str) -> None:
+    color = parse_color(pad_color)
+    with Image.open(image_paths[0]) as img:
+        setting_pil = resize_pad_image(img, image_size, color)
+    with Image.open(image_paths[0]) as img:
+        train_pil = resize_pad_arr(img, image_size, fill=color[0])
+    setting_tensor = pil_to_tensor(setting_pil)
+    train_tensor = pil_to_tensor(train_pil)
+    lines = [
+        f"image_path: {image_paths[0]}",
+        f"image_size: {image_size}",
+        f"pad_color: {color}",
+        f"setting tensor shape: {tuple(setting_tensor.shape)}",
+        f"train tensor shape: {tuple(train_tensor.shape)}",
+        f"max_abs_diff: {float((setting_tensor - train_tensor).abs().max().item()):.8g}",
+        f"setting min/max/mean: {float(setting_tensor.min()):.8g} {float(setting_tensor.max()):.8g} {float(setting_tensor.mean()):.8g}",
+        f"train min/max/mean: {float(train_tensor.min()):.8g} {float(train_tensor.max()):.8g} {float(train_tensor.mean()):.8g}",
+        f"setting hash: {tensor_hash(setting_tensor)}",
+        f"train hash: {tensor_hash(train_tensor)}",
+        f"setting first pixels: {setting_tensor.flatten()[:12].tolist()}",
+        f"train first pixels: {train_tensor.flatten()[:12].tolist()}",
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_config_ckpt_check(path: Path, runs: Mapping[str, Mapping[str, Any]]) -> None:
+    import yaml
+
+    lines = []
+    for run, spec in runs.items():
+        cfg_path = Path(str(spec["config"]))
+        with cfg_path.open("r", encoding="utf-8") as handle:
+            cfg = yaml.safe_load(handle)
+        text_cfg = cfg.get("text_conditioning", {})
+        text_recon = cfg.get("text_recon_conditioning", {})
+        ocr_tf = cfg.get("ocr_teacher_forcing_loss", {})
+        text_hr = cfg.get("text_hr", {})
+        trainer = cfg.get("trainer", {})
+        lines.extend([
+            f"[{run}]",
+            f"config path: {cfg_path}",
+            f"ckpt path: {spec['ckpt']}",
+            f"run_dir: {spec.get('run_dir')}",
+            f"logged val manifest: {extract_logged_val_manifest(Path(str(spec['run_dir'])))}",
+            f"text_conditioning.enabled: {text_cfg.get('enabled')}",
+            f"text_recon_conditioning.enabled: {text_recon.get('enabled')}",
+            f"text_recon_conditioning.mode: {text_recon.get('mode')}",
+            f"text_recon_conditioning.layers: {text_recon.get('layers')}",
+            f"text_recon_conditioning.layer_pairs: {text_recon.get('layer_pairs')}",
+            f"text_recon_conditioning.visual_memory_mask: {text_recon.get('visual_memory_mask')}",
+            f"text_recon_conditioning.residual_cross_attn: {text_recon.get('residual_cross_attn')}",
+            f"ocr_teacher_forcing_loss.enabled: {ocr_tf.get('enabled')}",
+            f"ocr_teacher_forcing_loss.weight: {ocr_tf.get('weight')}",
+            f"text_hr.enabled: {text_hr.get('enabled')}",
+            f"trainer.hr_on: {trainer.get('hr_on')}",
+            f"trainer.hr_loss_weight: {trainer.get('hr_loss_weight')}",
+            f"model.causal_settings.causal_type: {causal_type_from_config(cfg)}",
+            "",
+        ])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -318,6 +557,11 @@ def main() -> None:
         image_paths = image_paths[:args.max_images]
     if not image_paths:
         raise SystemExit("no images to evaluate")
+    if args.debug_dir is not None:
+        args.debug_dir.mkdir(parents=True, exist_ok=True)
+        write_manifest_check(args.debug_dir / "manifest_check.txt", args.manifest_jsonl, image_paths, metadata_by_path, runs)
+        write_preprocess_check(args.debug_dir / "preprocess_check.txt", image_paths, args.image_size, args.pad_color)
+        write_config_ckpt_check(args.debug_dir / "config_ckpt_check.txt", runs)
 
     device = prepare_device(args.device_backend, args.device_id)
     rows = []
@@ -343,6 +587,9 @@ def main() -> None:
 
     write_sanity_csv(args.output_dir / "metric_sanity.csv", rows)
     write_sanity_md(args.output_dir / "metric_sanity.md", rows)
+    write_sanity_md(args.output_dir / "metric_sanity_fixed.md", rows)
+    if args.debug_dir is not None:
+        write_sanity_md(args.debug_dir / "metric_sanity_fixed.md", rows)
     setting_metrics = read_setting_metrics(args.setting_metrics_csv)
     write_valpsnr_tables(
         output_dir=args.output_dir,

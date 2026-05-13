@@ -542,13 +542,14 @@ def reconstruct_batch(
         text_context: Optional[TextContext],
         device_backend: str,
         mixed_precision: str,
+        causal_type: Optional[str] = None,
 ) -> torch.Tensor:
     ptdtype = dtype_from_mixed_precision(mixed_precision)
     with torch.inference_mode():
         if text_context is None:
-            latent, _, info = model.encode(batch)
-            indices = info[2]
-            return model.decode_code(indices, latent.shape)
+            with autocast_context(device_backend, mixed_precision, dtype=ptdtype):
+                outputs = model(batch, causal_type=causal_type)
+            return outputs[0] if isinstance(outputs, (list, tuple)) else outputs
         if texts is None:
             raise ValueError("Text-conditioned reconstruction requires rendered text from --manifest-jsonl.")
 
@@ -604,6 +605,7 @@ def reconstruct_batch(
         with autocast_context(device_backend, mixed_precision, dtype=ptdtype):
             outputs = model(
                 batch,
+                causal_type=causal_type,
                 selected_decoder_layer=call_selected_decoder_layer,
                 decoder_text_features=decoder_text_features,
                 decoder_text_features_by_layer=decoder_text_features_by_layer,
@@ -1050,6 +1052,7 @@ def evaluate_run(
     fixed_wrong_text: str,
     strip_punctuation: bool,
     remove_spaces: bool,
+    causal_type: Optional[str],
 ) -> Tuple[Dict[str, Any], Dict[int, np.ndarray], Dict[int, np.ndarray], Dict[int, str]]:
     overall = MetricAccumulator()
     by_subset: Dict[str, MetricAccumulator] = defaultdict(MetricAccumulator)
@@ -1081,6 +1084,7 @@ def evaluate_run(
                 text_context,
                 device_backend=device_backend,
                 mixed_precision=mixed_precision,
+                causal_type=causal_type,
             )
         )
         gt_batch = [np.asarray(img, dtype=np.uint8) for img in pil_images]
@@ -1250,6 +1254,7 @@ def main() -> None:
             text_layer_pair_index=args.text_layer_pair_index,
             checkpoint_weight_key=args.checkpoint_weight_key,
         )
+        causal_type = (config.get("model", {}).get("causal_settings", {}) or {}).get("causal_type", None)
         if text_context is not None:
             print(f"[{run_name}] text-conditioned reconstruction uses pair {text_context.selected_pair}")
         metrics, recons, gts, subsets = evaluate_run(
@@ -1273,6 +1278,7 @@ def main() -> None:
             fixed_wrong_text=args.fixed_wrong_text,
             strip_punctuation=args.strip_punctuation,
             remove_spaces=args.remove_spaces,
+            causal_type=causal_type,
         )
         metrics_by_run[run_name] = metrics
         grid_recons_by_run[run_name] = recons
