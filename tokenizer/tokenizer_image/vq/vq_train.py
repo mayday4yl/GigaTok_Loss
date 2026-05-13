@@ -71,6 +71,7 @@ from tokenizer.tokenizer_image.vq.glyph_byt5 import (
     load_text_encoder_from_config,
     tokenize_texts_with_stats,
 )
+from scripts.stage1.ocr_debug.text_feature_cache import TextFeatureCache
 from tokenizer.tokenizer_image.scheduler import cosine_lr, const_lr, cosine_schedule_with_warmup_v2, wsd_lr
 
 from torchvision.transforms import Normalize
@@ -192,6 +193,15 @@ def parse_text_recon_layers(text_recon_cfg, decoder_num_layers=None):
                 f"text_recon_conditioning.layers out of range for decoder_num_layers={decoder_num_layers}: {out_of_range}"
             )
     return layers
+
+
+def get_cached_text_states(text_feature_cache, texts, device, dtype=None):
+    cached_features, cached_attention_mask = text_feature_cache.lookup_batch(
+        [str(text) for text in texts],
+        device=device,
+        dtype=dtype,
+    )
+    return (cached_features.detach(),), cached_attention_mask.detach()
 
 
 def compute_visual_memory_mask_ratio(base_ratio, schedule_cfg, step, total_steps):
@@ -524,6 +534,7 @@ def compute_reconstruction_metrics(
         causal_type,
         text_tokenizer=None,
         text_encoder=None,
+        text_feature_cache=None,
         text_layer_pairs=None,
         text_recon_layer_pairs=None,
         text_injection_layers=None,
@@ -556,31 +567,40 @@ def compute_reconstruction_metrics(
             decoder_head_text_features = None
             decoder_text_key_padding_mask = None
 
-            if text_tokenizer is not None:
-                if text_encoder is None:
-                    raise ValueError("Text-conditioned validation requires text_encoder.")
+            if text_tokenizer is not None or text_feature_cache is not None:
                 if not isinstance(text_batch, (list, tuple)):
                     raise TypeError("Text-conditioned validation requires the validation dataset to return text strings.")
 
-                text_backend = getattr(text_encoder, "encoder_backend", "t5")
-                text_inputs, _ = tokenize_texts_with_stats(
-                    text_tokenizer,
-                    [str(text) for text in text_batch],
-                    max_length=text_max_length,
-                    device=device,
-                    backend=text_backend,
-                )
-                input_ids = text_inputs["input_ids"]
-                text_attention_mask = text_inputs["attention_mask"]
-                decoder_text_key_padding_mask = ~text_attention_mask.bool()
-                with autocast_context(args.device_backend, args.mixed_precision, dtype=mixed_precision_dtype):
-                    text_outputs = text_encoder(
-                        input_ids=input_ids,
-                        attention_mask=text_attention_mask,
-                        output_hidden_states=True,
-                        return_dict=True,
+                texts = [str(text) for text in text_batch]
+                if text_feature_cache is not None:
+                    t5_layer_states, text_attention_mask = get_cached_text_states(
+                        text_feature_cache,
+                        texts,
+                        device=device,
+                        dtype=mixed_precision_dtype,
                     )
-                t5_layer_states = get_text_layer_states(text_outputs, text_backend)
+                else:
+                    if text_encoder is None:
+                        raise ValueError("Text-conditioned validation requires text_encoder.")
+                    text_backend = getattr(text_encoder, "encoder_backend", "t5")
+                    text_inputs, _ = tokenize_texts_with_stats(
+                        text_tokenizer,
+                        texts,
+                        max_length=text_max_length,
+                        device=device,
+                        backend=text_backend,
+                    )
+                    input_ids = text_inputs["input_ids"]
+                    text_attention_mask = text_inputs["attention_mask"]
+                    with autocast_context(args.device_backend, args.mixed_precision, dtype=mixed_precision_dtype):
+                        text_outputs = text_encoder(
+                            input_ids=input_ids,
+                            attention_mask=text_attention_mask,
+                            output_hidden_states=True,
+                            return_dict=True,
+                        )
+                    t5_layer_states = get_text_layer_states(text_outputs, text_backend)
+                decoder_text_key_padding_mask = ~text_attention_mask.bool()
                 if text_recon_mode == "residual_head":
                     head_text_layer = int(text_recon_head_text_layer)
                     if head_text_layer >= len(t5_layer_states):
@@ -1162,24 +1182,40 @@ def main(args):
     text_encoder_num_layers = None
     text_feature_dim = None
     text_encoder_backend = "t5"
+    text_feature_cache = None
     if text_conditioning_on:
         # Text-HR/Text-recon: the text encoder is frozen and only provides
         # hidden states for decoder-side conditioning.
         text_encoder_name = text_conditioning_cfg.get("encoder_name", "google/t5-v1_1-xl")
         text_cache_dir = text_conditioning_cfg.get("cache_dir", None)
         text_local_files_only = bool(text_conditioning_cfg.get("local_files_only", False))
-        text_encoder_result = load_text_encoder_from_config(text_conditioning_cfg, device)
-        text_tokenizer = text_encoder_result.tokenizer
-        text_encoder = text_encoder_result.encoder
-        text_feature_dim = text_encoder_result.feature_dim
-        text_encoder_num_layers = text_encoder_result.num_layers
-        text_encoder_backend = text_encoder_result.backend
-        logger.info(
-            f"Text conditioning enabled: backend={text_encoder_backend}, encoder={text_encoder_name}, "
-            f"d_model={text_feature_dim}, num_layers={text_encoder_num_layers}, "
-            f"max_length={text_max_length}, cache_dir={text_cache_dir}, "
-            f"local_files_only={text_local_files_only}"
-        )
+        text_feature_cache_path = args.text_feature_cache or os.environ.get("TEXT_FEATURE_CACHE")
+        if text_feature_cache_path:
+            text_feature_cache = TextFeatureCache(text_feature_cache_path)
+            text_feature_cache.validate_config(text_conditioning_cfg)
+            text_feature_dim = int(text_feature_cache.metadata["feature_dim"])
+            text_encoder_num_layers = int(text_feature_cache.metadata["num_layers"])
+            text_encoder_backend = str(text_feature_cache.metadata["backend"])
+            logger.info(
+                "Using cached text features: "
+                f"path={text_feature_cache.cache_path}, "
+                f"num_unique_texts={text_feature_cache.num_unique_texts}, "
+                f"feature_shape=[{text_feature_cache.max_length}, {text_feature_cache.feature_dim}], "
+                f"dtype={text_feature_cache.metadata.get('dtype')}"
+            )
+        else:
+            text_encoder_result = load_text_encoder_from_config(text_conditioning_cfg, device)
+            text_tokenizer = text_encoder_result.tokenizer
+            text_encoder = text_encoder_result.encoder
+            text_feature_dim = text_encoder_result.feature_dim
+            text_encoder_num_layers = text_encoder_result.num_layers
+            text_encoder_backend = text_encoder_result.backend
+            logger.info(
+                f"Text conditioning enabled: backend={text_encoder_backend}, encoder={text_encoder_name}, "
+                f"d_model={text_feature_dim}, num_layers={text_encoder_num_layers}, "
+                f"max_length={text_max_length}, cache_dir={text_cache_dir}, "
+                f"local_files_only={text_local_files_only}"
+            )
  
     vq_model = load_model_from_config(config)
     if text_conditioning_on:
@@ -1799,25 +1835,36 @@ def main(args):
                         "text_conditioning.enabled=True requires the dataset to return a batch of text strings."
                     )
                 texts = [str(text) for text in y]
-                text_inputs, glyph_token_stats = tokenize_texts_with_stats(
-                    text_tokenizer,
-                    texts,
-                    max_length=text_max_length,
-                    device=device,
-                    backend=text_encoder_backend,
-                )
-                input_ids = text_inputs["input_ids"]
-                text_attention_mask = text_inputs["attention_mask"]
+                if text_feature_cache is not None:
+                    t5_layer_states, text_attention_mask = get_cached_text_states(
+                        text_feature_cache,
+                        texts,
+                        device=device,
+                        dtype=ptdtype,
+                    )
+                    glyph_token_stats = {
+                        "glyph_max_length": torch.tensor(float(text_feature_cache.max_length), dtype=torch.float32, device=device),
+                    }
+                else:
+                    text_inputs, glyph_token_stats = tokenize_texts_with_stats(
+                        text_tokenizer,
+                        texts,
+                        max_length=text_max_length,
+                        device=device,
+                        backend=text_encoder_backend,
+                    )
+                    input_ids = text_inputs["input_ids"]
+                    text_attention_mask = text_inputs["attention_mask"]
+                    with torch.no_grad():
+                        with autocast_context(args.device_backend, args.mixed_precision, dtype=ptdtype):
+                            text_outputs = text_encoder(
+                                input_ids=input_ids,
+                                attention_mask=text_attention_mask,
+                                output_hidden_states=True,
+                                return_dict=True,
+                            )
+                    t5_layer_states = get_text_layer_states(text_outputs, text_encoder_backend)
                 decoder_text_key_padding_mask = ~text_attention_mask.bool()
-                with torch.no_grad():
-                    with autocast_context(args.device_backend, args.mixed_precision, dtype=ptdtype):
-                        text_outputs = text_encoder(
-                            input_ids=input_ids,
-                            attention_mask=text_attention_mask,
-                            output_hidden_states=True,
-                            return_dict=True,
-                        )
-                t5_layer_states = get_text_layer_states(text_outputs, text_encoder_backend)
                 if text_recon_on:
                     if text_recon_mode == "residual_head":
                         if text_recon_head_text_layer >= len(t5_layer_states):
@@ -2211,6 +2258,7 @@ def main(args):
                     causal_type=causal_type,
                     text_tokenizer=text_tokenizer if text_conditioning_on else None,
                     text_encoder=text_encoder if text_conditioning_on else None,
+                    text_feature_cache=text_feature_cache if text_conditioning_on else None,
                     text_layer_pairs=text_layer_pairs if text_conditioning_on else None,
                     text_recon_layer_pairs=text_recon_layer_pairs if text_recon_on else None,
                     text_injection_layers=text_injection_layers if text_recon_on else None,
@@ -2413,6 +2461,7 @@ if __name__ == "__main__":
     parser.add_argument("--val-compute-ssim", action='store_true', help="Compute online validation SSIM. Slower than MSE/PSNR.")
     parser.add_argument("--save-best", action='store_true', help="Save checkpoints/best.pt according to online validation metric.")
     parser.add_argument("--save-last", action='store_true', help="Save checkpoints/last.pt at the end of training.")
+    parser.add_argument("--text-feature-cache", type=str, default=None, help="Optional frozen Glyph-ByT5 mapped feature cache (.pt).")
     parser.add_argument("--best-metric", type=str, default="val_mse", choices=["val_mse", "val_mae", "val_psnr", "val_ssim"])
     parser.add_argument("--best-mode", type=str, default="min", choices=["min", "max"])
     parser.add_argument("--sub-exp-dir", type=str, default=None, help="sub experiment dir")
