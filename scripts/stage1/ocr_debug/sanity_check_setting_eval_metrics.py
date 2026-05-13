@@ -71,6 +71,9 @@ SANITY_FIELDS = [
     "run",
     "checkpoint_weight_key",
     "num_images",
+    "train_metric_source",
+    "train_metric_step",
+    "train_val_images",
     "train_final_val_mse",
     "train_final_val_psnr",
     "train_final_val_ssim",
@@ -166,24 +169,52 @@ def write_sanity_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
             writer.writerow({field: csv_value(row.get(field)) for field in SANITY_FIELDS})
 
 
-def final_val_metrics(run_dir: Path) -> dict[str, float | None]:
-    candidates = [
-        run_dir / "val.csv",
-        run_dir / "metrics" / "val_metrics.csv",
-    ]
-    rows: list[dict[str, str]] = []
-    for path in candidates:
-        rows = read_csv_rows(path)
-        if rows:
-            break
+def val_metric_candidate(path: Path) -> dict[str, Any]:
+    rows = read_csv_rows(path)
     if not rows:
-        return {"val_mse": None, "val_psnr": None, "val_ssim": None}
+        return {
+            "path": str(path),
+            "exists": path.exists(),
+            "rows": 0,
+            "step": None,
+            "val_mse": None,
+            "val_psnr": None,
+            "val_ssim": None,
+            "val_images": None,
+        }
     final = rows[-1]
     return {
+        "path": str(path),
+        "exists": True,
+        "rows": len(rows),
+        "step": parse_float(final.get("step")),
         "val_mse": parse_float(final.get("val_mse")),
         "val_psnr": parse_float(final.get("val_psnr")),
         "val_ssim": parse_float(final.get("val_ssim")),
+        "val_images": parse_float(final.get("val_images")),
     }
+
+
+def val_metric_candidates(run_dir: Path) -> list[dict[str, Any]]:
+    return [
+        val_metric_candidate(run_dir / "val.csv"),
+        val_metric_candidate(run_dir / "metrics" / "val_metrics.csv"),
+    ]
+
+
+def final_val_metrics(run_dir: Path) -> dict[str, float | None]:
+    candidates = val_metric_candidates(run_dir)
+    for candidate in candidates:
+        if candidate["rows"]:
+            return {
+                "source": candidate["path"],
+                "step": candidate["step"],
+                "val_mse": candidate["val_mse"],
+                "val_psnr": candidate["val_psnr"],
+                "val_ssim": candidate["val_ssim"],
+                "val_images": candidate["val_images"],
+            }
+    return {"source": None, "step": None, "val_mse": None, "val_psnr": None, "val_ssim": None, "val_images": None}
 
 
 def tensor_stats(x: torch.Tensor) -> dict[str, float]:
@@ -738,10 +769,28 @@ def write_config_ckpt_check(path: Path, runs: Mapping[str, Mapping[str, Any]]) -
         ocr_tf = cfg.get("ocr_teacher_forcing_loss", {})
         text_hr = cfg.get("text_hr", {})
         trainer = cfg.get("trainer", {})
+        ckpt_path = Path(str(spec["ckpt"]))
+        ckpt_info: dict[str, Any] = {}
+        if ckpt_path.exists():
+            try:
+                ckpt = torch.load(ckpt_path, map_location="cpu")
+                if isinstance(ckpt, Mapping):
+                    ckpt_info = {
+                        "keys": sorted(str(key) for key in ckpt.keys()),
+                        "steps": ckpt.get("steps"),
+                        "has_model": "model" in ckpt,
+                        "has_ema": "ema" in ckpt,
+                        "has_state_dict": "state_dict" in ckpt,
+                    }
+                del ckpt
+            except Exception as exc:  # pragma: no cover - diagnostic only
+                ckpt_info = {"error": repr(exc)}
         lines.extend([
             f"[{run}]",
             f"config path: {cfg_path}",
-            f"ckpt path: {spec['ckpt']}",
+            f"ckpt path: {ckpt_path}",
+            f"ckpt exists: {ckpt_path.exists()}",
+            f"ckpt info: {ckpt_info}",
             f"run_dir: {spec.get('run_dir')}",
             f"logged val manifest: {extract_logged_val_manifest(Path(str(spec['run_dir'])))}",
             f"text_conditioning.enabled: {text_cfg.get('enabled')}",
@@ -763,6 +812,35 @@ def write_config_ckpt_check(path: Path, runs: Mapping[str, Mapping[str, Any]]) -
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def write_train_metric_source_check(path: Path, runs: Mapping[str, Mapping[str, Any]]) -> None:
+    lines = []
+    for run, spec in runs.items():
+        run_dir = Path(str(spec["run_dir"]))
+        lines.append(f"[{run}]")
+        lines.append(f"run_dir: {run_dir}")
+        for candidate in val_metric_candidates(run_dir):
+            lines.append(
+                "candidate: path={path} exists={exists} rows={rows} step={step} "
+                "val_mse={val_mse} val_psnr={val_psnr} val_ssim={val_ssim} val_images={val_images}".format(
+                    **candidate
+                )
+            )
+        log_path = run_dir / "log.txt"
+        if log_path.exists():
+            val_lines = [
+                line.strip()
+                for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                if "Val MSE:" in line
+            ]
+            lines.append("last log Val MSE lines:")
+            lines.extend(val_lines[-3:] or ["<none>"])
+        else:
+            lines.append("log.txt: <missing>")
+        lines.append("")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -777,6 +855,7 @@ def main() -> None:
         write_manifest_check(args.debug_dir / "manifest_check.txt", args.manifest_jsonl, image_paths, metadata_by_path, runs)
         write_preprocess_check(args.debug_dir / "preprocess_check.txt", image_paths, args.image_size, args.pad_color)
         write_config_ckpt_check(args.debug_dir / "config_ckpt_check.txt", runs)
+        write_train_metric_source_check(args.debug_dir / "train_metric_source_check.txt", runs)
 
     device = prepare_device(args.device_backend, args.device_id)
     rows = []
@@ -794,6 +873,9 @@ def main() -> None:
         row["train_final_val_mse"] = train["val_mse"]
         row["train_final_val_psnr"] = train["val_psnr"]
         row["train_final_val_ssim"] = train["val_ssim"]
+        row["train_metric_source"] = train["source"]
+        row["train_metric_step"] = train["step"]
+        row["train_val_images"] = train["val_images"]
         if train["val_mse"] is not None:
             row["ratio"] = row["setting_eval_tensor_mse"] / train["val_mse"]
             if row.get("vq_train_compute_mse") is not None:
