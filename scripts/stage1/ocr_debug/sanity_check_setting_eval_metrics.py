@@ -547,12 +547,6 @@ def evaluate_tensor_metrics(
                     encoding="utf-8",
                 )
 
-    del model
-    if args.device_backend == "cuda":
-        torch.cuda.empty_cache()
-    elif args.device_backend == "npu":
-        torch.npu.empty_cache()
-
     mse = mse_sum / max(1, elem_count)
     psnr = -10.0 * math.log10(max(mse, 1e-12))
     vq_train_metrics = compute_vq_train_metrics_local(
@@ -576,6 +570,11 @@ def evaluate_tensor_metrics(
     }
     if range_stats:
         out.update(range_stats)
+    del model
+    if args.device_backend == "cuda":
+        torch.cuda.empty_cache()
+    elif args.device_backend == "npu":
+        torch.npu.empty_cache()
     return out
 
 
