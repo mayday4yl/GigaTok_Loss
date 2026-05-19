@@ -198,6 +198,146 @@ def _singular_energy_stats(sigma, eps=1e-8):
     }
 
 
+def _positional_distance_1d(valid_token_count, device, dtype):
+    if valid_token_count < 2:
+        raise ValueError("valid_token_count must be >= 2 for positional distance")
+    pos = torch.arange(valid_token_count, device=device, dtype=dtype)
+    pos = pos / max(1, valid_token_count - 1)
+    return (pos[:, None] - pos[None, :]).abs()
+
+
+def _positional_distance_2d(num_image_tokens, device, dtype):
+    side = int(round(math.sqrt(int(num_image_tokens))))
+    if side * side != int(num_image_tokens):
+        raise ValueError(f"N_img must be square for positional D_img, got {num_image_tokens}")
+    if side == 1:
+        coords = torch.zeros((1, 2), device=device, dtype=dtype)
+    else:
+        yy, xx = torch.meshgrid(
+            torch.linspace(0.0, 1.0, side, device=device, dtype=dtype),
+            torch.linspace(0.0, 1.0, side, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        coords = torch.stack([yy.reshape(-1), xx.reshape(-1)], dim=-1)
+    dist = torch.cdist(coords, coords, p=2)
+    return dist / math.sqrt(2.0), side
+
+
+def local_similarity_positional_loss(
+        attn_weights,
+        text_attention_mask,
+        image_token_len=0,
+        average_heads_before_loss=True,
+        skip_if_valid_tokens_lt=2,
+        eps=1e-8):
+    """GW-style local-similarity loss with fixed positional distances.
+
+    The residual text injection branch returns post-softmax image->text
+    attention [B, H, N_img, N_txt].  The advisor's formula is written as a
+    text->image transport, so this function transposes the selected valid text
+    slice and normalizes total transport mass per sample/head.
+    """
+    if attn_weights is None:
+        raise ValueError("attn_weights is required for local similarity loss.")
+    if attn_weights.dim() != 4:
+        raise ValueError(f"Expected attention shape [B, H, N_img, K], got {attn_weights.shape}")
+    if text_attention_mask is None:
+        raise ValueError("text_attention_mask is required for local similarity loss.")
+
+    batch_size, num_heads, num_image_tokens, num_keys = attn_weights.shape
+    text_attention_mask = text_attention_mask.to(device=attn_weights.device, dtype=torch.bool)
+    if text_attention_mask.dim() != 2 or text_attention_mask.shape[0] != batch_size:
+        raise ValueError(
+            f"Expected text_attention_mask shape [B, T], got {text_attention_mask.shape} "
+            f"for attention batch={batch_size}"
+        )
+    text_token_len = text_attention_mask.shape[1]
+    image_token_len = int(image_token_len)
+    if num_keys < image_token_len + text_token_len:
+        raise ValueError(
+            f"Attention key length {num_keys} is smaller than image_token_len + text_token_len "
+            f"({image_token_len} + {text_token_len})."
+        )
+
+    text_attn = attn_weights[:, :, :, image_token_len:image_token_len + text_token_len]
+    d_img, image_grid_side = _positional_distance_2d(
+        num_image_tokens,
+        device=attn_weights.device,
+        dtype=torch.float32,
+    )
+    d_img_sq = d_img.pow(2)
+
+    losses = []
+    raw_masses = []
+    valid_token_counts = []
+    d_txt_maxes = []
+    skipped_samples = 0
+
+    for batch_idx in range(batch_size):
+        valid_mask = text_attention_mask[batch_idx]
+        valid_token_count = int(valid_mask.sum().item())
+        if valid_token_count < int(skip_if_valid_tokens_lt):
+            skipped_samples += 1
+            continue
+
+        sample_attn = text_attn[batch_idx, :, :, valid_mask].float().clamp_min(0.0)
+        # Convert [H, N_img, T] to text->image transport [H, T, N_img].
+        sample_attn = sample_attn.transpose(-1, -2)
+        if average_heads_before_loss:
+            sample_attn = sample_attn.mean(dim=0, keepdim=True)
+
+        d_txt = _positional_distance_1d(valid_token_count, sample_attn.device, torch.float32)
+        d_txt_sq = d_txt.pow(2)
+        d_txt_maxes.append(d_txt.max().detach())
+        valid_token_counts.append(valid_token_count)
+
+        for head_idx in range(sample_attn.shape[0]):
+            transport = sample_attn[head_idx]
+            raw_mass = transport.sum()
+            raw_masses.append(raw_mass.detach())
+            if raw_mass <= eps:
+                skipped_samples += 1
+                continue
+            transport = transport / raw_mass.clamp_min(eps)
+            p = transport.sum(dim=1)
+            q = transport.sum(dim=0)
+            term_txt = p.matmul(d_txt_sq).matmul(p)
+            term_img = q.matmul(d_img_sq).matmul(q)
+            cross = (d_txt.matmul(transport).matmul(d_img) * transport).sum()
+            losses.append(term_txt + term_img - 2.0 * cross)
+
+    if not losses:
+        zero = attn_weights.new_zeros(())
+        return zero, {
+            "local_valid_sample_count": torch.tensor(0.0, device=attn_weights.device),
+            "local_A_mass_mean": zero.detach(),
+            "local_A_mass_min": zero.detach(),
+            "local_D_txt_max": zero.detach(),
+            "local_D_img_max": d_img.max().detach(),
+            "local_N_img": torch.tensor(float(num_image_tokens), device=attn_weights.device),
+            "local_img_grid_side": torch.tensor(float(image_grid_side), device=attn_weights.device),
+            "local_valid_text_tokens_mean": zero.detach(),
+            "local_skipped_samples": torch.tensor(float(skipped_samples), device=attn_weights.device),
+        }
+
+    loss = torch.stack(losses).mean()
+    if not torch.isfinite(loss):
+        raise RuntimeError(f"local_similarity_loss is not finite: {loss}")
+    raw_mass_tensor = torch.stack(raw_masses) if raw_masses else attn_weights.new_zeros((1,))
+    valid_tokens_tensor = torch.tensor(valid_token_counts, device=attn_weights.device, dtype=torch.float32)
+    return loss, {
+        "local_valid_sample_count": torch.tensor(float(len(losses)), device=attn_weights.device),
+        "local_A_mass_mean": raw_mass_tensor.float().mean().detach(),
+        "local_A_mass_min": raw_mass_tensor.float().min().detach(),
+        "local_D_txt_max": torch.stack(d_txt_maxes).float().mean().detach() if d_txt_maxes else attn_weights.new_zeros(()),
+        "local_D_img_max": d_img.max().detach(),
+        "local_N_img": torch.tensor(float(num_image_tokens), device=attn_weights.device),
+        "local_img_grid_side": torch.tensor(float(image_grid_side), device=attn_weights.device),
+        "local_valid_text_tokens_mean": valid_tokens_tensor.mean().detach() if valid_token_counts else attn_weights.new_zeros(()),
+        "local_skipped_samples": torch.tensor(float(skipped_samples), device=attn_weights.device),
+    }
+
+
 def high_rank_image_text_attention_loss(
         attn_weights,
         text_attention_mask,
@@ -586,6 +726,9 @@ class VQLoss(nn.Module):
                 selected_text_layer=None, text_hr_tau=1.0,
                 text_hr_skip_if_valid_tokens_lt=2, text_hr_image_token_len=256,
                 text_hr_svd_mode="frobenius_uniform", text_hr_eps=1e-8,
+                local_similarity_attn_weights=None, local_similarity_loss_weight=0.0,
+                local_similarity_image_token_len=0, local_similarity_average_heads_before_loss=True,
+                local_similarity_skip_if_valid_tokens_lt=2, local_similarity_eps=1e-8,
                 text_recon_stats=None
                 ):
         assert len(inter_loss_set) == 2
@@ -736,7 +879,33 @@ class VQLoss(nn.Module):
                 raise ValueError("text_hr_loss_weight is non-zero but text_hr_attn_weights is None.")
 
             text_hr_loss_term = text_hr_loss_weight * text_hr_loss if text_hr_loss is not None else 0.0
+            local_similarity_loss = None
+            local_similarity_stats = {}
+            if local_similarity_attn_weights is not None:
+                local_similarity_loss, local_similarity_stats = local_similarity_positional_loss(
+                    local_similarity_attn_weights,
+                    text_attention_mask=text_attention_mask,
+                    image_token_len=local_similarity_image_token_len,
+                    average_heads_before_loss=local_similarity_average_heads_before_loss,
+                    skip_if_valid_tokens_lt=local_similarity_skip_if_valid_tokens_lt,
+                    eps=local_similarity_eps,
+                )
+            elif local_similarity_loss_weight != 0:
+                raise ValueError("local_similarity_loss_weight is non-zero but local_similarity_attn_weights is None.")
+            local_similarity_loss_term = (
+                local_similarity_loss_weight * local_similarity_loss
+                if local_similarity_loss is not None else 0.0
+            )
+
             text_recon_stats = text_recon_stats or {}
+            if local_similarity_loss is not None:
+                text_recon_stats.update(local_similarity_stats)
+                text_recon_stats["local_similarity_loss"] = local_similarity_loss.detach()
+                text_recon_stats["weighted_local_similarity_loss"] = local_similarity_loss_term.detach()
+                text_recon_stats["local_similarity_loss_weight"] = torch.tensor(
+                    float(local_similarity_loss_weight),
+                    device=local_similarity_loss.device,
+                )
             def text_recon_stat_float(name, default=0.0):
                 value = text_recon_stats.get(name, default)
                 if torch.is_tensor(value):
@@ -746,7 +915,7 @@ class VQLoss(nn.Module):
                 self.perceptual_weight * (p_loss + direct_p_loss) + \
                 disc_adaptive_weight * disc_weight * (generator_adv_loss + direct_generator_adv_loss) + \
                 codebook_loss_sum + feature_rec_loss + self.proj_weight * proj_loss + \
-                hr_loss_term + text_hr_loss_term
+                hr_loss_term + text_hr_loss_term + local_similarity_loss_term
 
             if check_nan_loss:
                 if torch.isnan(loss).any():
@@ -788,6 +957,15 @@ class VQLoss(nn.Module):
                             f"text_hr_visual_attention_mass_mean: {text_hr_stats['visual_attention_mass_mean']:.4f}, "
                             f"text_hr_valid_text_tokens_mean: {text_hr_stats['valid_text_tokens_mean']:.2f}, "
                             f"text_hr_skipped_samples: {text_hr_stats['skipped_samples']}\n"
+                        )
+                    if local_similarity_loss is not None:
+                        error_info += (
+                            f"local_similarity_loss: {local_similarity_loss:.4e}, "
+                            f"local_similarity_loss_weight: {local_similarity_loss_weight:.4e}, "
+                            f"local_valid_sample_count: {local_similarity_stats['local_valid_sample_count']:.0f}, "
+                            f"local_A_mass_mean: {local_similarity_stats['local_A_mass_mean']:.4e}, "
+                            f"local_D_txt_max: {local_similarity_stats['local_D_txt_max']:.4e}, "
+                            f"local_D_img_max: {local_similarity_stats['local_D_img_max']:.4e}\n"
                         )
                     get_ip_cmd = """hostname -I | awk '{split($0, a, " "); print a[1]}'"""
                     ip_addr = os.popen(get_ip_cmd).read().strip()

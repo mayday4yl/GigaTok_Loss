@@ -115,6 +115,22 @@ text_recon_conditioning:
   adaln:
     enabled: False
 
+ocr_box_gate:
+  enabled: False
+  bbox_jsonl: null
+  grid_size: 16
+  inside_value: 1.0
+  edge_value: 0.3
+  outside_value: 0.05
+  dilate_tokens: 1
+  missing_policy: "error"
+  empty_boxes_policy: "error"
+  low_conf_enabled: False
+  low_conf_alpha: 1.0
+  low_conf_max: 1.2
+  apply_layers: [6, 12, 18]
+  log_debug: True
+
 text_hr:
   enabled: True
   hr_loss_weight: 500.0

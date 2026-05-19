@@ -227,6 +227,7 @@ class VQVitModelPlus(nn.Module):
                                )
 
         self.num_latent_tokens = config.num_latent_tokens
+        self.ocr_visual_alignment_mlp = None
         # scale = self.s2to1encoder.width ** -0.5
         # self.latent_tokens = nn.Parameter(
         #     scale * torch.randn(self.num_latent_tokens, self.s2to1encoder.width))
@@ -510,6 +511,44 @@ class VQVitModelPlus(nn.Module):
             self.s1to2decoder.residual_cross_attn_layers = None
             self.s1to2decoder.residual_cross_attn_projs = None
             self.s1to2decoder.residual_cross_attn_scales = None
+
+    def configure_ocr_visual_alignment(self, target_dim, mlp_hidden_mult=4.0):
+        decoder_width = int(self.s1to2decoder.width)
+        target_dim = int(target_dim)
+        hidden_dim = int(decoder_width * float(mlp_hidden_mult))
+        if target_dim <= 0:
+            raise ValueError(f"ocr_visual_alignment target_dim must be positive, got {target_dim}")
+        if hidden_dim <= 0:
+            raise ValueError(f"ocr_visual_alignment hidden_dim must be positive, got {hidden_dim}")
+        self.ocr_visual_alignment_mlp = nn.Sequential(
+            nn.LayerNorm(decoder_width),
+            nn.Linear(decoder_width, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, target_dim),
+        )
+        self.ocr_visual_alignment_mlp.apply(self._init_weights)
+
+    def project_ocr_visual_alignment_features(self, decoder_features):
+        if self.ocr_visual_alignment_mlp is None:
+            raise RuntimeError("ocr_visual_alignment_mlp is not configured.")
+        return self.ocr_visual_alignment_mlp(decoder_features)
+
+    def _attach_ocr_visual_alignment_projection(self, text_recon_stats):
+        if not text_recon_stats:
+            return text_recon_stats
+        decoder_features = text_recon_stats.pop("_ocr_visual_alignment_decoder_feature", None)
+        if decoder_features is None:
+            return text_recon_stats
+        if self.ocr_visual_alignment_mlp is None:
+            raise RuntimeError("ocr_visual_alignment_layer requires configured ocr_visual_alignment_mlp.")
+        text_recon_stats["_ocr_visual_alignment_projected_feature"] = self.ocr_visual_alignment_mlp(decoder_features)
+        text_recon_stats["_ocr_visual_alignment_decoder_feature_tokens"] = decoder_features.new_tensor(
+            float(decoder_features.shape[1])
+        )
+        text_recon_stats["_ocr_visual_alignment_decoder_feature_dim"] = decoder_features.new_tensor(
+            float(decoder_features.shape[2])
+        )
+        return text_recon_stats
 
     def project_text_memory(self, decoder_text_features):
         # Text-HR v2: decoder_text_features are selected T5 layer features [B, T, d_t5].
@@ -873,6 +912,9 @@ class VQVitModelPlus(nn.Module):
             visual_memory_mask_fixed_pattern=False,
             visual_memory_mask_seed=0,
             visual_memory_mask_apply_in_eval=False,
+            ocr_box_gate=None,
+            ocr_box_gate_layers=None,
+            ocr_visual_alignment_layer=None,
             return_text_recon_stats=False,
             ):
         quant = self.post_quant_conv(quant)
@@ -934,6 +976,9 @@ class VQVitModelPlus(nn.Module):
                     residual_gate=residual_gate,
                     residual_cross_attn_text_by_layer=residual_cross_attn_text_by_layer,
                     adaln_params_by_layer=adaln_params_by_layer,
+                    ocr_box_gate=ocr_box_gate,
+                    ocr_box_gate_layers=ocr_box_gate_layers,
+                    ocr_visual_alignment_layer=ocr_visual_alignment_layer,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -960,6 +1005,9 @@ class VQVitModelPlus(nn.Module):
                     residual_gate=residual_gate,
                     residual_cross_attn_text_by_layer=residual_cross_attn_text_by_layer,
                     adaln_params_by_layer=adaln_params_by_layer,
+                    ocr_box_gate=ocr_box_gate,
+                    ocr_box_gate_layers=ocr_box_gate_layers,
+                    ocr_visual_alignment_layer=ocr_visual_alignment_layer,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -980,6 +1028,8 @@ class VQVitModelPlus(nn.Module):
             )
             if residual_head_stats:
                 text_recon_stats.update(residual_head_stats)
+            if return_text_recon_stats:
+                text_recon_stats = self._attach_ocr_visual_alignment_projection(text_recon_stats)
             if selected_decoder_layer is not None:
                 if return_text_recon_stats:
                     return pixel_dec, rec_spatial, inner_feat, decoder_cross_attn, text_recon_stats
@@ -1014,6 +1064,9 @@ class VQVitModelPlus(nn.Module):
                     residual_gate=residual_gate,
                     residual_cross_attn_text_by_layer=residual_cross_attn_text_by_layer,
                     adaln_params_by_layer=adaln_params_by_layer,
+                    ocr_box_gate=ocr_box_gate,
+                    ocr_box_gate_layers=ocr_box_gate_layers,
+                    ocr_visual_alignment_layer=ocr_visual_alignment_layer,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -1039,6 +1092,9 @@ class VQVitModelPlus(nn.Module):
                     residual_gate=residual_gate,
                     residual_cross_attn_text_by_layer=residual_cross_attn_text_by_layer,
                     adaln_params_by_layer=adaln_params_by_layer,
+                    ocr_box_gate=ocr_box_gate,
+                    ocr_box_gate_layers=ocr_box_gate_layers,
+                    ocr_visual_alignment_layer=ocr_visual_alignment_layer,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -1059,6 +1115,8 @@ class VQVitModelPlus(nn.Module):
             )
             if residual_head_stats:
                 text_recon_stats.update(residual_head_stats)
+            if return_text_recon_stats:
+                text_recon_stats = self._attach_ocr_visual_alignment_projection(text_recon_stats)
             if selected_decoder_layer is not None:
                 if return_text_recon_stats:
                     return pixel_dec, rec_spatial, decoder_cross_attn, text_recon_stats
@@ -1096,6 +1154,9 @@ class VQVitModelPlus(nn.Module):
             visual_memory_mask_fixed_pattern=False,
             visual_memory_mask_seed=0,
             visual_memory_mask_apply_in_eval=False,
+            ocr_box_gate=None,
+            ocr_box_gate_layers=None,
+            ocr_visual_alignment_layer=None,
             return_text_recon_stats=False,
             ):
         # Text-HR v2: selected_decoder_layer / decoder_text_features keep the
@@ -1130,6 +1191,9 @@ class VQVitModelPlus(nn.Module):
                         visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
                         visual_memory_mask_seed=visual_memory_mask_seed,
                         visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
+                        ocr_box_gate=ocr_box_gate,
+                        ocr_box_gate_layers=ocr_box_gate_layers,
+                        ocr_visual_alignment_layer=ocr_visual_alignment_layer,
                         return_text_recon_stats=return_text_recon_stats,
                     )
                     if return_text_recon_stats:
@@ -1150,6 +1214,9 @@ class VQVitModelPlus(nn.Module):
                         visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
                         visual_memory_mask_seed=visual_memory_mask_seed,
                         visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
+                        ocr_box_gate=ocr_box_gate,
+                        ocr_box_gate_layers=ocr_box_gate_layers,
+                        ocr_visual_alignment_layer=ocr_visual_alignment_layer,
                         return_text_recon_stats=return_text_recon_stats,
                     )
                     if return_text_recon_stats:
@@ -1175,6 +1242,9 @@ class VQVitModelPlus(nn.Module):
                         visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
                         visual_memory_mask_seed=visual_memory_mask_seed,
                         visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
+                        ocr_box_gate=ocr_box_gate,
+                        ocr_box_gate_layers=ocr_box_gate_layers,
+                        ocr_visual_alignment_layer=ocr_visual_alignment_layer,
                         return_text_recon_stats=return_text_recon_stats,
                     )
                     if return_text_recon_stats:
@@ -1196,6 +1266,9 @@ class VQVitModelPlus(nn.Module):
                         visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
                         visual_memory_mask_seed=visual_memory_mask_seed,
                         visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
+                        ocr_box_gate=ocr_box_gate,
+                        ocr_box_gate_layers=ocr_box_gate_layers,
+                        ocr_visual_alignment_layer=ocr_visual_alignment_layer,
                         return_text_recon_stats=return_text_recon_stats,
                     )
                     if return_text_recon_stats:
@@ -1220,6 +1293,9 @@ class VQVitModelPlus(nn.Module):
                     visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
                     visual_memory_mask_seed=visual_memory_mask_seed,
                     visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
+                    ocr_box_gate=ocr_box_gate,
+                    ocr_box_gate_layers=ocr_box_gate_layers,
+                    ocr_visual_alignment_layer=ocr_visual_alignment_layer,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:
@@ -1240,6 +1316,9 @@ class VQVitModelPlus(nn.Module):
                     visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
                     visual_memory_mask_seed=visual_memory_mask_seed,
                     visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
+                    ocr_box_gate=ocr_box_gate,
+                    ocr_box_gate_layers=ocr_box_gate_layers,
+                    ocr_visual_alignment_layer=ocr_visual_alignment_layer,
                     return_text_recon_stats=return_text_recon_stats,
                 )
                 if return_text_recon_stats:

@@ -65,6 +65,12 @@ except ImportError:
 
 from dataset.augmentation import random_crop_arr
 from dataset.build import build_dataset
+from dataset.ocr_box_gate import (
+    load_ocr_box_index,
+    ocr_box_gate_config_from_dict,
+    preflight_ocr_box_coverage,
+    validate_ocr_box_gate_config,
+)
 from tokenizer.tokenizer_image.vq.vq_loss import VQLoss
 from tokenizer.tokenizer_image.vq.glyph_byt5 import (
     get_text_layer_states,
@@ -353,6 +359,140 @@ class DeepSeekOCRFeatureLoss(torch.nn.Module):
         return loss, stats
 
 
+def _last_linear_out_features(module):
+    if isinstance(module, torch.nn.Linear):
+        return int(module.out_features)
+    for child in reversed(list(module.children())):
+        out = _last_linear_out_features(child)
+        if out is not None:
+            return out
+    return None
+
+
+class DeepSeekOCRVisualAlignmentLoss(torch.nn.Module):
+    """REPA-style alignment target from frozen DeepSeek-OCR visual features.
+
+    The trainable projection head lives on the GigaTok model.  This module only
+    extracts detached target features from GT images and computes similarity.
+    """
+
+    def __init__(
+            self,
+            model_path,
+            device,
+            dtype_name="bf16",
+            image_size=512,
+            attn_implementation="eager",
+            loss_type="cosine"):
+        super().__init__()
+        if AutoModel is None:
+            raise ImportError("transformers.AutoModel is required for ocr_visual_alignment_loss.backend=deepseek_ocr")
+        dtype_map = {
+            "fp32": torch.float32,
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+        }
+        if dtype_name not in dtype_map:
+            raise ValueError(f"Unsupported OCR dtype={dtype_name}; expected one of {sorted(dtype_map)}")
+        self.image_size = int(image_size)
+        self.loss_type = str(loss_type)
+        self.model_dtype = dtype_map[dtype_name]
+        kwargs = {
+            "trust_remote_code": True,
+            "use_safetensors": True,
+        }
+        if attn_implementation and str(attn_implementation) != "none":
+            kwargs["_attn_implementation"] = str(attn_implementation)
+        if dtype_name != "fp32":
+            kwargs["torch_dtype"] = self.model_dtype
+        self.ocr_model = AutoModel.from_pretrained(str(model_path), **kwargs).eval().to(device)
+        if dtype_name != "fp32":
+            self.ocr_model = self.ocr_model.to(self.model_dtype)
+        for param in self.ocr_model.parameters():
+            param.requires_grad_(False)
+
+        core = self.ocr_model.get_model() if hasattr(self.ocr_model, "get_model") else self.ocr_model.model
+        feature_dim = _last_linear_out_features(core.projector)
+        if feature_dim is None:
+            raise ValueError("Unable to infer DeepSeek-OCR projector output dimension.")
+        self.feature_dim = int(feature_dim)
+
+    def _preprocess(self, images):
+        images = images.clamp(-1, 1)
+        if images.shape[-2:] != (self.image_size, self.image_size):
+            images = F.interpolate(
+                images,
+                size=(self.image_size, self.image_size),
+                mode="bicubic",
+                align_corners=False,
+            )
+        return images.clamp(-1, 1).to(dtype=self.model_dtype)
+
+    def _extract_visual_features(self, images):
+        core = self.ocr_model.get_model() if hasattr(self.ocr_model, "get_model") else self.ocr_model.model
+        sam_features = core.sam_model(images)
+        vision_features = core.vision_model(images, sam_features)
+        features = torch.cat(
+            (vision_features[:, 1:], sam_features.flatten(2).permute(0, 2, 1)),
+            dim=-1,
+        )
+        return core.projector(features)
+
+    @staticmethod
+    def _resize_token_grid(features, target_token_count):
+        batch_size, token_count, width = features.shape
+        source_side = int(round(math.sqrt(int(token_count))))
+        if source_side * source_side != int(token_count):
+            raise ValueError(f"OCR visual target token count must be square, got {token_count}")
+        target_side = int(round(math.sqrt(int(target_token_count))))
+        if target_side * target_side != int(target_token_count):
+            raise ValueError(f"GigaTok decoder feature token count must be square, got {target_token_count}")
+        if source_side == target_side:
+            return features
+        grid = features.float().transpose(1, 2).reshape(batch_size, width, source_side, source_side)
+        grid = F.interpolate(grid, size=(target_side, target_side), mode="bicubic", align_corners=False)
+        return grid.reshape(batch_size, width, target_side * target_side).transpose(1, 2)
+
+    def target_features(self, targets, target_token_count):
+        with torch.no_grad():
+            target_features = self._extract_visual_features(self._preprocess(targets)).detach()
+            target_features = self._resize_token_grid(target_features, target_token_count).detach()
+        return target_features
+
+    def forward(self, projected_decoder_features, targets):
+        target_features = self.target_features(targets, projected_decoder_features.shape[1])
+        projected = projected_decoder_features.float()
+        target = target_features.float()
+        if projected.shape != target.shape:
+            raise ValueError(
+                f"OCR visual alignment shape mismatch: projected={tuple(projected.shape)}, "
+                f"target={tuple(target.shape)}"
+            )
+        projected_norm = F.normalize(projected, dim=-1)
+        target_norm = F.normalize(target, dim=-1)
+        cosine_distance_per_token = 1.0 - (projected_norm * target_norm).sum(dim=-1)
+        feature_cos = cosine_distance_per_token.mean()
+        feature_mse = F.mse_loss(projected, target)
+        if self.loss_type == "cosine":
+            loss = feature_cos
+        elif self.loss_type == "mse":
+            loss = feature_mse
+        elif self.loss_type in {"mse_cosine", "mse+cosine"}:
+            loss = feature_mse + feature_cos
+        else:
+            raise ValueError(f"Unsupported OCR visual alignment loss_type={self.loss_type}")
+        grad_param_count = sum(1 for param in self.ocr_model.parameters() if param.requires_grad)
+        stats = {
+            "ocr_visual_align_loss": loss.detach(),
+            "ocr_visual_align_cosine_distance": feature_cos.detach(),
+            "ocr_visual_align_mse": feature_mse.detach(),
+            "ocr_visual_target_tokens": torch.tensor(float(target.shape[1]), device=projected_decoder_features.device),
+            "ocr_visual_target_dim": torch.tensor(float(target.shape[2]), device=projected_decoder_features.device),
+            "ocr_visual_encoder_grad_param_count": torch.tensor(float(grad_param_count), device=projected_decoder_features.device),
+        }
+        return loss, stats
+
+
 class DeepSeekOCRTeacherForcingLoss(torch.nn.Module):
     """Frozen DeepSeek-OCR causal-LM CE against GT text.
 
@@ -526,6 +666,31 @@ def append_csv_row(path, fieldnames, row):
         writer.writerow(row)
 
 
+def unpack_image_text_gate_batch(batch):
+    if not isinstance(batch, (list, tuple)):
+        raise TypeError(f"Expected dataloader batch tuple/list, got {type(batch)!r}")
+    if len(batch) == 2:
+        imgs, texts = batch
+        return imgs, texts, None, None
+    if len(batch) == 4:
+        imgs, texts, ocr_box_gate, ocr_box_stats = batch
+        return imgs, texts, ocr_box_gate, ocr_box_stats
+    raise ValueError(f"Unsupported batch structure with {len(batch)} items")
+
+
+def move_ocr_box_gate_stats_to_device(stats, device):
+    if not stats:
+        return {}
+    moved = {}
+    for key, value in stats.items():
+        if torch.is_tensor(value):
+            moved[f"{key}_mean" if key == "ocr_box_count" else key] = value.to(device=device, non_blocking=True).float().mean()
+        else:
+            moved[f"{key}_mean" if key == "ocr_box_count" else key] = torch.tensor(
+                float(value), device=device, dtype=torch.float32)
+    return moved
+
+
 def compute_reconstruction_metrics(
         vq_model,
         val_loader,
@@ -547,6 +712,8 @@ def compute_reconstruction_metrics(
         visual_memory_mask_fixed_pattern=False,
         visual_memory_mask_seed=0,
         visual_memory_mask_apply_in_eval=False,
+        ocr_box_gate_enabled=False,
+        ocr_box_gate_layers=None,
         text_max_length=None,
         mixed_precision_dtype=None,
 ):
@@ -559,8 +726,13 @@ def compute_reconstruction_metrics(
     ssim_count = torch.tensor(0.0, device=device)
 
     with torch.no_grad():
-        for imgs, text_batch in val_loader:
+        for batch in val_loader:
+            imgs, text_batch, ocr_box_gate, _ocr_box_stats = unpack_image_text_gate_batch(batch)
             imgs = imgs.to(device, non_blocking=True)
+            if ocr_box_gate is not None:
+                ocr_box_gate = ocr_box_gate.to(device, non_blocking=True).float()
+            if ocr_box_gate_enabled and ocr_box_gate is None:
+                raise RuntimeError("ocr_box_gate.enabled=True but validation batch has no ocr_box_gate")
             selected_decoder_layer = None
             decoder_text_features = None
             decoder_text_features_by_layer = None
@@ -645,6 +817,8 @@ def compute_reconstruction_metrics(
                     visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
                     visual_memory_mask_seed=visual_memory_mask_seed,
                     visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
+                    ocr_box_gate=ocr_box_gate,
+                    ocr_box_gate_layers=ocr_box_gate_layers,
                 )
             recons = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
             diff = (recons.float() - imgs.float()) * 0.5
@@ -841,13 +1015,20 @@ def main(args):
     text_conditioning_cfg = config.get("text_conditioning", {})
     text_recon_cfg = config.get("text_recon_conditioning", {})
     text_hr_cfg = config.get("text_hr", {})
+    local_similarity_cfg = config.get("local_similarity_loss", {})
     ocr_feature_loss_cfg = config.get("ocr_feature_loss", {})
     ocr_teacher_forcing_cfg = config.get("ocr_teacher_forcing_loss", {})
+    ocr_visual_alignment_cfg = config.get("ocr_visual_alignment_loss", {})
+    ocr_box_gate_raw_cfg = config.get("ocr_box_gate", {})
     text_conditioning_on = bool(text_conditioning_cfg.get("enabled", False))
     text_recon_on = bool(text_recon_cfg.get("enabled", False))
     text_hr_on = bool(text_hr_cfg.get("enabled", False))
+    local_similarity_on = bool(local_similarity_cfg.get("enabled", False))
     ocr_feature_loss_on = bool(ocr_feature_loss_cfg.get("enabled", False))
     ocr_teacher_forcing_on = bool(ocr_teacher_forcing_cfg.get("enabled", False))
+    ocr_visual_alignment_on = bool(ocr_visual_alignment_cfg.get("enabled", False))
+    ocr_box_gate_config = ocr_box_gate_config_from_dict(ocr_box_gate_raw_cfg, image_size=args.image_size)
+    ocr_box_gate_on = bool(ocr_box_gate_config.enabled)
     text_recon_mode = str(text_recon_cfg.get("mode", "concat_memory"))
     visual_memory_mask_cfg = text_recon_cfg.get("visual_memory_mask", {})
     visual_memory_mask_enabled = bool(visual_memory_mask_cfg.get("enabled", False))
@@ -862,6 +1043,14 @@ def main(args):
         raise ValueError("text_recon_conditioning.enabled requires text_conditioning.enabled=True.")
     if text_hr_on and not text_conditioning_on:
         raise ValueError("text_hr.enabled requires text_conditioning.enabled=True.")
+    if local_similarity_on and not text_conditioning_on:
+        raise ValueError("local_similarity_loss.enabled requires text_conditioning.enabled=True.")
+    if local_similarity_on and not text_recon_on:
+        raise ValueError("local_similarity_loss.enabled requires text_recon_conditioning.enabled=True.")
+    if ocr_box_gate_on and not text_recon_on:
+        raise ValueError("ocr_box_gate.enabled requires text_recon_conditioning.enabled=True.")
+    if ocr_box_gate_on and text_recon_mode != "residual_cross_attn_visual_mask":
+        raise ValueError("ocr_box_gate.enabled requires text_recon_conditioning.mode=residual_cross_attn_visual_mask.")
     if hr_on and text_hr_on:
         raise ValueError("v1 hr_on and v2 text_hr.enabled cannot be enabled at the same time.")
     if text_recon_on:
@@ -897,7 +1086,7 @@ def main(args):
             raise ValueError(
                 f"text_recon_conditioning.mode={text_recon_mode} requires text_hr.enabled=false."
             )
-        if text_recon_mode == "residual_cross_attn_visual_mask" and text_hr_on:
+        if text_recon_mode == "residual_cross_attn_visual_mask" and (text_hr_on or local_similarity_on):
             configured_image_token_len = int(
                 text_hr_cfg.get("image_token_len", config["model"]["init_args"].get("num_latent_tokens", 256))
             )
@@ -943,11 +1132,30 @@ def main(args):
         adaln_cfg = text_recon_cfg.get("adaln", {})
         if text_recon_mode != "adaln" and isinstance(adaln_cfg, dict) and bool(adaln_cfg.get("enabled", False)):
             raise NotImplementedError("text_recon_conditioning.adaln is only implemented for mode=adaln.")
+    validate_ocr_box_gate_config(
+        ocr_box_gate_config,
+        int(config["model"]["init_args"].get("num_latent_tokens", 256)),
+    )
+    ocr_box_gate_layers = (
+        list(ocr_box_gate_config.apply_layers)
+        if ocr_box_gate_on and ocr_box_gate_config.apply_layers is not None else None
+    )
     text_hr_loss_weight = float(text_hr_cfg.get("hr_loss_weight", 0.0)) if text_hr_on else 0.0
     text_hr_tau = float(text_hr_cfg.get("tau", 1.0))
     text_hr_svd_mode = str(text_hr_cfg.get("svd_mode", "frobenius_uniform"))
     text_hr_eps = float(text_hr_cfg.get("eps", 1e-8))
     text_hr_skip_if_valid_tokens_lt = int(text_hr_cfg.get("skip_if_valid_tokens_lt", 2))
+    if text_hr_on and text_hr_loss_weight <= 0.0:
+        raise ValueError("text_hr.enabled=True requires text_hr.hr_loss_weight > 0.")
+    local_similarity_loss_weight = float(local_similarity_cfg.get("weight", 0.0)) if local_similarity_on else 0.0
+    local_similarity_distance_type = str(local_similarity_cfg.get("distance_type", "positional"))
+    local_similarity_average_heads_before_loss = bool(local_similarity_cfg.get("average_heads_before_loss", True))
+    local_similarity_eps = float(local_similarity_cfg.get("eps", 1e-8))
+    if local_similarity_on:
+        if local_similarity_loss_weight <= 0.0:
+            raise ValueError("local_similarity_loss.enabled=True requires local_similarity_loss.weight > 0.")
+        if local_similarity_distance_type != "positional":
+            raise NotImplementedError("This quick ablation only supports local_similarity_loss.distance_type=positional.")
     text_max_length = int(text_conditioning_cfg.get("max_length", 128))
     if ocr_feature_loss_on:
         if str(ocr_feature_loss_cfg.get("backend", "deepseek_ocr")) != "deepseek_ocr":
@@ -971,6 +1179,19 @@ def main(args):
             raise ValueError("ocr_teacher_forcing_loss.target_max_tokens must be positive.")
     if ocr_feature_loss_on and ocr_teacher_forcing_on:
         raise ValueError("Enable only one OCR loss block at a time to avoid loading DeepSeek-OCR twice.")
+    if ocr_visual_alignment_on:
+        if str(ocr_visual_alignment_cfg.get("backend", "deepseek_ocr")) != "deepseek_ocr":
+            raise NotImplementedError("Only ocr_visual_alignment_loss.backend=deepseek_ocr is implemented.")
+        if float(ocr_visual_alignment_cfg.get("weight", 0.0)) < 0.0:
+            raise ValueError("ocr_visual_alignment_loss.weight must be non-negative.")
+        if int(ocr_visual_alignment_cfg.get("image_size", 512)) <= 0:
+            raise ValueError("ocr_visual_alignment_loss.image_size must be positive.")
+        if not text_recon_on:
+            raise ValueError("ocr_visual_alignment_loss.enabled requires text_recon_conditioning.enabled=True.")
+    if ocr_visual_alignment_on and ocr_teacher_forcing_on:
+        raise ValueError("ocr_visual_alignment_loss replaces OCR CE; do not enable ocr_teacher_forcing_loss together.")
+    if ocr_visual_alignment_on and ocr_feature_loss_on:
+        raise ValueError("Enable only one OCR visual loss block at a time.")
     freeze_encoder = config["trainer"].get("freeze_encoder", False)
     freeze_quantizer = config["trainer"].get("freeze_quantizer", False)
     freeze_codebook = config["trainer"].get("freeze_codebook", False)
@@ -1037,7 +1258,40 @@ def main(args):
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
         ])
+    ocr_box_index = None
+    if ocr_box_gate_on:
+        if args.dataset != "textatlas_image_text":
+            raise ValueError("ocr_box_gate.enabled=True currently requires --dataset textatlas_image_text.")
+        if not textatlas_jsonl_on:
+            raise ValueError("ocr_box_gate.enabled=True requires TextAtlas JSONL input.")
+        ocr_box_index = load_ocr_box_index(ocr_box_gate_config.bbox_jsonl)
+        train_manifest_path = args.json_path or args.data_path
+        manifest_paths = [train_manifest_path]
+        max_images_by_manifest = {train_manifest_path: int(args.max_images or 0)}
+        if args.val_json_path is not None:
+            manifest_paths.append(args.val_json_path)
+            max_images_by_manifest[args.val_json_path] = int(args.val_max_images or 0)
+        preflight = preflight_ocr_box_coverage(
+            manifest_paths,
+            ocr_box_index,
+            ocr_box_gate_config,
+            max_images_by_manifest=max_images_by_manifest,
+        )
+        print(
+            "OCR box gate enabled: "
+            f"bbox_jsonl={ocr_box_gate_config.bbox_jsonl}, "
+            f"grid_size={ocr_box_gate_config.grid_size}, "
+            f"image_size={ocr_box_gate_config.image_size}, "
+            f"inside={ocr_box_gate_config.inside_value}, "
+            f"edge={ocr_box_gate_config.edge_value}, "
+            f"outside={ocr_box_gate_config.outside_value}, "
+            f"low_conf_enabled={ocr_box_gate_config.low_conf_enabled}, "
+            f"preflight={preflight}"
+        )
+    args.ocr_box_gate_cfg = ocr_box_gate_config
+    args.ocr_box_index = ocr_box_index
     dataset = build_dataset(args, transform=transform)
+    args.ocr_box_index = None
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -1075,6 +1329,7 @@ def main(args):
             val_args.data_path = args.val_json_path
             val_args.json_path = args.val_json_path
             val_args.max_images = args.val_max_images
+            val_args.ocr_box_index = ocr_box_index
             val_dataset = build_dataset(val_args, transform=val_transform)
         else:
             val_dataset = JsonImageDataset(
@@ -1098,6 +1353,7 @@ def main(args):
             pin_memory=True,
             drop_last=False
         )
+    args.ocr_box_index = None
 
 
     total_steps = args.iterations
@@ -1216,6 +1472,43 @@ def main(args):
                 f"max_length={text_max_length}, cache_dir={text_cache_dir}, "
                 f"local_files_only={text_local_files_only}"
             )
+
+    ocr_visual_alignment_module = None
+    ocr_visual_alignment_weight = 0.0
+    ocr_visual_alignment_start_step = 0
+    ocr_visual_alignment_decoder_layer = None
+    if ocr_visual_alignment_on:
+        ocr_visual_alignment_weight = float(ocr_visual_alignment_cfg.get("weight", 0.0))
+        ocr_visual_alignment_start_step = int(ocr_visual_alignment_cfg.get("start_step", 0))
+        ocr_visual_alignment_decoder_layer = int(ocr_visual_alignment_cfg.get("decoder_layer", 12))
+        ocr_visual_model_path = (
+            ocr_visual_alignment_cfg.get("model_path")
+            or os.environ.get("DEEPSEEK_OCR_MODEL")
+        )
+        if not ocr_visual_model_path or not os.path.exists(str(ocr_visual_model_path)):
+            raise FileNotFoundError(
+                "DeepSeek-OCR model path missing for ocr_visual_alignment_loss. "
+                f"config_path={ocr_visual_alignment_cfg.get('model_path')}, "
+                f"DEEPSEEK_OCR_MODEL={os.environ.get('DEEPSEEK_OCR_MODEL')}"
+            )
+        ocr_visual_alignment_module = DeepSeekOCRVisualAlignmentLoss(
+            model_path=ocr_visual_model_path,
+            device=device,
+            dtype_name=str(ocr_visual_alignment_cfg.get("dtype", "bf16")),
+            image_size=int(ocr_visual_alignment_cfg.get("image_size", 512)),
+            attn_implementation=str(ocr_visual_alignment_cfg.get("attn_implementation", "eager")),
+            loss_type=str(ocr_visual_alignment_cfg.get("loss_type", "cosine")),
+        )
+        logger.info(
+            "Frozen DeepSeek-OCR visual alignment target enabled: "
+            f"model_path={ocr_visual_model_path}, weight={ocr_visual_alignment_weight}, "
+            f"start_step={ocr_visual_alignment_start_step}, "
+            f"decoder_layer={ocr_visual_alignment_decoder_layer}, "
+            f"target_dim={ocr_visual_alignment_module.feature_dim}, "
+            f"image_size={ocr_visual_alignment_cfg.get('image_size', 512)}, "
+            f"dtype={ocr_visual_alignment_cfg.get('dtype', 'bf16')}, "
+            f"loss_type={ocr_visual_alignment_cfg.get('loss_type', 'cosine')}"
+        )
  
     vq_model = load_model_from_config(config)
     if text_conditioning_on:
@@ -1260,6 +1553,22 @@ def main(args):
             residual_cross_attn_layers=residual_cross_attn_layers,
             residual_cross_attn_scale_init=residual_cross_attn_cfg.get("scale_init", None),
             residual_cross_attn_scale_learnable=bool(residual_cross_attn_cfg.get("scale_learnable", True)),
+        )
+    if ocr_visual_alignment_module is not None:
+        vq_model.configure_ocr_visual_alignment(
+            target_dim=ocr_visual_alignment_module.feature_dim,
+            mlp_hidden_mult=float(ocr_visual_alignment_cfg.get("mlp_hidden_mult", 4.0)),
+        )
+        ocr_mlp_param_count = sum(
+            p.numel() for p in vq_model.ocr_visual_alignment_mlp.parameters()
+        )
+        ocr_mlp_trainable_count = sum(
+            p.numel() for p in vq_model.ocr_visual_alignment_mlp.parameters() if p.requires_grad
+        )
+        logger.info(
+            "Configured GigaTok OCR visual alignment MLP: "
+            f"decoder_layer={ocr_visual_alignment_decoder_layer}, "
+            f"param_count={ocr_mlp_param_count}, trainable_param_count={ocr_mlp_trainable_count}"
         )
 
     # create and load model
@@ -1418,6 +1727,28 @@ def main(args):
     else:
         raise ValueError(f"Optimizer {config['trainer'].get('optimizer', 'Adam')} not supported.")
 
+    optimizer_contains_ocr_visual_mlp = False
+    if ocr_visual_alignment_module is not None:
+        mlp_param_ids = {
+            id(param) for param in vq_model.ocr_visual_alignment_mlp.parameters()
+        }
+        optimizer_param_ids = {
+            id(param)
+            for group in optimizer.param_groups
+            for param in group.get("params", [])
+        }
+        optimizer_contains_ocr_visual_mlp = mlp_param_ids.issubset(optimizer_param_ids)
+        logger.info(
+            "OCR visual alignment optimizer check: "
+            f"ocr_visual_alignment_mlp_param_count="
+            f"{sum(p.numel() for p in vq_model.ocr_visual_alignment_mlp.parameters())}, "
+            f"ocr_visual_alignment_mlp_trainable_param_count="
+            f"{sum(p.numel() for p in vq_model.ocr_visual_alignment_mlp.parameters() if p.requires_grad)}, "
+            f"optimizer_contains_ocr_visual_mlp={optimizer_contains_ocr_visual_mlp}"
+        )
+        if not optimizer_contains_ocr_visual_mlp:
+            raise RuntimeError("optimizer does not contain all ocr_visual_alignment_mlp parameters.")
+
 
     
 
@@ -1436,6 +1767,7 @@ def main(args):
                     or name.startswith("residual_head_mlp.") \
                     or name.startswith("residual_text_mlp.") \
                     or name.startswith("adaln_mlps.") \
+                    or name.startswith("ocr_visual_alignment_mlp.") \
                     or name.startswith("s1to2decoder.residual_cross_attn_layers.") \
                     or name.startswith("s1to2decoder.residual_cross_attn_projs.") \
                     or name.startswith("s1to2decoder.residual_cross_attn_scales."):
@@ -1448,6 +1780,7 @@ def main(args):
                     or name.startswith("residual_head_mlp.") \
                     or name.startswith("residual_text_mlp.") \
                     or name.startswith("adaln_mlps.") \
+                    or name.startswith("ocr_visual_alignment_mlp.") \
                     or name.startswith("s1to2decoder.residual_cross_attn_layers.") \
                     or name.startswith("s1to2decoder.residual_cross_attn_projs.") \
                     or name.startswith("s1to2decoder.residual_cross_attn_scales."):
@@ -1620,7 +1953,7 @@ def main(args):
     text_injection_layers = []
     text_recon_head_text_layer = int(text_recon_cfg.get("head_text_layer", 15))
     text_hr_image_token_len = int(text_hr_cfg.get("image_token_len", vq_model.config.num_latent_tokens))
-    if text_conditioning_on and (text_hr_on or not text_recon_on):
+    if text_conditioning_on and (text_hr_on or local_similarity_on or not text_recon_on):
         text_layer_pairs = build_text_layer_pairs(
             text_hr_cfg,
             decoder_num_layers=decoder_num_layers,
@@ -1786,12 +2119,17 @@ def main(args):
         else:
             loader_iter = iter(loader)
 
-        for x, y in loader_iter:
+        for batch in loader_iter:
             if args.early_stop_iter is not None and args.early_stop_iter <= train_steps:
                 breaking_flag = True
                 break
 
+            x, y, ocr_box_gate, ocr_box_stats = unpack_image_text_gate_batch(batch)
             imgs = x.to(device, non_blocking=True)
+            if ocr_box_gate is not None:
+                ocr_box_gate = ocr_box_gate.to(device, non_blocking=True).float()
+            if ocr_box_gate_on and ocr_box_gate is None:
+                raise RuntimeError("ocr_box_gate.enabled=True but train batch has no ocr_box_gate")
             current_visual_memory_mask_ratio, visual_memory_mask_schedule_progress = compute_visual_memory_mask_ratio(
                 visual_memory_mask_ratio,
                 visual_memory_mask_schedule_cfg,
@@ -1819,7 +2157,7 @@ def main(args):
             text_recon_stats = None
 
             if text_conditioning_on:
-                if text_hr_on or not text_recon_on:
+                if text_hr_on or local_similarity_on or not text_recon_on:
                     pair_rng = random.Random(train_steps + 1 + args.global_seed)
                     # Text-HR v2: randomly choose one [T5 layer, decoder layer] pair
                     # per training step, matching the current experimental design.
@@ -1899,6 +2237,8 @@ def main(args):
                         "text_valid_tokens_mean": text_attention_mask.float().sum(dim=1).mean(),
                     }
                     text_recon_stats.update(glyph_token_stats)
+                    if ocr_box_gate_on:
+                        text_recon_stats.update(move_ocr_box_gate_stats_to_device(ocr_box_stats, device))
             elif hr_on:
                 if hr_random_one_layer:
                     layer_rng = random.Random(train_steps + 1 + args.global_seed)
@@ -1973,7 +2313,11 @@ def main(args):
                         visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
                         visual_memory_mask_seed=visual_memory_mask_seed,
                         visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
+                        ocr_box_gate=ocr_box_gate,
+                        ocr_box_gate_layers=ocr_box_gate_layers,
                         return_text_recon_stats=text_recon_on,
+                        ocr_visual_alignment_layer=ocr_visual_alignment_decoder_layer
+                        if ocr_visual_alignment_module is not None else None,
                     )
                     if selected_decoder_layer is not None:
                         if text_recon_on:
@@ -2011,7 +2355,11 @@ def main(args):
                         visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
                         visual_memory_mask_seed=visual_memory_mask_seed,
                         visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
+                        ocr_box_gate=ocr_box_gate,
+                        ocr_box_gate_layers=ocr_box_gate_layers,
                         return_text_recon_stats=text_recon_on,
+                        ocr_visual_alignment_layer=ocr_visual_alignment_decoder_layer
+                        if ocr_visual_alignment_module is not None else None,
                     )
                     if selected_decoder_layer is not None:
                         if text_recon_on:
@@ -2038,6 +2386,22 @@ def main(args):
                         float(visual_memory_mask_schedule_progress), device=device)
                 if text_recon_stats:
                     mask_grid = text_recon_stats.pop("_visual_memory_mask_grid", None)
+                ocr_visual_projected_feature = None
+                ocr_visual_decoder_feature_tokens = None
+                ocr_visual_decoder_feature_dim = None
+                if text_recon_stats:
+                    ocr_visual_projected_feature = text_recon_stats.pop(
+                        "_ocr_visual_alignment_projected_feature",
+                        None,
+                    )
+                    ocr_visual_decoder_feature_tokens = text_recon_stats.pop(
+                        "_ocr_visual_alignment_decoder_feature_tokens",
+                        None,
+                    )
+                    ocr_visual_decoder_feature_dim = text_recon_stats.pop(
+                        "_ocr_visual_alignment_decoder_feature_dim",
+                        None,
+                    )
                 if mask_grid is not None:
                     recon_for_stats = recons_imgs[0] if isinstance(recons_imgs, (list, tuple)) else recons_imgs
                     mask_img = F.interpolate(
@@ -2056,6 +2420,47 @@ def main(args):
                     text_recon_stats["masked_unmasked_mse_ratio"] = (
                         masked_mse / unmasked_mse.clamp_min(1e-8)
                     ).detach()
+                ocr_visual_alignment_loss_value = None
+                if (
+                    ocr_visual_alignment_module is not None
+                    and train_steps + 1 >= ocr_visual_alignment_start_step
+                    and ocr_visual_alignment_weight > 0.0
+                ):
+                    if ocr_visual_projected_feature is None:
+                        raise RuntimeError(
+                            "ocr_visual_alignment_loss is enabled but projected decoder feature was not returned. "
+                            f"decoder_layer={ocr_visual_alignment_decoder_layer}"
+                        )
+                    ocr_visual_alignment_loss_value, ocr_visual_stats = ocr_visual_alignment_module(
+                        ocr_visual_projected_feature,
+                        imgs,
+                    )
+                    if torch.isnan(ocr_visual_alignment_loss_value).any():
+                        raise RuntimeError("ocr_visual_align_loss contains NaN.")
+                    if not torch.isfinite(ocr_visual_alignment_loss_value).all():
+                        raise RuntimeError("ocr_visual_align_loss is not finite.")
+                    if text_recon_stats is None:
+                        text_recon_stats = {}
+                    text_recon_stats.update(ocr_visual_stats)
+                    text_recon_stats["weighted_ocr_visual_align_loss"] = (
+                        ocr_visual_alignment_weight * ocr_visual_alignment_loss_value
+                    ).detach()
+                    text_recon_stats["ocr_visual_align_weight"] = torch.tensor(
+                        float(ocr_visual_alignment_weight),
+                        device=device,
+                    )
+                    text_recon_stats["gigatok_decoder_feature_tokens"] = torch.tensor(
+                        float(ocr_visual_decoder_feature_tokens.detach().float().item())
+                        if torch.is_tensor(ocr_visual_decoder_feature_tokens)
+                        else float(ocr_visual_projected_feature.shape[1]),
+                        device=device,
+                    )
+                    text_recon_stats["gigatok_decoder_feature_dim"] = torch.tensor(
+                        float(ocr_visual_decoder_feature_dim.detach().float().item())
+                        if torch.is_tensor(ocr_visual_decoder_feature_dim)
+                        else float(ocr_visual_projected_feature.shape[2]),
+                        device=device,
+                    )
                 ocr_feature_loss_value = None
                 if (
                     ocr_feature_loss_module is not None
@@ -2134,7 +2539,7 @@ def main(args):
                                    # Text-HR v2: pass the selected layer attention
                                    # and text mask into VQLoss for image-to-text SVD.
                                    text_hr_attn_weights=hr_attn_weights if text_hr_on else None,
-                                   text_attention_mask=text_attention_mask if text_hr_on else None,
+                                   text_attention_mask=text_attention_mask if (text_hr_on or local_similarity_on) else None,
                                    text_hr_loss_weight=text_hr_loss_weight if text_hr_on else 0.0,
                                    selected_text_layer=selected_text_layer,
                                    text_hr_tau=text_hr_tau,
@@ -2142,15 +2547,45 @@ def main(args):
                                    text_hr_eps=text_hr_eps,
                                    text_hr_skip_if_valid_tokens_lt=text_hr_skip_if_valid_tokens_lt,
                                    text_hr_image_token_len=text_hr_image_token_len,
+                                   local_similarity_attn_weights=hr_attn_weights if local_similarity_on else None,
+                                   local_similarity_loss_weight=local_similarity_loss_weight if local_similarity_on else 0.0,
+                                   local_similarity_image_token_len=text_hr_image_token_len,
+                                   local_similarity_average_heads_before_loss=local_similarity_average_heads_before_loss,
+                                   local_similarity_skip_if_valid_tokens_lt=text_hr_skip_if_valid_tokens_lt,
+                                   local_similarity_eps=local_similarity_eps,
                                    text_recon_stats=text_recon_stats,
                                    )
                 if ocr_feature_loss_value is not None:
                     loss_gen = loss_gen + ocr_feature_loss_weight * ocr_feature_loss_value
                 if ocr_teacher_forcing_loss_value is not None:
                     loss_gen = loss_gen + ocr_teacher_forcing_effective_weight * ocr_teacher_forcing_loss_value
+                if ocr_visual_alignment_loss_value is not None:
+                    loss_gen = loss_gen + ocr_visual_alignment_weight * ocr_visual_alignment_loss_value
             
             if train_steps + 1 >= int(config["loss"]["params"].get("gen_start", 0)):
                 scaler.scale(loss_gen).backward()
+                if ocr_visual_alignment_module is not None:
+                    ocr_visual_mlp_grad_norm_sq = 0.0
+                    ocr_visual_mlp_has_grad = False
+                    for param in vq_model.module.ocr_visual_alignment_mlp.parameters():
+                        if param.grad is not None:
+                            ocr_visual_mlp_has_grad = True
+                            grad = param.grad.detach().float()
+                            ocr_visual_mlp_grad_norm_sq += float(grad.pow(2).sum().item())
+                    ocr_visual_mlp_grad_norm = math.sqrt(ocr_visual_mlp_grad_norm_sq)
+                    ocr_visual_encoder_grad_param_count = sum(
+                        1 for param in ocr_visual_alignment_module.ocr_model.parameters()
+                        if param.grad is not None
+                    )
+                    if rank == 0 and node_rank == 0 and (
+                        (train_steps + 1) % args.log_every == 0 or train_steps < 2
+                    ):
+                        logger.info(
+                            "OCR visual alignment grad check: "
+                            f"ocr_visual_mlp_grad_norm={ocr_visual_mlp_grad_norm:.6e}, "
+                            f"ocr_visual_mlp_has_grad={ocr_visual_mlp_has_grad}, "
+                            f"ocr_visual_encoder_grad_param_count={ocr_visual_encoder_grad_param_count}"
+                        )
                 if config["trainer"]["max_grad_norm"] != 0.0:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(vq_model.parameters(), config["trainer"]["max_grad_norm"])
@@ -2271,6 +2706,8 @@ def main(args):
                     visual_memory_mask_fixed_pattern=visual_memory_mask_fixed_pattern,
                     visual_memory_mask_seed=visual_memory_mask_seed,
                     visual_memory_mask_apply_in_eval=visual_memory_mask_apply_in_eval,
+                    ocr_box_gate_enabled=ocr_box_gate_on,
+                    ocr_box_gate_layers=ocr_box_gate_layers,
                     text_max_length=text_max_length if text_conditioning_on else None,
                     mixed_precision_dtype=ptdtype,
                 )

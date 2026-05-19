@@ -1,0 +1,196 @@
+model:
+  model_cls: VQVitModelPlus
+  init_args:
+    codebook_size: 16384
+    codebook_embed_dim: 8
+    codebook_l2_norm: true
+    codebook_show_usage: true
+    commit_loss_beta: 0.25
+    entropy_loss_ratio: 0.0
+    encoder_ch_mult:
+    - 1
+    - 1
+    - 2
+    - 2
+    - 4
+    decoder_ch_mult:
+    - 1
+    - 1
+    - 2
+    - 2
+    - 4
+    model_size: null
+    encoder_size: base
+    decoder_size: large
+    num_latent_tokens: 256
+    z_channels: 256
+    dropout_p: 0.0
+    multi_level_query_init: true
+    last_level_2d_query_init: false
+    multi_level_2d_query_init: false
+    adaptive_gn: true
+    d2s_up: true
+    rot: true
+    use_attn: false
+    fea_rec_loss_type: mse
+    fea_rec_loss_weight: 1.0
+    distill_depth: 3
+  causal_settings:
+    causal_type: null
+    dynamic_length_train: false
+    dynamic_level_range: null
+    min_level: 0
+trainer:
+  global_batch_size: 256
+  lr: 1e-4
+  lr_scheduler: cosine_v2
+  end_lr: 1e-5
+  optimizer: AdamW
+  global_seed: 0
+  warmup: 0
+  weight_decay: 1e-4
+  beta1: 0.9
+  beta2: 0.95
+  max_grad_norm: 10.0
+  distill_loss: true
+  hr_on: false
+  hr_loss_weight: 0.0
+  hr_random_one_layer: true
+  freeze_encoder: true
+  freeze_quantizer: true
+  freeze_codebook: true
+  freeze_post_quant_conv: false
+text_conditioning:
+  enabled: true
+  encoder_backend: glyph_byt5
+  encoder_name: /home/ma-user/work/GigaTok_hr/gigatok_persist/models/Glyph-SDXL-v2
+  byt5_base_name: /home/ma-user/work/GigaTok_hr/gigatok_persist/models/google_byt5-small
+  cache_dir: null
+  local_files_only: true
+  max_length: 1024
+  freeze: true
+  output_hidden_states: true
+  exclude_embedding_output: false
+  text_projection: linear_layernorm
+  text_type_embedding: false
+  text_position_embedding: false
+  glyph_byt5:
+    mapper_num_layers: 4
+    mapper_output_dim: 2048
+    byt5_model_path: checkpoints/byt5_model.pt
+    byt5_mapper_path: checkpoints/byt5_mapper.pt
+    color_special_token: true
+    font_special_token: true
+    multilingual: true
+    color_ann_path: assets/color_idx.json
+    font_ann_path: assets/multilingual_10-lang_idx.json
+text_recon_conditioning:
+  enabled: true
+  mode: residual_cross_attn_visual_mask
+  layers:
+  - 6
+  - 12
+  - 18
+  layer_pairs:
+  - - 0
+    - 6
+  - - 0
+    - 12
+  - - 0
+    - 18
+  visual_type_embedding: false
+  text_gate:
+    enabled: false
+    init: 0.1
+  residual_cross_attn:
+    scale_init: 0.1
+    scale_learnable: true
+  visual_memory_mask:
+    enabled: true
+    ratio: 0.3
+    mode: learned_mask_token
+    strategy: block_random
+    block_size: 2
+    fixed_pattern: false
+    seed: 0
+    apply_in_eval: false
+    schedule:
+      enabled: true
+      type: cosine
+      min_ratio: 0.0
+      max_ratio: 0.3
+      warmup_frac: 0.1
+      plateau_frac: 0.2
+  residual:
+    enabled: false
+    inject_at: rec_spatial_before_cnn
+    gate_init: 1e-3
+  adaln:
+    enabled: false
+text_hr:
+  enabled: false
+  hr_loss_weight: 0.0
+  tau: 1.0
+  image_token_len: 0
+  layer_strategy: explicit_pairs
+  layer_pairs:
+  - - 0
+    - 6
+  - - 0
+    - 12
+  - - 0
+    - 18
+  random_one_pair_per_step: true
+  attention_source: residual_cross_attn_post_softmax
+  matrix: image_to_text_attention
+  mask_padding_before_svd: true
+  svd_mode: gram_scaled_identity
+  eps: 1e-8
+  skip_if_valid_tokens_lt: 2
+ocr_feature_loss:
+  enabled: false
+  backend: deepseek_ocr
+  model_path: /home/ma-user/work/GigaTok_hr/gigatok_persist/models/DeepSeek-OCR
+  weight: 0.0
+  start_step: 0
+  image_size: 512
+  dtype: bf16
+  attn_implementation: eager
+  loss_type: mse
+ocr_teacher_forcing_loss:
+  enabled: true
+  backend: deepseek_ocr
+  model_path: /home/ma-user/work/GigaTok_hr/gigatok_persist/models/DeepSeek-OCR
+  weight: 0.02
+  start_weight: 0.005
+  start_step: 0
+  warmup_steps: 50
+  image_size: 512
+  dtype: bf16
+  attn_implementation: eager
+  prompt: '<image>
+
+    <|grounding|>OCR this image.'
+  target_max_tokens: 256
+  include_eos: false
+loss:
+  loss_cls: VQLoss
+  params:
+    disc_start: 80000
+    disc_weight: 0.5
+    disc_type: dinodisc
+    disc_loss: hinge
+    disc_dim: 64
+    kw: 4
+    norm: batch
+    gen_adv_loss: hinge
+    image_size: 256
+    perceptual_weight: 1.0
+    reconstruction_weight: 1.0
+    reconstruction_loss: l2
+    codebook_weight: 1.0
+    aux_loss_end: 15000
+    use_direct_rec_loss: true
+    resnet_perceptual: false
+    blur_ds: false
+    lecam: false

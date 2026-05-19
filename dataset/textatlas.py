@@ -5,6 +5,12 @@ import re
 from PIL import Image
 from torch.utils.data import Dataset
 
+from dataset.ocr_box_gate import (
+    build_ocr_box_gate,
+    load_ocr_box_index,
+    ocr_box_gate_config_from_dict,
+)
+
 
 PROMPT_TEXT_PATTERNS = (
     r"displaying\s+the\s+text\s*[:：]",
@@ -23,10 +29,16 @@ def looks_like_raw_prompt(text):
 
 
 class TextAtlasImageTextDataset(Dataset):
-    def __init__(self, manifest_path, transform=None, max_images=0):
+    def __init__(self, manifest_path, transform=None, max_images=0, ocr_box_gate_cfg=None, ocr_box_index=None):
         self.transform = transform
         self.manifest_dir = os.path.dirname(os.path.abspath(manifest_path))
         self.rows = []
+        self.ocr_box_gate_config = ocr_box_gate_config_from_dict(ocr_box_gate_cfg)
+        self.ocr_box_gate_enabled = bool(self.ocr_box_gate_config.enabled)
+        if self.ocr_box_gate_enabled:
+            self.ocr_box_index = ocr_box_index or load_ocr_box_index(self.ocr_box_gate_config.bbox_jsonl)
+        else:
+            self.ocr_box_index = None
         with open(manifest_path, "r", encoding="utf-8") as handle:
             for line_no, line in enumerate(handle, start=1):
                 line = line.strip()
@@ -67,20 +79,33 @@ class TextAtlasImageTextDataset(Dataset):
         image_path = row["image_path"]
         if not os.path.isabs(image_path):
             image_path = os.path.join(self.manifest_dir, image_path)
+        image_path = os.path.abspath(image_path) if os.path.isabs(image_path) else image_path
         if not os.path.exists(image_path):
             raise FileNotFoundError(image_path)
         image = Image.open(image_path).convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
-        return image, str(row.get("text") or "")
+        text = str(row.get("text") or "")
+        if not self.ocr_box_gate_enabled:
+            return image, text
+
+        box_entry = self.ocr_box_index.get(image_path)
+        if box_entry is None:
+            raise KeyError(f"OCR bbox missing for image_path={image_path}")
+        gate, gate_stats = build_ocr_box_gate(box_entry["boxes"], self.ocr_box_gate_config)
+        return image, text, gate, gate_stats
 
 
 def build_textatlas_image_text(args, transform):
     manifest_path = args.json_path or args.data_path
     if manifest_path is None:
         raise ValueError("textatlas_image_text requires --json-path or --data-path pointing to a materialized manifest JSONL.")
+    ocr_box_gate_cfg = getattr(args, "ocr_box_gate_cfg", None)
+    ocr_box_index = getattr(args, "ocr_box_index", None)
     return TextAtlasImageTextDataset(
         manifest_path,
         transform=transform,
         max_images=getattr(args, "max_images", 0),
+        ocr_box_gate_cfg=ocr_box_gate_cfg,
+        ocr_box_index=ocr_box_index,
     )

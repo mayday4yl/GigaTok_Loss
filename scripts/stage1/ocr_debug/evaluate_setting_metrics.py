@@ -15,7 +15,22 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Sequence
 
 
-RUN_ORDER = ["orig", "noocr", "w001", "w002", "w003", "w005"]
+RUN_ORDER = [
+    "w001",
+    "w001_ocrvis_only",
+    "w001_hr_only",
+    "w001_local_only",
+    "w001_hr_local",
+    "ocrvis_hr_local",
+    "orig",
+    "noocr",
+    "w0005",
+    "w0015",
+    "w002",
+    "w0025",
+    "w003",
+    "w005",
+]
 SETTING_FIELDS = [
     "run",
     "ocr_weight",
@@ -171,7 +186,11 @@ def load_runs(path: Path) -> Dict[str, Dict[str, Any]]:
             if not value.exists():
                 raise FileNotFoundError(f"{name}.{key} not found: {value}")
         runs[str(name)] = dict(spec)
-    return {name: runs[name] for name in RUN_ORDER if name in runs}
+    ordered = {name: runs[name] for name in RUN_ORDER if name in runs}
+    for name, spec in runs.items():
+        if name not in ordered:
+            ordered[name] = spec
+    return ordered
 
 
 def run_specs(runs: Mapping[str, Mapping[str, Any]]) -> list[str]:
@@ -321,7 +340,7 @@ def final_train_value(run_dir: Path, field: str) -> str:
     return ""
 
 
-def final_validation_metrics(run_dir: Path) -> dict[str, Any]:
+def final_validation_metrics(run_dir: Path, step: int | None = None) -> dict[str, Any]:
     candidates = [
         run_dir / "val.csv",
         run_dir / "metrics" / "val_metrics.csv",
@@ -330,7 +349,17 @@ def final_validation_metrics(run_dir: Path) -> dict[str, Any]:
         rows = read_csv_rows(path)
         if not rows:
             continue
-        final = rows[-1]
+        if step is None:
+            final = rows[-1]
+        else:
+            final = None
+            for row in rows:
+                row_step = parse_float(row.get("step"))
+                if row_step is not None and int(row_step) == int(step):
+                    final = row
+                    break
+            if final is None:
+                raise ValueError(f"{path} does not contain required step={step}")
         return {
             "source": str(path),
             "step": parse_float(final.get("step")),
@@ -377,13 +406,13 @@ def build_setting_rows(
     rows = []
     for name, spec in runs.items():
         overall = ((recon_metrics.get("runs") or {}).get(name) or {}).get("overall") or {}
-        train = final_validation_metrics(Path(str(spec["run_dir"]))) if image_metric_source == "train_val_csv" else {}
+        train = final_validation_metrics(Path(str(spec["run_dir"])), step=args.step) if image_metric_source == "train_val_csv" else {}
         deep = deepseek_metrics.get(name, {})
         third = thirdparty_metrics.get(name, {})
         psnr = train.get("val_psnr") if image_metric_source == "train_val_csv" else overall.get("psnr")
         ssim = train.get("val_ssim") if image_metric_source == "train_val_csv" else overall.get("ssim")
         mse = train.get("val_mse") if image_metric_source == "train_val_csv" else overall.get("mse")
-        image_metric_note = "training val.csv" if image_metric_source == "train_val_csv" else "setting_eval reconstruction"
+        image_metric_note = "training validation CSV" if image_metric_source == "train_val_csv" else "setting_eval reconstruction"
         rows.append(
             {
                 "run": name,
@@ -525,7 +554,7 @@ def write_setting_md(
     lpips_note: str,
     image_metric_source: str,
 ) -> None:
-    image_metric_note = "training val.csv" if image_metric_source == "train_val_csv" else "setting_eval reconstruction"
+    image_metric_note = "training validation CSV" if image_metric_source == "train_val_csv" else "setting_eval reconstruction"
     lines = [
         "# Setting Metrics",
         "",
@@ -694,7 +723,13 @@ def main() -> None:
     p_rows = paper_rows(rows, best, notes)
     write_csv(args.output_dir / "paper_table.csv", PAPER_FIELDS, p_rows)
 
+    if args.image_metric_source == "train_val_csv":
+        image_source_line = "Image metrics source: training validation CSV row for current reporting."
+    else:
+        image_source_line = "All image metrics are recomputed post-hoc from checkpoints."
+
     summary_lines = [
+        image_source_line,
         f"1. Best PSNR setting: {best_by_metric(rows, 'psnr', True)}.",
         f"2. Best third-party OCR CER/NED setting: {best_by_metric(rows, 'thirdparty_ocr_cer', False)} / {best_by_metric(rows, 'thirdparty_ocr_ned', True)}.",
         f"3. DeepSeek OCR best CER setting: {best_by_metric(rows, 'deepseek_ocr_cer', False)}.",

@@ -1748,6 +1748,9 @@ class ViTDecoder(nn.Module):
             residual_gate=None,
             residual_cross_attn_text_by_layer=None,
             adaln_params_by_layer=None,
+            ocr_box_gate=None,
+            ocr_box_gate_layers=None,
+            ocr_visual_alignment_layer=None,
             return_text_recon_stats=False,
             ):
         assert selected_decoder_layer is None or not return_feat, \
@@ -1983,6 +1986,44 @@ class ViTDecoder(nn.Module):
                     text_recon_stats["_visual_memory_mask_grid"] = visual_memory_mask.detach().permute(
                         1, 2, 0).reshape(bs, 1, side, side)
 
+        ocr_box_gate_lbd = None
+        ocr_box_gate_layer_set = set()
+        if ocr_box_gate is not None:
+            if residual_cross_attn_lnd_by_layer is None:
+                raise RuntimeError("ocr_box_gate requires residual_cross_attn_text_by_layer.")
+            if ocr_box_gate.dim() != 2:
+                raise AssertionError(f"ocr_box_gate must be [B, L], got shape={tuple(ocr_box_gate.shape)}")
+            if ocr_box_gate.shape[0] != latent_tokens.shape[1]:
+                raise AssertionError(
+                    f"ocr_box_gate batch={ocr_box_gate.shape[0]} does not match latent batch={latent_tokens.shape[1]}"
+                )
+            if ocr_box_gate.shape[1] != latent_tokens.shape[0]:
+                raise AssertionError(
+                    f"ocr_box_gate tokens={ocr_box_gate.shape[1]} does not match latent tokens={latent_tokens.shape[0]}"
+                )
+            expected_tokens = int(self.grid_size) * int(self.grid_size)
+            if ocr_box_gate.shape[1] != expected_tokens:
+                raise AssertionError(
+                    f"ocr_box_gate tokens={ocr_box_gate.shape[1]} does not match grid_size^2={expected_tokens}"
+                )
+            ocr_box_gate_lbd = ocr_box_gate.to(
+                device=latent_tokens.device,
+                dtype=latent_tokens.dtype,
+            ).transpose(0, 1).unsqueeze(-1)
+            expected_shape = (latent_tokens.shape[0], latent_tokens.shape[1], 1)
+            if tuple(ocr_box_gate_lbd.shape) != expected_shape:
+                raise AssertionError(
+                    f"ocr_box_gate_lbd shape={tuple(ocr_box_gate_lbd.shape)}, expected={expected_shape}"
+                )
+            if ocr_box_gate_layers is None:
+                ocr_box_gate_layer_set = set(residual_cross_attn_layer_set)
+            else:
+                ocr_box_gate_layer_set = {int(layer_idx) for layer_idx in ocr_box_gate_layers}
+            missing_gate_layers = sorted(layer_idx for layer_idx in ocr_box_gate_layer_set
+                                         if layer_idx not in residual_cross_attn_layer_set)
+            if missing_gate_layers:
+                raise ValueError(f"ocr_box_gate_layers not in residual cross-attn layers: {missing_gate_layers}")
+
         selected_cross_attn_weights = None
         for i in range(self.num_layers):
             return_cross_attn_weights = selected_decoder_layer == i
@@ -2073,6 +2114,15 @@ class ViTDecoder(nn.Module):
                     projected_context = projected_context * residual_scale
                 else:
                     residual_scale = latent_tokens.new_tensor(1.0)
+                scaled_projected_context = projected_context
+                if ocr_box_gate_lbd is not None and i in ocr_box_gate_layer_set:
+                    if projected_context.shape[:2] != ocr_box_gate_lbd.shape[:2]:
+                        raise AssertionError(
+                            "projected_context and ocr_box_gate_lbd shape mismatch: "
+                            f"projected_context={tuple(projected_context.shape)}, "
+                            f"ocr_box_gate_lbd={tuple(ocr_box_gate_lbd.shape)}"
+                        )
+                    projected_context = projected_context * ocr_box_gate_lbd
                 latent_tokens = latent_tokens + projected_context
                 if return_cross_attn_weights:
                     selected_cross_attn_weights = text_attn
@@ -2083,6 +2133,11 @@ class ViTDecoder(nn.Module):
                         raw_projected_context.float().norm(dim=-1).mean())
                     text_recon_stats.setdefault("residual_cross_attn_proj_norms", []).append(
                         projected_context.float().norm(dim=-1).mean())
+                    if ocr_box_gate_lbd is not None and i in ocr_box_gate_layer_set:
+                        text_recon_stats.setdefault("ocr_box_projected_context_norm_before_gates", []).append(
+                            scaled_projected_context.float().norm(dim=-1).mean())
+                        text_recon_stats.setdefault("ocr_box_projected_context_norm_after_gates", []).append(
+                            projected_context.float().norm(dim=-1).mean())
                     text_recon_stats.setdefault("residual_cross_attn_scales", []).append(
                         residual_scale.float().abs().mean())
                     entropy, top1 = self._residual_cross_attn_weight_stats(
@@ -2101,6 +2156,12 @@ class ViTDecoder(nn.Module):
                 )
                 gate = residual_gate.to(device=latent_tokens.device, dtype=latent_tokens.dtype)
                 latent_tokens = latent_tokens + gate * residual
+            if ocr_visual_alignment_layer is not None and i == int(ocr_visual_alignment_layer):
+                if not return_text_recon_stats:
+                    raise RuntimeError("ocr_visual_alignment_layer requires return_text_recon_stats=True.")
+                text_recon_stats["_ocr_visual_alignment_decoder_feature"] = (
+                    latent_tokens.permute(1, 0, 2).contiguous()
+                )
             if self.out_inner_feat and ret_inner_feat and (i + 1) == self.out_inner_depth:
                 inner_feat = self.distill_mlp(latent_tokens)
 
@@ -2127,6 +2188,12 @@ class ViTDecoder(nn.Module):
             if "residual_cross_attn_raw_proj_norms" in text_recon_stats:
                 text_recon_stats["residual_cross_attn_raw_proj_norm_mean"] = torch.stack(
                     text_recon_stats.pop("residual_cross_attn_raw_proj_norms")).mean()
+            if "ocr_box_projected_context_norm_before_gates" in text_recon_stats:
+                text_recon_stats["ocr_box_projected_context_norm_before_gate"] = torch.stack(
+                    text_recon_stats.pop("ocr_box_projected_context_norm_before_gates")).mean()
+            if "ocr_box_projected_context_norm_after_gates" in text_recon_stats:
+                text_recon_stats["ocr_box_projected_context_norm_after_gate"] = torch.stack(
+                    text_recon_stats.pop("ocr_box_projected_context_norm_after_gates")).mean()
             if "residual_cross_attn_scales" in text_recon_stats:
                 text_recon_stats["residual_cross_attn_scale_mean"] = torch.stack(
                     text_recon_stats.pop("residual_cross_attn_scales")).mean()
