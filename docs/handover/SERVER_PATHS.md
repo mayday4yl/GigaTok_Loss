@@ -41,6 +41,42 @@ Current 250 epoch training log root:
 /data2/duoduo_25/yl_GigaTok_Loss/logs/continue_250ep_serial_20260518_133045
 ```
 
+Main OCR-box proxy 250-epoch checkpoint:
+
+```bash
+/data2/duoduo_25/yl_GigaTok_Loss/gigatok_persist/outputs/ocr_box_gate/formal_runs/ocr_box_gate_conf_proxy_realworld40_5k_gbs48_continue_250ep/train/checkpoints/last.pt
+```
+
+GigaTok 5k baseline 250-epoch checkpoint:
+
+```bash
+/data2/duoduo_25/yl_GigaTok_Loss/gigatok_persist/outputs/original_gigatok_baseline_realworld40_5k/orig_gigatok_realworld40_5k_gbs48_continue_250ep/train/checkpoints/last.pt
+```
+
+5k manifests:
+
+```bash
+/data2/duoduo_25/yl_GigaTok_Loss/gigatok_persist/outputs/text_rich_realworld_upweighted_manifests
+```
+
+5k text feature cache:
+
+```bash
+/data2/duoduo_25/yl_GigaTok_Loss/gigatok_persist/outputs/text_feature_cache/realworld40_glyph_mapped
+```
+
+5k OCR bbox/proxy:
+
+```bash
+/data2/duoduo_25/yl_GigaTok_Loss/gigatok_persist/outputs/ocr_box_gate/realworld40_5k
+```
+
+holdout_v2 prepared inputs and fixed-path eval attempts:
+
+```bash
+/data2/duoduo_25/yl_GigaTok_Loss/gigatok_persist/outputs/overnight_allin
+```
+
 Overnight summary:
 
 ```bash
@@ -84,6 +120,18 @@ readable50 eval outputs:
 
 ```bash
 /public/sdc/yl_GigaTok_Loss/gigatok_persist/outputs/overnight_allin/readable50_eval
+```
+
+Legacy readable50 method checkpoint/config archive, copied for future reruns:
+
+```bash
+/public/sdc/yl_GigaTok_Loss/gigatok_persist/outputs/legacy_readable50_methods_20260519/gigatok_persist_subset
+```
+
+Transfer log for that archive:
+
+```bash
+/public/sdc/yl_GigaTok_Loss/logs/legacy_readable50_methods_transfer_20260519/rsync.log
 ```
 
 Companion logs:

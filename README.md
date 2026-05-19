@@ -86,6 +86,27 @@ docs/handover/CURRENT_STATE.md
 docs/handover/EXPERIMENT_STATUS.md
 ```
 
+## Where Things Are
+
+Use this as the first artifact map. If a path looks stale, verify it against `docs/handover/CURRENT_STATE.md` before using it.
+
+| Item | Where to look |
+|---|---|
+| Current Git code | This branch, `codex/handover-gigatok-20260519` |
+| New NPU repo copy | `/data2/duoduo_25/yl_GigaTok_Loss/repo/GigaTok_Loss_two_ablation` |
+| New NPU persist root | `/data2/duoduo_25/yl_GigaTok_Loss/gigatok_persist` |
+| 3090 repo copy | `/data/duoduo_25/yl_GigaTok_Loss/repo/GigaTok_Loss_two_ablation` |
+| 3090 persist root | `/public/sdc/yl_GigaTok_Loss/gigatok_persist` |
+| Main OCR-box proxy 250-epoch checkpoint | See exact path in `docs/handover/CURRENT_STATE.md` |
+| GigaTok 5k baseline 250-epoch checkpoint | See exact path in `docs/handover/CURRENT_STATE.md` |
+| 5k train/val manifests | New NPU persist root, `outputs/text_rich_realworld_upweighted_manifests/` |
+| 5k text feature cache | New NPU persist root, `outputs/text_feature_cache/realworld40_glyph_mapped/` |
+| 5k OCR bbox/proxy JSONL | New NPU persist root, `outputs/ocr_box_gate/realworld40_5k/` |
+| holdout_v2 prepared inputs/eval | New NPU persist root, `outputs/overnight_allin/` |
+| readable50 eval outputs | 3090 persist root, `outputs/overnight_allin/readable50_eval/` |
+| readable50 legacy method checkpoint archive | 3090 persist root, `outputs/legacy_readable50_methods_20260519/` after transfer completes |
+| Training/eval logs | New NPU `/data2/duoduo_25/yl_GigaTok_Loss/logs`, 3090 `/public/sdc/yl_GigaTok_Loss/logs` |
+
 ## Key Code Areas
 
 Tokenizer training/model code:
@@ -152,3 +173,16 @@ Those artifacts must stay on the active servers and be referenced by path.
 3. SSH into the new 8-card NPU server and verify the two `last.pt` checkpoint paths from `CURRENT_STATE.md`.
 4. SSH into the 3090 server and verify readable50 outputs from `CURRENT_STATE.md`.
 5. Use `docs/handover/RUNBOOK.md` for any next command; do not invent paths from memory.
+
+## How To Read This Repository
+
+For handover, read by purpose rather than by folder order:
+
+1. **Current status:** `docs/handover/CURRENT_STATE.md`
+2. **Server paths:** `docs/handover/SERVER_PATHS.md`
+3. **How to run/check things:** `docs/handover/RUNBOOK.md` and `docs/handover/SERVER_QUICKSTART.md`
+4. **What code changed:** `docs/handover/CODE_CHANGES.md`
+5. **Known traps:** `docs/handover/KNOWN_ISSUES.md`
+6. **Historical notes:** `docs/handover/DOCS_INDEX.md`
+
+Do not start by reading old experiment notes or SVGs. They are useful only after the current state is understood.
