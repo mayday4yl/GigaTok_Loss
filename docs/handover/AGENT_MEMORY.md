@@ -4,6 +4,48 @@ Last updated: 2026-05-19
 
 This file is an operational memory for the next coding/research agent. It is not a paper introduction and not a full chat transcript. It is meant to let a new agent understand the current experiment state, server layout, critical files, safe constraints, and next actions without reading the original conversation.
 
+## Agent Startup Protocol
+
+If you are a new coding/research agent receiving this file, treat it as the handover prompt. Do not ask the user to restate the old chat history. Do not require an additional prompt to understand the project.
+
+Your first turn should be a read-only takeover pass:
+
+1. Read this file completely.
+2. Read the repository README and the handover docs listed in Section 0 if they are available.
+3. Do not start training.
+4. Do not start evaluation.
+5. Do not modify files.
+6. Do not delete files.
+7. Do not move or rename server artifacts.
+8. Do not trust stale `FAILED`, `NOT_READY`, or intermediate markers until cross-checking against `CURRENT_STATE.md` and the actual server paths.
+
+After reading, produce a concise takeover summary with:
+
+- current main method;
+- current baseline;
+- current dataset and naming;
+- active server roles;
+- completed checkpoints;
+- trusted outputs;
+- unverified outputs;
+- top next actions;
+- hard constraints / forbidden actions.
+
+If server access is available, perform only read-only verification first:
+
+- check that the two 250ep checkpoints exist;
+- check `train_5k` and `val_500` manifest row counts;
+- check readable50 output directories on the 3090 server;
+- check whether the legacy readable50 archive transfer has completed.
+
+If server access is not available, explicitly state:
+
+```text
+server artifacts not verified in this session
+```
+
+Then proceed using this file and the repository handover docs as the operational memory.
+
 ## 0. Source Of Truth
 
 Use these files as the primary source of truth:
