@@ -31,7 +31,7 @@ Do not use the root `README.md` or Text-HR SVGs as the current method descriptio
    - More detailed status for training, data, holdout eval, readable50, and missing items.
 
 4. `docs/handover/SERVER_PATHS.md`
-   - Where everything lives on the new 8-card NPU, 8x3090 CUDA server, and old 2-card NPU.
+   - Where everything lives on the new 8-card NPU and 8x3090 CUDA server.
 
 5. `docs/handover/RUNBOOK.md`
    - Operational commands for checking training, continuing safely, holdout eval, readable50 eval, and OCR readability.

@@ -99,34 +99,6 @@ DeepSeek-OCR:
 /public/sdc/yl_GigaTok_Loss/gigatok_persist/models/DeepSeek-OCR
 ```
 
-## Old 2-Card NPU Server
-
-SSH alias:
-
-```bash
-ssh ModelArts-GPU
-```
-
-Typical project root:
-
-```bash
-/home/ma-user/work/GigaTok_hr
-```
-
-Typical repo:
-
-```bash
-/home/ma-user/work/GigaTok_hr/GigaTok_Loss_two_ablation
-```
-
-Typical persist root:
-
-```bash
-/home/ma-user/work/GigaTok_hr/gigatok_persist
-```
-
-This server was used for earlier readable50 and baseline experiments. It may need to be freed for other users. Before deleting anything, verify that required checkpoints/configs have been copied to the new NPU server or 3090 server.
-
 ## Do Not Delete Without Confirmation
 
 - Any `last.pt` or `0002500.pt` / `0026250.pt` checkpoint used in reported experiments.

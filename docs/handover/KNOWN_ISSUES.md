@@ -111,6 +111,5 @@ The servers are shared. Only modify files under the project-owned roots:
 - `/data2/duoduo_25/yl_GigaTok_Loss`
 - `/public/sdc/yl_GigaTok_Loss`
 - `/data/duoduo_25/yl_GigaTok_Loss`
-- `/home/ma-user/work/GigaTok_hr` for old NPU work
 
 Do not delete other users' files. Avoid `rm -rf`; avoid `rsync --delete`.

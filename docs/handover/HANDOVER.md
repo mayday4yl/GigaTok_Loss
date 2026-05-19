@@ -58,7 +58,7 @@ As of this handover:
 - `CURRENT_STATE.md`: authoritative current snapshot and warnings about stale historical records.
 - `RUNBOOK.md`: commands and procedures to continue training/eval.
 - `SERVER_QUICKSTART.md`: exact login/env/check/eval command templates for first-time server use.
-- `SERVER_PATHS.md`: important paths on the new 8-card NPU, 8x3090 CUDA server, and old 2-card NPU.
+- `SERVER_PATHS.md`: important paths on the new 8-card NPU and 8x3090 CUDA server.
 - `EXPERIMENT_STATUS.md`: current status of training, eval, readable50, and unresolved items.
 - `CODE_CHANGES.md`: summary of key code changes and what they were for.
 - `KNOWN_ISSUES.md`: known failure modes and how to avoid repeating them.
