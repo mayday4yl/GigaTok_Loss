@@ -4,6 +4,17 @@ Last updated: 2026-05-19
 
 Start here before reading older notes, figures, or server logs. Some files in this repository are historical planning records, and several server-side `FAILED` / `NOT_READY` markers came from earlier attempts before later fixes.
 
+## Live Recheck Notes
+
+Read-only live checks on 2026-05-19 confirmed the state below:
+
+- NPU wrapper state file still says `status=done`.
+- NPU done markers exist for `main_ocr_box_proxy`, `gigatok_5k_baseline`, and `global`.
+- Main training log ends at `step=0026250`, saved `*_continue_250ep/.../last.pt`, and printed `Done!`.
+- GigaTok 5k baseline log ends at `step=0026250`, saved `*_continue_250ep/.../last.pt`, and printed `Done!`.
+- NPU fixed-path eval currently shows `smoke_10` outputs for balanced and medium only.
+- 3090 readable50 output directories contain basic eval summaries, per-sample JSONL, grids, reconstructions, and GT images for the three readable50 sets.
+
 ## Authoritative Current State
 
 ### Training

@@ -3609,3 +3609,8 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - readable50 三组在 3090 上已有基础 PSNR/SSIM/Text-PSNR/Text-SSIM 输出，但 OCR CER/NED 未确认完成。
   - `gigatok_only` readable50 同口径 checkpoint 未找到，不能用 pretrained 或 5k baseline 硬塞进消融主表。
 - 更新 `HANDOVER.md`、`EXPERIMENT_STATUS.md`、`DOCS_INDEX.md`、`CODE_CHANGES.md`，把 Text-HR 图和 HR/local/ocrvis 相关内容标记为历史/非当前主方法，避免交接时误读。
+- 随后做了只读 live recheck：
+  - 新 8 卡 NPU 的 `global.state` 为 `status=done`，三个 done marker 存在。
+  - 主方法与 GigaTok baseline 训练日志都在 `step=0026250` 保存 `*_continue_250ep/.../last.pt` 后输出 `Done!`。
+  - NPU fixed-path holdout_v2 目前只确认到 balanced/medium 的 `smoke_10` 输出，未看到 full 200 eval 输出。
+  - 3090 readable50 三组有基础 eval summary / per-sample / grid，但未看到 OCR CER/NED 输出。
