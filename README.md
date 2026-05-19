@@ -37,6 +37,7 @@ Then use these as needed:
 docs/handover/RUNBOOK.md
 docs/handover/EXPERIMENT_STATUS.md
 docs/handover/CONVERSATION_SUMMARY.md
+docs/handover/AGENT_MEMORY.md
 docs/handover/SERVER_PATHS.md
 docs/handover/SERVER_ARTIFACT_INDEX.md
 docs/handover/CODE_CHANGES.md
