@@ -33,22 +33,25 @@ Do not use older Text-HR SVGs as the current method description. They document e
 4. `docs/handover/SERVER_PATHS.md`
    - Where everything lives on the new 8-card NPU and 8x3090 CUDA server.
 
-5. `docs/handover/RUNBOOK.md`
+5. `docs/handover/SERVER_ARTIFACT_INDEX.md`
+   - Plain-language map of server artifact directories, what each one means, and what must be preserved.
+
+6. `docs/handover/RUNBOOK.md`
    - Operational commands for checking training, continuing safely, holdout eval, readable50 eval, and OCR readability.
 
-6. `docs/handover/SERVER_QUICKSTART.md`
+7. `docs/handover/SERVER_QUICKSTART.md`
    - First 30 minutes on the servers: login, activate env, check training, run holdout eval, and run OCR readability.
 
-7. `docs/handover/CODE_CHANGES.md`
+8. `docs/handover/CODE_CHANGES.md`
    - Code map: which files implement text conditioning, OCR CE, OCR-box gate, proxy confidence, gradient accumulation, selection, and eval.
 
-8. `docs/handover/KNOWN_ISSUES.md`
+9. `docs/handover/KNOWN_ISSUES.md`
    - Failure modes to avoid: `--finetune` on resume, checkpoint fallback, proxy normalization drift, bbox path mismatch, and readable50 pitfalls.
 
-9. `docs/handover/GIT_AND_ARTIFACTS.md`
+10. `docs/handover/GIT_AND_ARTIFACTS.md`
    - What is in Git versus what must stay as server artifacts.
 
-10. `docs/handover/DOCS_INDEX.md`
+11. `docs/handover/DOCS_INDEX.md`
    - Index of older docs and diagrams. Use it only after understanding which parts are historical.
 
 ## Current Method In Plain Terms

@@ -71,4 +71,4 @@ gpt_pro_method_review_package/
 
 ## Artifact Index
 
-Use the server paths in `SERVER_PATHS.md` and `EXPERIMENT_STATUS.md` as the artifact index. If a future owner copies artifacts, update those docs with the new path and date.
+Use `SERVER_ARTIFACT_INDEX.md`, `SERVER_PATHS.md`, and `EXPERIMENT_STATUS.md` as the artifact index. If a future owner copies artifacts, update those docs with the new path and date.

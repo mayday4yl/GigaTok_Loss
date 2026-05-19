@@ -25,6 +25,7 @@ Then use these as needed:
 docs/handover/RUNBOOK.md
 docs/handover/EXPERIMENT_STATUS.md
 docs/handover/SERVER_PATHS.md
+docs/handover/SERVER_ARTIFACT_INDEX.md
 docs/handover/CODE_CHANGES.md
 docs/handover/KNOWN_ISSUES.md
 docs/handover/GIT_AND_ARTIFACTS.md
@@ -78,10 +79,11 @@ New 8-card NPU server project root:
 /data/duoduo_25/yl_GigaTok_Loss
 ```
 
-Large artifacts are not in Git. Checkpoints, text feature cache, OCR bbox/proxy JSONL, reconstruction images, and logs live on the servers above. Exact paths are in:
+Large artifacts are not in Git. Checkpoints, text feature cache, OCR bbox/proxy JSONL, reconstruction images, and logs live on the servers above. Exact paths and plain-language explanations are in:
 
 ```bash
 docs/handover/SERVER_PATHS.md
+docs/handover/SERVER_ARTIFACT_INDEX.md
 docs/handover/CURRENT_STATE.md
 docs/handover/EXPERIMENT_STATUS.md
 ```
@@ -180,9 +182,10 @@ For handover, read by purpose rather than by folder order:
 
 1. **Current status:** `docs/handover/CURRENT_STATE.md`
 2. **Server paths:** `docs/handover/SERVER_PATHS.md`
-3. **How to run/check things:** `docs/handover/RUNBOOK.md` and `docs/handover/SERVER_QUICKSTART.md`
-4. **What code changed:** `docs/handover/CODE_CHANGES.md`
-5. **Known traps:** `docs/handover/KNOWN_ISSUES.md`
-6. **Historical notes:** `docs/handover/DOCS_INDEX.md`
+3. **Server artifact meanings:** `docs/handover/SERVER_ARTIFACT_INDEX.md`
+4. **How to run/check things:** `docs/handover/RUNBOOK.md` and `docs/handover/SERVER_QUICKSTART.md`
+5. **What code changed:** `docs/handover/CODE_CHANGES.md`
+6. **Known traps:** `docs/handover/KNOWN_ISSUES.md`
+7. **Historical notes:** `docs/handover/DOCS_INDEX.md`
 
 Do not start by reading old experiment notes or SVGs. They are useful only after the current state is understood.
