@@ -3617,3 +3617,9 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - 再次按“师姐从 0 接手”视角复查，发现根目录 `README.md` 仍是早期 Text-HR pilot 口径，容易误导。
 - 新增 `docs/handover/README_FOR_HANDOVER.md` 作为第一阅读入口，按 5 分钟 summary、阅读顺序、当前方法、artifact 路径、done/pending 表格、常见问题和下一步组织。
 - 在根目录 `README.md` 顶部增加 handover note，明确其为历史 Text-HR pilot 内容，当前主线应以 `docs/handover/README_FOR_HANDOVER.md` 和 `CURRENT_STATE.md` 为准。
+- 为了让接手者能实际登录服务器运行剩余代码，新增 `docs/handover/SERVER_QUICKSTART.md`：
+  - 新 8 卡 NPU 的登录、docker、conda、环境变量、训练完成检查。
+  - 250 epoch checkpoint/config/text cache 路径检查。
+  - holdout_v2 balanced/medium 的 smoke 与 full 200 eval 命令模板。
+  - 3090 的登录、Python 环境、readable50 输出定位。
+  - OCR CER/NED readability 二次计算命令模板。

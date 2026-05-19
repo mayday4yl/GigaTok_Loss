@@ -36,16 +36,19 @@ Do not use the root `README.md` or Text-HR SVGs as the current method descriptio
 5. `docs/handover/RUNBOOK.md`
    - Operational commands for checking training, continuing safely, holdout eval, readable50 eval, and OCR readability.
 
-6. `docs/handover/CODE_CHANGES.md`
+6. `docs/handover/SERVER_QUICKSTART.md`
+   - First 30 minutes on the servers: login, activate env, check training, run holdout eval, and run OCR readability.
+
+7. `docs/handover/CODE_CHANGES.md`
    - Code map: which files implement text conditioning, OCR CE, OCR-box gate, proxy confidence, gradient accumulation, selection, and eval.
 
-7. `docs/handover/KNOWN_ISSUES.md`
+8. `docs/handover/KNOWN_ISSUES.md`
    - Failure modes to avoid: `--finetune` on resume, checkpoint fallback, proxy normalization drift, bbox path mismatch, and readable50 pitfalls.
 
-8. `docs/handover/GIT_AND_ARTIFACTS.md`
+9. `docs/handover/GIT_AND_ARTIFACTS.md`
    - What is in Git versus what must stay as server artifacts.
 
-9. `docs/handover/DOCS_INDEX.md`
+10. `docs/handover/DOCS_INDEX.md`
    - Index of older docs and diagrams. Use it only after understanding which parts are historical.
 
 ## Current Method In Plain Terms
