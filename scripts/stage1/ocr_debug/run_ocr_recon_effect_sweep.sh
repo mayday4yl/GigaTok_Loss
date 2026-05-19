@@ -57,8 +57,11 @@ ocr_weight_for_group() {
   case "$1" in
     orig) echo "" ;;
     noocr) echo "" ;;
+    w0005) echo "0.005" ;;
     w001) echo "0.01" ;;
+    w0015) echo "0.015" ;;
     w002) echo "0.02" ;;
+    w0025) echo "0.025" ;;
     w003) echo "0.03" ;;
     w005) echo "0.05" ;;
     *)

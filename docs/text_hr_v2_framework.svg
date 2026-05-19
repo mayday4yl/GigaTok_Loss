@@ -1,0 +1,207 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1160" viewBox="0 0 1800 1160">
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#28323c"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#9b1c31"/>
+    </marker>
+    <style>
+      .title { font: 700 34px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #17212b; }
+      .subtitle { font: 500 18px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #475569; }
+      .section { font: 700 22px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #17212b; }
+      .label { font: 700 17px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #17212b; }
+      .small { font: 500 14px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #475569; }
+      .tiny { font: 500 12px Arial, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; fill: #64748b; }
+      .formula { font: 600 15px "SFMono-Regular", Consolas, "Liberation Mono", monospace; fill: #1f2937; }
+      .box { stroke-width: 2; rx: 12; ry: 12; }
+      .frozen { fill: #edf4ff; stroke: #5b86c5; }
+      .train { fill: #fff4df; stroke: #d28a18; }
+      .data { fill: #eefcf4; stroke: #36a56b; }
+      .loss { fill: #fff1f2; stroke: #cc3850; }
+      .neutral { fill: #f8fafc; stroke: #94a3b8; }
+      .dashed { stroke-dasharray: 7 6; }
+      .arrow { stroke: #28323c; stroke-width: 2.3; fill: none; marker-end: url(#arrow); }
+      .arrow-red { stroke: #9b1c31; stroke-width: 2.3; fill: none; marker-end: url(#arrow-red); }
+      .note { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; ry: 10; }
+      .legend-line { stroke-width: 4; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1800" height="1160" fill="#ffffff"/>
+  <text x="900" y="52" text-anchor="middle" class="title">Text-Conditioned GigaTok Decoder with Image-to-Text High-Rank Regularization</text>
+  <text x="900" y="82" text-anchor="middle" class="subtitle">v2 framework: rendered text from image + frozen T5 encoder + trainable GigaTok decoder HR constraint</text>
+
+  <!-- Data source -->
+  <rect x="640" y="118" width="520" height="82" class="box data"/>
+  <text x="900" y="150" text-anchor="middle" class="label">TextAtlas v2 Manifest</text>
+  <text x="900" y="176" text-anchor="middle" class="small">image_path + rendered text inside the image</text>
+
+  <rect x="250" y="250" width="270" height="72" class="box data"/>
+  <text x="385" y="280" text-anchor="middle" class="label">Image x</text>
+  <text x="385" y="304" text-anchor="middle" class="small">input image</text>
+
+  <rect x="1280" y="250" width="270" height="72" class="box data"/>
+  <text x="1415" y="280" text-anchor="middle" class="label">Rendered Text y</text>
+  <text x="1415" y="304" text-anchor="middle" class="small">not caption, not prompt</text>
+
+  <path d="M760 200 C640 225 515 235 435 250" class="arrow"/>
+  <path d="M1040 200 C1160 225 1285 235 1365 250" class="arrow"/>
+
+  <!-- Image branch container -->
+  <rect x="90" y="360" width="610" height="465" class="box neutral dashed"/>
+  <text x="395" y="392" text-anchor="middle" class="section">Frozen GigaTok Image Tokenization Path</text>
+
+  <rect x="160" y="430" width="470" height="62" class="box frozen"/>
+  <text x="395" y="456" text-anchor="middle" class="label">GigaTok Encoder</text>
+  <text x="395" y="479" text-anchor="middle" class="small">Frozen, no gradient update</text>
+
+  <rect x="160" y="530" width="470" height="62" class="box frozen"/>
+  <text x="395" y="556" text-anchor="middle" class="label">Vector Quantizer</text>
+  <text x="395" y="579" text-anchor="middle" class="small">Frozen codebook / image tokens</text>
+
+  <rect x="160" y="630" width="470" height="62" class="box frozen"/>
+  <text x="395" y="656" text-anchor="middle" class="label">Post-Quant Projection</text>
+  <text x="395" y="679" text-anchor="middle" class="small">Frozen, still before decoder</text>
+
+  <rect x="160" y="730" width="470" height="62" class="box neutral"/>
+  <text x="395" y="756" text-anchor="middle" class="label">Image Memory</text>
+  <text x="395" y="779" text-anchor="middle" class="formula">z_img ∈ R^{B × 256 × C_dec}, C_dec=1024</text>
+
+  <path d="M385 322 L385 430" class="arrow"/>
+  <path d="M395 492 L395 530" class="arrow"/>
+  <path d="M395 592 L395 630" class="arrow"/>
+  <path d="M395 692 L395 730" class="arrow"/>
+
+  <!-- Text branch container -->
+  <rect x="1100" y="360" width="610" height="465" class="box neutral dashed"/>
+  <text x="1405" y="392" text-anchor="middle" class="section">Frozen T5 Text Encoding Path</text>
+
+  <rect x="1170" y="430" width="470" height="62" class="box frozen"/>
+  <text x="1405" y="456" text-anchor="middle" class="label">T5 Tokenizer</text>
+  <text x="1405" y="479" text-anchor="middle" class="small">Frozen tokenizer</text>
+
+  <rect x="1170" y="530" width="470" height="68" class="box frozen"/>
+  <text x="1405" y="558" text-anchor="middle" class="label">T5 Encoder</text>
+  <text x="1405" y="582" text-anchor="middle" class="formula">output_hidden_states=True</text>
+
+  <rect x="1170" y="636" width="470" height="68" class="box neutral"/>
+  <text x="1405" y="664" text-anchor="middle" class="label">Hidden States</text>
+  <text x="1405" y="688" text-anchor="middle" class="small">exclude embedding output h[0]</text>
+
+  <rect x="1170" y="742" width="470" height="62" class="box neutral"/>
+  <text x="1405" y="768" text-anchor="middle" class="label">Selected Text Layer Pool</text>
+  <text x="1405" y="791" text-anchor="middle" class="formula">l_text ∈ {8, ..., 15}</text>
+
+  <path d="M1415 322 L1415 430" class="arrow"/>
+  <path d="M1405 492 L1405 530" class="arrow"/>
+  <path d="M1405 598 L1405 636" class="arrow"/>
+  <path d="M1405 704 L1405 742" class="arrow"/>
+
+  <!-- Sampling and adapter -->
+  <rect x="760" y="260" width="280" height="96" class="box neutral"/>
+  <text x="900" y="292" text-anchor="middle" class="label">Layer-Pair Sampling</text>
+  <text x="900" y="318" text-anchor="middle" class="small">sample one pair per step</text>
+  <text x="900" y="340" text-anchor="middle" class="formula">(l_text, l_dec), 8-15</text>
+
+  <path d="M1170 773 C1072 748 1005 580 920 356" class="arrow"/>
+  <path d="M900 356 L900 410" class="arrow"/>
+
+  <rect x="760" y="410" width="280" height="72" class="box neutral"/>
+  <text x="900" y="438" text-anchor="middle" class="label">Text Feature</text>
+  <text x="900" y="463" text-anchor="middle" class="formula">h_text^l ∈ R^{B × T × d_T5}, d_T5=2048</text>
+
+  <rect x="760" y="520" width="280" height="76" class="box train"/>
+  <text x="900" y="548" text-anchor="middle" class="label">Text Adapter</text>
+  <text x="900" y="572" text-anchor="middle" class="small">Linear Projection + LayerNorm</text>
+
+  <rect x="760" y="634" width="280" height="78" class="box train"/>
+  <text x="900" y="662" text-anchor="middle" class="label">text_type_embedding</text>
+  <text x="900" y="686" text-anchor="middle" class="small">learnable modality tag</text>
+
+  <rect x="760" y="750" width="280" height="62" class="box neutral"/>
+  <text x="900" y="776" text-anchor="middle" class="label">Text Memory</text>
+  <text x="900" y="799" text-anchor="middle" class="formula">z_txt ∈ R^{B × T × C_dec}, C_dec=1024</text>
+
+  <path d="M900 482 L900 520" class="arrow"/>
+  <path d="M900 596 L900 634" class="arrow"/>
+  <path d="M900 712 L900 750" class="arrow"/>
+
+  <rect x="740" y="834" width="320" height="54" class="note"/>
+  <text x="900" y="858" text-anchor="middle" class="small">No text position embedding in v2</text>
+  <text x="900" y="878" text-anchor="middle" class="tiny">position information comes from token order and attention</text>
+
+  <!-- Decoder container -->
+  <rect x="520" y="900" width="760" height="180" class="box train"/>
+  <text x="900" y="932" text-anchor="middle" class="section">Trainable GigaTok Decoder</text>
+
+  <rect x="570" y="966" width="210" height="62" class="box train"/>
+  <text x="675" y="992" text-anchor="middle" class="label">Decoder Layers</text>
+  <text x="675" y="1015" text-anchor="middle" class="small">1 ... 24</text>
+
+  <rect x="820" y="954" width="270" height="88" class="box train"/>
+  <text x="955" y="982" text-anchor="middle" class="label">Selected Cross-Attention</text>
+  <text x="955" y="1006" text-anchor="middle" class="formula">Q = image queries</text>
+  <text x="955" y="1028" text-anchor="middle" class="formula">K,V = [z_img ; z_txt]</text>
+
+  <rect x="1130" y="966" width="110" height="62" class="box train"/>
+  <text x="1185" y="992" text-anchor="middle" class="label">Output</text>
+  <text x="1185" y="1015" text-anchor="middle" class="formula">x_hat</text>
+
+  <path d="M630 761 C700 825 695 885 675 966" class="arrow"/>
+  <path d="M900 812 C920 850 940 895 955 954" class="arrow"/>
+  <path d="M780 997 L820 997" class="arrow"/>
+  <path d="M1090 997 L1130 997" class="arrow"/>
+
+  <!-- HR loss branch -->
+  <rect x="1310" y="880" width="410" height="220" class="box loss"/>
+  <text x="1515" y="912" text-anchor="middle" class="section">Image-to-Text High-Rank Loss</text>
+
+  <rect x="1340" y="940" width="350" height="42" class="box loss"/>
+  <text x="1515" y="966" text-anchor="middle" class="formula">A ∈ R^{B × H × 256 × (256+T)}</text>
+
+  <rect x="1340" y="996" width="350" height="42" class="box loss"/>
+  <text x="1515" y="1022" text-anchor="middle" class="formula">M = A[:, :, :, 256:256+T]</text>
+
+  <rect x="1340" y="1052" width="350" height="42" class="box loss"/>
+  <text x="1515" y="1078" text-anchor="middle" class="formula">mask padding → SVD → mean(|σ - τ|)</text>
+
+  <path d="M1090 970 C1195 930 1240 930 1310 960" class="arrow-red"/>
+  <path d="M1515 982 L1515 996" class="arrow-red"/>
+  <path d="M1515 1038 L1515 1052" class="arrow-red"/>
+
+  <!-- Original loss and total objective -->
+  <rect x="80" y="930" width="360" height="104" class="box loss"/>
+  <text x="260" y="962" text-anchor="middle" class="section">Original GigaTok Losses</text>
+  <text x="260" y="992" text-anchor="middle" class="small">reconstruction / perceptual / adversarial</text>
+  <text x="260" y="1016" text-anchor="middle" class="formula">L_GigaTok</text>
+
+  <path d="M1130 1010 C870 1120 460 1112 335 1034" class="arrow-red"/>
+
+  <rect x="690" y="1100" width="420" height="46" class="box loss"/>
+  <text x="900" y="1129" text-anchor="middle" class="formula">L_total = L_GigaTok + λ_HR · L_HR</text>
+  <path d="M440 982 C570 1030 665 1072 760 1100" class="arrow-red"/>
+  <path d="M1515 1094 C1400 1134 1240 1140 1110 1123" class="arrow-red"/>
+
+  <!-- Update note -->
+  <rect x="1190" y="1100" width="430" height="46" class="box train"/>
+  <text x="1405" y="1129" text-anchor="middle" class="small">Update only: decoder + text adapter + text_type_embedding</text>
+  <path d="M1110 1123 L1190 1123" class="arrow"/>
+
+  <!-- Legend -->
+  <rect x="80" y="118" width="400" height="82" class="note"/>
+  <line x1="110" y1="145" x2="155" y2="145" class="legend-line" stroke="#5b86c5"/>
+  <text x="170" y="151" class="small">Frozen modules</text>
+  <line x1="110" y1="172" x2="155" y2="172" class="legend-line" stroke="#d28a18"/>
+  <text x="170" y="178" class="small">Trainable modules</text>
+  <line x1="300" y1="145" x2="345" y2="145" class="legend-line" stroke="#cc3850"/>
+  <text x="360" y="151" class="small">Loss branch</text>
+  <line x1="300" y1="172" x2="345" y2="172" class="legend-line" stroke="#36a56b"/>
+  <text x="360" y="178" class="small">Data</text>
+
+  <!-- Baseline / HR note -->
+  <rect x="1300" y="118" width="420" height="82" class="note"/>
+  <text x="1510" y="146" text-anchor="middle" class="label">Experiment Setting</text>
+  <text x="1510" y="172" text-anchor="middle" class="small">Baseline: text conditioning only</text>
+  <text x="1510" y="193" text-anchor="middle" class="small">HR: same split + λ_HR · L_HR</text>
+</svg>

@@ -1,29 +1,10 @@
-# 给师姐看的代码修改行号说明
+- 相对原版 GigaTok，当前主要改动是：
 
-这份文档按“相对于官方原版 GigaTok”的口径整理当前分支的主要修改，并标注当前分支中的行号范围，方便直接打开文件审阅。
+  1. 在 stage-1 tokenizer decoder 的指定 cross-attention 层接入 frozen T5 文本特征。
+  2. 返回该层 post-softmax image-to-text attention，并对其做 SVD / high-rank 约束。
+  3. 增加 TextAtlas 数据读取、NPU 训练、online validation、单图 overfit 和逐层诊断工具，用来验证该方法是否有效。
 
-## 对比口径
-
-- 原版 GigaTok remote: `upstream=https://github.com/SilentView/GigaTok.git`
-- 原版基线: `upstream/master`
-- merge-base: `baf3de042034318aa762c28db4d14231efce8b0c`
-- 当前分支: `codex/text-hr-decoder`
-
-完整 diff 可用：
-
-```bash
-git diff --stat upstream/master...HEAD
-git diff --name-status upstream/master...HEAD
-```
-
-行号说明：
-
-- 下表行号是**当前分支文件中的行号**。
-- 对新增文件，行号表示新增文件内相关代码范围。
-- 对原版已有文件，行号表示相对原版 GigaTok 的主要修改区域。
-- 核心方法相关位置也可以直接搜索 `Text-HR v2`。
-
-## 一、最核心方法代码
+## 一、核心方法代码
 
 ### 1. Decoder cross-attention 返回 post-softmax attention
 
@@ -34,7 +15,7 @@ git diff --name-status upstream/master...HEAD
 | 638-685 | `TransformerDecoderLayer.forward_post(...)` 增加 `return_cross_attn_weights`，调用 `nn.MultiheadAttention` 时设置 `need_weights=return_cross_attn_weights`、`average_attn_weights=False`，返回 `cross_attn_weights` | 让选中 decoder 层能返回 post-softmax cross-attention 矩阵 `[B,H,Q,K]` |
 | 688-745 | `TransformerDecoderLayer.forward_pre(...)` 做同样的 attention 返回逻辑 | 兼容 pre-norm decoder block |
 
-给师姐看重点：第 `673-678` 行和第 `740-745` 行，那里是真正从 PyTorch attention 取权重的位置。
+
 
 ### 2. VQ tokenizer 接入 frozen T5 text feature
 
@@ -47,7 +28,7 @@ git diff --name-status upstream/master...HEAD
 | 481-528 | 修改 `decode(...)`，支持 `selected_decoder_layer`、`decoder_text_features`、`decoder_text_key_padding_mask`，并返回该层 cross-attention | 只在选中的 decoder layer 注入 text memory，不影响原 image-only 路径 |
 | 535-625 | 修改 `forward(...)` 参数和返回值，透传 text feature 与 attention weights | 训练阶段把 attention weights 交给 loss 计算 HR |
 
-给师姐看重点：第 `357-404` 行是 text projection；第 `481-528` 行是 text 注入 decoder；第 `617-624` 行是返回 attention 给训练 loss。
+第 `357-404` 行是 text projection；第 `481-528` 行是 text 注入 decoder；第 `617-624` 行是返回 attention 给训练 loss。
 
 ### 3. Image-to-text attention 的 SVD / HR loss
 
@@ -61,9 +42,9 @@ git diff --name-status upstream/master...HEAD
 | 558-586 | 计算 `hr_loss_term` 和 `text_hr_loss_term`，并加入 generator 总 loss | HR 真正进入优化目标的位置 |
 | 640-685 | 日志和 wandb/cache 字段增加 `text_hr_loss`、`weighted_text_hr_loss`、`sigma_mean`、有效 token 数等 | 单独观察 HR 是否生效 |
 
-给师姐看重点：第 `151-232` 行是 loss 定义；第 `581-586` 行是加入总 loss。
+第 `151-232` 行是 loss 定义；第 `581-586` 行是加入总 loss。
 
-## 二、训练主线接入
+## 二、训练接入
 
 文件：`tokenizer/tokenizer_image/vq/vq_train.py`
 
@@ -78,11 +59,11 @@ git diff --name-status upstream/master...HEAD
 | 1124-1169 | 每个 step 随机选一组 layer pair，tokenize 文本，跑 frozen T5，取选中 hidden state | 训练时得到要注入 decoder 的 text feature |
 | 1219-1278 | 前向时把 text feature 传给 VQ model，并把返回的 attention weights / text mask 传给 `VQLoss` | Text-HR 进入训练主循环 |
 
-给师姐看重点：第 `1124-1169` 行是每步选层和取 T5 feature；第 `1260-1278` 行是把 attention 交给 loss。
+第 `1124-1169` 行是每步选层和取 T5 feature；第 `1260-1278` 行是把 attention 交给 loss。
 
 ## 三、配置文件
 
-### 1. 我们的方法配置
+### 1. 当前方法配置
 
 文件：`configs/vq/VQ_BL256_dino_disc_text_hr_v2.yaml`
 
@@ -92,9 +73,9 @@ git diff --name-status upstream/master...HEAD
 | 65-79 | `text_conditioning` | 开启 frozen T5，设置 `max_length=128`、projection、type embedding |
 | 81-105 | `text_hr` | 开启 Text-HR，设置 layer pairs 8-15、post-softmax、image-to-text、mask padding、SVD 模式 |
 
-给师姐看重点：第 `65-105` 行就是方法开关和超参。
+第 `65-105` 行是方法开关和超参。
 
-### 2. 原生 GigaTok baseline 配置
+### 2. GigaTok baseline 配置
 
 文件：`configs/vq/VQ_BL256_dino_disc_stage1_baseline.yaml`
 
@@ -164,42 +145,3 @@ git diff --name-status upstream/master...HEAD
 | 246-337 | 构建 text layer pairs，加载 tokenizer checkpoint，兼容新增 text 参数 | 评估时复现训练结构 |
 | 340-392 | `reconstruct_batch(...)` 支持 image-only 和 text-conditioned 两条路径 | 导出重建图和指标 |
 | 395-406 | MSE / MAE / PSNR / SSIM 计算 | 重建指标 |
-
-## 六、NPU / validation / checkpoint 兼容等工程改动
-
-这些不是方法核心，但相对原版 GigaTok 也是重要修改。
-
-| 文件 | 当前行号 | 修改内容 | 作用 |
-|---|---|---|---|
-| `tokenizer/tokenizer_image/vq/vq_train.py` | 179-276 | online reconstruction validation 指标计算 | 训练中输出 Val MSE / MAE / PSNR / SSIM |
-| `tokenizer/tokenizer_image/vq/vq_train.py` | 534-575 | validation dataset 构建逻辑 | 支持 TextAtlas JSONL validation |
-| `tokenizer/tokenizer_image/vq/vq_train.py` | 1520-1586 | 新增 CLI 参数，如 `--device-backend`、`--val-json-path`、`--no-wandb` 等 | 服务器实验可控 |
-| `utils/distributed.py` | 6-17, 34-72 | 增加 `cuda` / `npu` backend 分支，并在 NPU 下使用 `hccl` | Ascend 服务器运行 |
-| `utils/model_init.py` | 53-91, 101-114 | 支持 `DINOV2_REPO_DIR` 本地加载 DINOv2，并固定 DINOv2-B embed dim 检查 | 避免在线下载失败，保持 frozen DINOv2-B |
-| `utils/model_init.py` | 181-213 | `custom_load(...)` 增加 `ignore_missing_keys` | 兼容旧 GigaTok checkpoint 中没有新增 text projection 参数 |
-| `utils/resume_log.py` | 25-39, 58, 113-128, 134-152 | wandb import 失败时延迟报错，配合 `--no-wandb` 继续训练 | 服务器 wandb / protobuf 环境不稳定时不阻塞训练 |
-
-## 七、给师姐看的最小代码包
-
-如果她只想看我们方法主体，发这些即可：
-
-```text
-docs/original_gigatok_line_review.md
-docs/original_gigatok_diff_map.md
-configs/vq/VQ_BL256_dino_disc_text_hr_v2.yaml
-configs/vq/VQ_BL256_dino_disc_stage1_baseline.yaml
-tokenizer/tokenizer_image/vq/blocks.py
-tokenizer/tokenizer_image/vq/vq_vit_model.py
-tokenizer/tokenizer_image/vq/vq_loss.py
-tokenizer/tokenizer_image/vq/vq_train.py
-dataset/textatlas.py
-scripts/stage1/single_image_debug/diagnose_single_image.py
-```
-
-## 八、一句话说明
-
-相对原版 GigaTok，当前主改动是：
-
-1. 在 stage-1 tokenizer decoder 的指定 cross-attention 层接入 frozen T5 文本特征。
-2. 返回该层 post-softmax image-to-text attention，并对其做 SVD / high-rank 约束。
-3. 增加 TextAtlas 数据读取、NPU 训练、online validation、单图 overfit 和逐层诊断工具，用来验证该方法是否有效。
