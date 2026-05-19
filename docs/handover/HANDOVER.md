@@ -16,7 +16,7 @@ The work extends the GigaTok B-L discrete tokenizer fine-tuning pipeline for tex
 - High-rank / local-sim / OCR visual-alignment ablations.
 - OCR-box gate, including a proxy-confidence variant that uses DeepSeek-OCR token logprobs.
 
-The current main line is **stage-1 tokenizer fine-tuning only**. The AR model is not part of the active experiment.
+The current main line is **text-rich discrete tokenizer fine-tuning only**. The AR model is not part of the active experiment.
 
 Historical HR/local/OCR-visual-alignment material remains in this repo for context. The current main OCR-box proxy experiment keeps HR/local/OCR visual alignment disabled.
 

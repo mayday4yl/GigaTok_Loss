@@ -11,7 +11,7 @@ Current source of truth:
 
 Current main experiment:
 
-- stage-1 GigaTok tokenizer fine-tuning
+- text-rich GigaTok discrete tokenizer fine-tuning
 - `realworld40_5k`
 - main method: OCR-box gate + DeepSeek-OCR token-logprob proxy confidence
 - baseline: GigaTok-only tokenizer baseline on the same 5k data

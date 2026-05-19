@@ -36,7 +36,7 @@ Use this to understand historical experiment decisions.
 
 ### `docs/stage1_text_hr_flow.svg`
 
-Early stage-1 Text-HR pipeline diagram.
+Legacy Text-HR pipeline diagram. The filename is historical and should not be used as the current method name.
 
 ### `docs/text_hr_v2_framework.svg`
 

@@ -8,7 +8,7 @@ This is the first file to read if you are taking over from zero. The repository 
 
 Current project state:
 
-- Task: stage-1 GigaTok tokenizer fine-tuning for text-rich image reconstruction.
+- Task: text-rich GigaTok discrete tokenizer fine-tuning for image reconstruction.
 - Current main method: OCR-box gate + proxy confidence.
 - Baseline: GigaTok-only tokenizer baseline on the same `realworld40_5k` data.
 - Current training data: `train_5k / val_500`, with holdout candidates `holdout_v2_readable_balanced_200` and `holdout_v2_readable_medium_200`.
@@ -16,7 +16,7 @@ Current project state:
 - Current eval status: path-aligned holdout smoke passed, but full 200-image holdout eval still needs completion or explicit verification.
 - readable50 ablation status: three 50-image curated sets have basic reconstruction metrics on the 3090 server; OCR CER/NED is still missing or unverified.
 
-Do not use the root `README.md` or Text-HR SVGs as the current method description. They document earlier project stages.
+Do not use older Text-HR SVGs as the current method description. They document earlier exploratory directions.
 
 ## Read In This Order
 

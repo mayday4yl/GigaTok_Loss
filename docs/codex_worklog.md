@@ -25,6 +25,11 @@ This handover branch keeps only the current handover-oriented worklog. Older exp
 
 The current main experiment is OCR-box gate + DeepSeek-OCR token-logprob proxy confidence. HR/local/OCR visual-alignment code exists in the repository for historical and ablation work, but those modules are disabled for the current main method.
 
+## 2026-05-19 Paper-Facing Terminology Cleanup
+
+- Updated `AGENTS.md`, root `README.md`, and handover entry docs to describe the active work as text-rich discrete tokenizer fine-tuning / semantic-aligned text-rich image tokenization instead of the older internal phase wording.
+- Kept historical script directory names unchanged so existing commands and paths do not break.
+
 ## Artifact Policy
 
 Git contains code, scripts, configs, and handover docs. Large artifacts remain on the active project servers and are referenced by absolute paths in `docs/handover/`.

@@ -22,7 +22,7 @@ Purpose:
 - Add high-rank loss experiments on decoder attention.
 - Support logging and config switches for optional losses.
 
-Original stage-1 rule remains important: do not modify the AR model for this work.
+Original tokenizer-only rule remains important: do not modify the AR model for this work.
 
 Current-status note: HR/local/OCR visual-alignment code exists for historical and ablation work, but the current main `realworld40_5k` OCR-box proxy experiment disables HR/local/OCR visual alignment.
 
