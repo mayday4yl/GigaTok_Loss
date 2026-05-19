@@ -1,2 +1,50 @@
 
 .DS_Store
+
+# Python / local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Editor / OS noise
+.vscode/
+.idea/
+
+# Logs and process state
+*.log
+*.pid
+*.state
+nohup.out
+
+# Large ML artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+checkpoints/
+
+# Data/cache/output artifacts. Keep manifests and small summaries only when
+# explicitly selected for handover.
+cache/
+outputs/
+gigatok_persist/
+text_feature_cache/
+reconstruction*/
+reconstructions/
+gt_256/
+eval_artifacts/
+tmp*/
+
+# OCR/proxy artifacts are often large and path-specific.
+*ocr_bbox*.jsonl
+*_with_proxy_conf*.jsonl
+*proxy_conf*.jsonl
+
+# Ad hoc review/export folders
+gpt_pro_method_review_excluded/
+gpt_pro_method_review_package/

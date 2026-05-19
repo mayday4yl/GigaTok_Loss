@@ -3498,3 +3498,103 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
 - 代码状态：
   - `python3 -m py_compile scripts/stage1/ocr_debug/evaluate_setting_metrics.py` 通过。
   - 未重训，未改 checkpoint。
+## 2026-05-14 two-ablation 2500-step quick screening 准备
+
+- 目标改为 `TARGET_STEPS=2500` quick screening，不把新实验 2500 step 与 `w001@5000` 混在同一主表。
+- 新增两组组合路线：
+  - `w001_hr_local`: text + OCR CE(0.01) + text-HR + positional local-similarity。
+  - `ocrvis_hr_local`: text + text-HR + positional local-similarity + OCR visual alignment，关闭 OCR CE。
+- 代码改动：
+  - `vq_loss.py` 新增 positional GW/local-similarity loss，`D_img` 从 attention 的 `N_img` 自动推断 square grid。
+  - `vq_vit_model.py` 新增 `ocr_visual_alignment_mlp`，并把 projection 放进 DDP forward graph，避免在 forward 外使用 DDP 参数。
+  - `vq_train.py` 新增 frozen DeepSeek-OCR visual target alignment，MLP 参数进入 optimizer/checkpoint；OCR visual encoder 保持 frozen。
+  - `evaluate_setting_metrics.py` 支持按指定 step 从训练 `val.csv` 读取 PSNR/SSIM。
+  - `evaluate_two_ablation_readable50.py` 生成 two-ablation 主表、GT-derived bbox 和 text-region metrics。
+  - `run_two_ablation_readable50_bg.sh` 支持 `TARGET_STEPS=${TARGET_STEPS:-2500}`，默认输出 `setting_eval_2500/`。
+- 远端独立 worktree smoke：
+  - worktree: `/home/ma-user/work/GigaTok_hr/GigaTok_Loss_two_ablation`。
+  - 使用空闲 NPU，`RUN_SMOKE=1 TARGET_STEPS=2500 LOG_EVERY=1 SMOKE_SAVE_ROOT=.../smoke_v2`。
+  - `w001@2500` baseline checkpoint 和 `val.csv step=2500` 均存在。
+  - `text_hr.enabled=True`，`hr_loss_weight=500.0`，`svd_mode=gram_scaled_identity`，`image_token_len=0`。
+  - `local_similarity_loss`、`weighted_local_similarity_loss`、`text_hr_loss`、`weighted_text_hr_loss` 均在 smoke log 中出现。
+  - `ocr_visual_alignment_mlp_param_count=9444608`，`optimizer_contains_ocr_visual_mlp=True`。
+  - smoke summary: `checkpoint_contains_ocr_visual_mlp=True`，`ocr_visual_mlp_grad_norm=0.07315585`，`ocr_visual_encoder_grad_param_count=0`。
+  - bbox smoke grid 已生成：`/home/ma-user/work/GigaTok_hr/gigatok_persist/outputs/ocr_two_new_ablation_readable50/text_bbox_debug_grid_smoke.png`。
+- 注意：
+  - 这轮是 two combined routes quick comparison，不是完整因果 ablation。
+  - 不能把效果单独归因到 high-rank、local-similarity 或 OCR visual alignment 某一个模块。
+
+## 2026-05-14 Proposed Method 与当前实现对照
+
+- 结论：论文草稿与当前代码主线不完全一致，需要先决定是改论文表述还是改代码。
+- 已一致的部分：
+  - frozen Glyph-ByT5：ByT5 encoder last hidden state 经过 frozen Glyph mapper 输出 2048 维 feature。
+  - GigaTok 侧 `text_projection` 为 trainable `Linear(2048, 1024) + LayerNorm`。
+  - residual cross-attn 注入使用 visual tokens query、text memory key/value，并用 text padding mask。
+  - DeepSeek-OCR teacher-forcing CE 路径已实现，OCR 模型 frozen，loss 对 target text token 计算，prompt/image token labels 为 `-100`。
+  - encoder / quantizer / codebook 在当前 stage-1 config 中冻结，decoder 与新增 text/cross-attn 模块训练。
+- 主要不一致：
+  - 论文 HR 写成所有注入层平均的 `A^T A - I` Gram 正交；当前 active config 是每步随机选 1 个 decoder layer 做 `gram_scaled_identity`，先 Frobenius normalize，再对 heads 和 image queries 堆叠成 `[H*N_v, T_valid]` 后做 scaled Gram loss。
+  - 项目约束中的原始 HR 定义是 singular-value distribution `p=sigma/sum(sigma)` 的 uniform MSE；论文草稿的 Gram identity 和当前代码的 scaled Gram 都不是这个公式。
+  - 当前 residual cross-attn 是在指定 transformer decoder block 之后额外加一条 text cross-attn residual；论文需避免写成替换原 decoder cross-attention。
+  - 当前 config 使用 `layers: [6, 12, 18]` 作为 0-based decoder indices；如果论文按自然语言“第 6/12/18 层”理解为 1-based，需要改成 [5, 11, 17] 或在论文中明确 indexing。
+  - 当前 config 启用了 visual memory mask（learned mask token, block random, ratio schedule），论文 method 未描述；若这是主线机制，需要补写，否则实验 config 需关闭。
+  - 论文写 codebook 更新，但当前 stage-1 config 是 `freeze_codebook: True`；应改论文或改 config。
+  - 当前 worklog 最近还有 local-similarity 与 OCR visual alignment 的组合筛选，它们不属于这版 method，不能把效果归因到本文四组件，除非纳入正文并做严格消融。
+- 建议：短期保持代码不动，优先修改论文 method，使其匹配当前可复现主线；尤其把 HR 改成“随机一层的 stochastic estimator + scaled Gram / 或切回 SVD-uniform”，并删掉 codebook 更新表述。
+
+## 2026-05-14 Proposed Method 分节逐项核对
+
+- 用户给出的 3.1/3.2/3.3/3.4 对照表整体正确，可以作为论文 method 修改依据。
+- 3.1 Glyph-Aware Text Representation：
+  - `vq_train.py:1360` / `1373` 对应 cached text feature 与在线 frozen text encoder fallback；注意 cache 由 `--text-feature-cache` 或 `TEXT_FEATURE_CACHE` 触发，不是 YAML 中固定写死。
+  - 当前主线 config 中 `freeze_encoder=True`、`freeze_quantizer=True`、`freeze_codebook=True`，论文应写 codebook frozen，不应写 codebook updated。
+  - `text_projection` 当前默认 `linear_layernorm`，即 `Linear(2048,1024)+LayerNorm`，论文公式可保留线性投影但文字里需说明包含 LayerNorm。
+- 3.2 Layer-Wise Cross-Attention Injection：
+  - residual cross-attn 的 Q/K/V 对应关系正确：`query=latent_tokens`，`key=value=layer_text_memory`。
+  - 当前 selected config 使用 layers `[6,12,18]` 和 scale init `5e-2`。
+  - output projection 是 zero-init，scale 是 learnable；论文若写稳定初始化，最好写成 zero-initialized output projection plus learnable residual scale initialized to 0.05。
+  - 当前还启用 visual memory mask（block random, schedule 到 0.3），method 若使用该 config 需要补写；否则主实验 config 需关掉 mask。
+- 3.3 OCR Supervision：
+  - DeepSeek-OCR teacher-forcing CE 对照正确；当前 prompt 具体为 `<image>\n<|grounding|>OCR this image.`，image size 512，bf16，target max tokens 256，include_eos false。
+  - `ocr_visual_alignment_loss` 是最近 quick screening 的另一条路线，不属于这版 3.3 主线，论文不应混写。
+- 3.4 High-Rank Regularization：
+  - post-softmax attention weights 对照正确，`need_weights=True` + `average_attn_weights=False` 返回 `[B,H,Q,K]`。
+  - 当前 active HR 是 `svd_mode=gram_scaled_identity`，对 Frobenius-normalized `[H*N_v,T_valid]` attention matrix 做 scaled identity Gram loss。
+  - 当前每 step 随机选一个 `[text_layer, decoder_layer]` pair，不是三层同时平均；论文需写 stochastic selected-layer estimator，或改代码/配置为三层同时算。
+  - 当前代码仍计算 raw/normed SVD stats 用于日志，但 `gram_scaled_identity` 的实际 loss 不是 SVD-uniform MSE。
+
+## 2026-05-15 OCR box gate v1 接入
+
+- 目标：实现 OCR bbox spatial gate，限制 residual cross-attn text injection 只主要作用在 OCR 文本框覆盖的 16x16 visual token 区域。
+- 方向确认：
+  - 当前 GigaTok residual cross-attn 是 image/visual decoder tokens 作为 query，text memory 作为 key/value。
+  - 本次没有新增 text-query-image-key attention，也没有实现 heatmap、text span alignment 或额外 attention loss。
+- 代码改动：
+  - 新增 `dataset/ocr_box_gate.py`，统一处理 bbox JSONL 读取、exact image_path preflight、bbox->256 token gate、低置信度因子和 debug overlay。
+  - `dataset/textatlas.py` 在 `ocr_box_gate.enabled=True` 时返回 `(image, text, ocr_box_gate, ocr_box_stats)`；关闭时保持原 `(image, text)`。
+  - `vq_train.py` 解析 `ocr_box_gate` 配置，训练前检查 `grid_size * grid_size == num_latent_tokens`、manifest/bbox exact 覆盖、`boxes=[]` error，并把 gate/stat 传入模型日志。
+  - `vq_vit_model.py` 透传 `ocr_box_gate` / `ocr_box_gate_layers` 到 decoder。
+  - `blocks.py` 在 residual cross-attn 分支中按顺序执行：projection -> residual_scale -> ocr_box_gate -> residual add，并强制 assert gate shape `[B, 256]` / `[256, B, 1]`。
+  - 新增 `scripts/stage1/ocr_debug/debug_ocr_box_gate_overlay.py`，用于先生成 `bbox_debug_overlay.png` 和 `gate_debug_16x16.png`；overlay 使用与训练一致的 aspect-ratio resize + pad 到 256x256。
+- v1 默认：
+  - `outside_value=0.05`，`empty_boxes_policy="error"`，`missing_policy="error"`。
+  - `low_conf_enabled=False`，confidence 只读入和记录；`ocr_low_conf_factor_mean` 应为 1.0。
+- 校验：
+  - `python3 -m py_compile dataset/ocr_box_gate.py dataset/textatlas.py tokenizer/tokenizer_image/vq/blocks.py tokenizer/tokenizer_image/vq/vq_vit_model.py tokenizer/tokenizer_image/vq/vq_train.py scripts/stage1/ocr_debug/debug_ocr_box_gate_overlay.py` 通过。
+  - 本地环境缺 `torch` / `PIL`，未在本机做实际 dataset/overlay runtime；需要在训练服务器环境中跑 overlay 和 2-step smoke。
+
+## 2026-05-19 交接分支与 handover 文档
+
+- 新建交接分支：`codex/handover-gigatok-20260519`。
+- 目标：为后续接手者整理项目主线、服务器路径、当前实验状态、运行命令、代码改动和已知风险，不只覆盖当前 overnight 实验。
+- 新增文档目录：`docs/handover/`。
+  - `HANDOVER.md`：项目范围、当前主实验、必须保持的实验规则和下一步。
+  - `RUNBOOK.md`：NPU 续训、holdout eval、readable50 eval、OCR readability 的操作说明。
+  - `SERVER_PATHS.md`：新 8 卡 NPU、8x3090、旧 2 卡 NPU 的关键路径。
+  - `EXPERIMENT_STATUS.md`：250 epoch 训练、realworld40_5k、holdout_v2、readable50 消融的当前状态。
+  - `CODE_CHANGES.md`：HR/text conditioning、OCR CE、OCR-box gate、proxy confidence、eval/path alignment 等代码改动地图。
+  - `KNOWN_ISSUES.md`：resume、checkpoint fallback、proxy normalization、bbox path mismatch、readable50 口径等风险。
+  - `GIT_AND_ARTIFACTS.md`：哪些内容进 Git，哪些 checkpoint/cache/log/output 只记录服务器路径。
+- 更新 `.gitignore`，防止 checkpoint、cache、OCR/proxy JSONL、reconstruction、logs、临时 review/export 文件夹误提交。
+- 注意：当前 worktree 仍有较多历史修改和未跟踪脚本，不能全量提交；后续应按交接 docs、核心代码/config、实验脚本分批审查提交。
