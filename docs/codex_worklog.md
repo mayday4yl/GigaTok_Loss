@@ -3598,3 +3598,14 @@ bash scripts/stage1/single_image_debug/run_single_image_overfit.sh
   - `GIT_AND_ARTIFACTS.md`：哪些内容进 Git，哪些 checkpoint/cache/log/output 只记录服务器路径。
 - 更新 `.gitignore`，防止 checkpoint、cache、OCR/proxy JSONL、reconstruction、logs、临时 review/export 文件夹误提交。
 - 注意：当前 worktree 仍有较多历史修改和未跟踪脚本，不能全量提交；后续应按交接 docs、核心代码/config、实验脚本分批审查提交。
+
+## 2026-05-19 交接文档 current-state 复查
+
+- 用户指出部分记录来自历史阶段，可能与当前进度混淆；本轮只更新交接文档，不改训练/评估代码，不操作服务器进程。
+- 新增 `docs/handover/CURRENT_STATE.md` 作为当前事实入口，明确：
+  - 8 卡 NPU 上主方法与 GigaTok 5k baseline 都已完成 250 epoch / `step=26250`。
+  - `global.state` 中存在旧 100 epoch checkpoint 路径，最终 250 epoch checkpoint 应以文档列出的 `*_continue_250ep/train/checkpoints/last.pt` 为准。
+  - holdout_v2 path alignment 已完成，并且 balanced/medium 的 10-sample smoke eval 通过；完整 200-image eval 仍待完成或确认。
+  - readable50 三组在 3090 上已有基础 PSNR/SSIM/Text-PSNR/Text-SSIM 输出，但 OCR CER/NED 未确认完成。
+  - `gigatok_only` readable50 同口径 checkpoint 未找到，不能用 pretrained 或 5k baseline 硬塞进消融主表。
+- 更新 `HANDOVER.md`、`EXPERIMENT_STATUS.md`、`DOCS_INDEX.md`、`CODE_CHANGES.md`，把 Text-HR 图和 HR/local/ocrvis 相关内容标记为历史/非当前主方法，避免交接时误读。

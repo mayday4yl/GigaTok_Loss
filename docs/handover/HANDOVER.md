@@ -4,6 +4,8 @@ Last updated: 2026-05-19
 
 This handover summarizes the project state, where the important files live, and how a new owner can continue without reverse-engineering the last several weeks of experiments.
 
+**Read first:** `CURRENT_STATE.md` is the authoritative snapshot for the current server status. Older notes, SVG diagrams, and failed-marker files are useful history but may not reflect the latest progress after path fixes and reruns.
+
 ## Project Scope
 
 The work extends the GigaTok B-L discrete tokenizer fine-tuning pipeline for text-heavy image reconstruction. The project has several experimental branches of ideas:
@@ -15,6 +17,8 @@ The work extends the GigaTok B-L discrete tokenizer fine-tuning pipeline for tex
 - OCR-box gate, including a proxy-confidence variant that uses DeepSeek-OCR token logprobs.
 
 The current main line is **stage-1 tokenizer fine-tuning only**. The AR model is not part of the active experiment.
+
+Historical HR/local/OCR-visual-alignment material remains in this repo for context. The current main OCR-box proxy experiment keeps HR/local/OCR visual alignment disabled.
 
 ## Current Main Experiment
 
@@ -34,7 +38,7 @@ As of this handover:
 - The GigaTok-only baseline has also continued to 250 epoch on the new 8-card NPU server and completed at `step=26250`.
 - 3090-side readable50 basic reconstruction evals exist for three curated 50-image sets.
 - OCR CER/NED second-pass readability for readable50 still needs to be completed or verified.
-- NPU-side holdout_v2 eval initially failed due to `image_path` mismatch between manifest and bbox/proxy JSONL. Path-aligned proxy JSONL copies were generated for the two holdout_v2 sets. Full eval still needs completion/verification.
+- NPU-side holdout_v2 eval initially failed due to `image_path` mismatch between manifest and bbox/proxy JSONL. Path-aligned proxy JSONL copies were generated for the two holdout_v2 sets, and 10-sample smoke eval passed after the fix. Full 200-image eval still needs completion/verification.
 
 ## Primary Rules To Preserve
 
@@ -50,6 +54,7 @@ As of this handover:
 
 ## Documentation Map
 
+- `CURRENT_STATE.md`: authoritative current snapshot and warnings about stale historical records.
 - `RUNBOOK.md`: commands and procedures to continue training/eval.
 - `SERVER_PATHS.md`: important paths on the new 8-card NPU, 8x3090 CUDA server, and old 2-card NPU.
 - `EXPERIMENT_STATUS.md`: current status of training, eval, readable50, and unresolved items.

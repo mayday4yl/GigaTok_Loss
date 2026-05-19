@@ -24,6 +24,8 @@ Purpose:
 
 Original stage-1 rule remains important: do not modify the AR model for this work.
 
+Current-status note: HR/local/OCR visual-alignment code exists for historical and ablation work, but the current main `realworld40_5k` OCR-box proxy experiment disables HR/local/OCR visual alignment.
+
 ## OCR Teacher Forcing / OCR-Box Gate
 
 Relevant files:

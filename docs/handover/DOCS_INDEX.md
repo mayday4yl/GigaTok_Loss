@@ -2,7 +2,7 @@
 
 Last updated: 2026-05-19
 
-This index explains the older project notes that are useful for handover but are not required to run the current 5k main experiment.
+This index explains the older project notes that are useful for handover but are not required to run the current 5k main experiment. For current progress, start with `docs/handover/CURRENT_STATE.md`.
 
 ## Method / Code Understanding
 
@@ -47,6 +47,8 @@ Framework diagram for the Text-HR v2 direction.
 More detailed Text-HR v2 flow diagram.
 
 These SVGs are for communication and paper/slides reference. They are not source of truth for the latest OCR-box proxy method.
+
+Do not use these SVGs to explain the final current method without relabeling them as historical. The current main experiment is OCR-box gate + proxy confidence, with HR/local/OCR visual-alignment disabled. A final current-method diagram has not been committed here.
 
 ## Historical Sweep Script
 

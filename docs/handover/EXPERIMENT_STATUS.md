@@ -110,7 +110,14 @@ Confirmed during alignment:
 - match method: `sha256_after_prefix_map`
 - only top-level `image_path` was changed
 
-Full holdout eval still needs final completion/verification.
+10-sample smoke eval after the path fix completed for both sets:
+
+```bash
+/data2/duoduo_25/yl_GigaTok_Loss/gigatok_persist/outputs/overnight_allin/eval_fixed_path/holdout_v2_readable_balanced_200/smoke_10
+/data2/duoduo_25/yl_GigaTok_Loss/gigatok_persist/outputs/overnight_allin/eval_fixed_path/holdout_v2_readable_medium_200/smoke_10
+```
+
+Full 200-image holdout eval still needs final completion/verification. Do not use old pre-fix failure files as the final status, but also do not report final holdout tables until the full 200-image outputs exist.
 
 ## 5. readable50 Ablation
 
@@ -145,6 +152,8 @@ The basic reconstruction metrics are available:
 
 OCR CER/NED second-pass readability is still missing or needs verification.
 
+No readable50 OCR CER/NED table was confirmed in the checked 3090 readable50 output directories at handover time.
+
 ## 6. Current readable50 Basic Metric Trend
 
 Balanced set:
@@ -167,4 +176,4 @@ The interpretation should be revisited after OCR CER/NED is added.
 - `gigatok_only` same-protocol readable50 checkpoint was not found. Do not substitute pretrained GigaTok or the 5k baseline into the readable50 ablation main table.
 - OCR CER/NED for readable50 should be computed from saved reconstructions using DeepSeek-OCR readability script.
 - NPU-side readable50 eval failures are not required for the main ablation; use 3090 readable50 results.
-- Main holdout_v2 full eval needs completion after the path alignment fix.
+- Main holdout_v2 full eval needs completion after the path alignment fix and smoke success.
