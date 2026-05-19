@@ -36,6 +36,7 @@ Then use these as needed:
 ```bash
 docs/handover/RUNBOOK.md
 docs/handover/EXPERIMENT_STATUS.md
+docs/handover/CONVERSATION_SUMMARY.md
 docs/handover/SERVER_PATHS.md
 docs/handover/SERVER_ARTIFACT_INDEX.md
 docs/handover/CODE_CHANGES.md
