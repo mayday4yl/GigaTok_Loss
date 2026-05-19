@@ -64,6 +64,21 @@ Current data:
   - `holdout_v2_readable_balanced_200` as primary candidate
   - `holdout_v2_readable_medium_200` as secondary/supplementary candidate
 
+Naming glossary:
+
+| Name | Meaning |
+|---|---|
+| `realworld40` | Text-rich dataset variant where real-world / mixed image sources are upweighted to about 40%. In this project, the real-world part mainly means TextScenesHQ + TextVisionBlend. |
+| `realworld40_5k` | The current 5k training setup: `train_5k`, `val_500`, and related holdout/eval artifacts derived from the realworld40 selection. |
+| `train_5k_realworld40_text_rich` | 5,000-image training manifest for the current experiments. |
+| `val_500_realworld40_text_rich` | 500-image validation manifest used for training-time validation and sanity checks. |
+| `holdout_200_realworld40_text_rich` | Earlier 200-image holdout split derived from the 5k setup. Later `holdout_v2` candidates were prepared for final reporting. |
+| `holdout_v2_readable_balanced_200` | Primary 200-image holdout candidate for main final tables. It is intended to be readable and source-balanced. |
+| `holdout_v2_readable_medium_200` | Secondary / supplementary 200-image holdout candidate, biased toward medium text coverage. |
+| `readable50_textscenes40_*` | Curated 50-image probe sets for readable50 ablation/effect checks. These are not the main unbiased holdout. |
+| `realworld40_glyph_mapped` | Text feature cache directory for the current realworld40 setup. |
+| `realworld40_5k` under `outputs/ocr_box_gate/` | OCR bbox and proxy-confidence artifacts used by the current main OCR-box gate training/eval. |
+
 Current training status:
 
 - Main OCR-box proxy run has reached 250 epochs / `step=26250`.
