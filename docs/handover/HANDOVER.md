@@ -4,7 +4,7 @@ Last updated: 2026-05-19
 
 This handover summarizes the project state, where the important files live, and how a new owner can continue without reverse-engineering the last several weeks of experiments.
 
-**Read first:** `CURRENT_STATE.md` is the authoritative snapshot for the current server status. Older notes, SVG diagrams, and failed-marker files are useful history but may not reflect the latest progress after path fixes and reruns.
+**Read first:** `README_FOR_HANDOVER.md`, then `CURRENT_STATE.md`. `CURRENT_STATE.md` is the authoritative snapshot for the current server status. Older notes, SVG diagrams, and failed-marker files are useful history but may not reflect the latest progress after path fixes and reruns.
 
 ## Project Scope
 
@@ -54,6 +54,7 @@ As of this handover:
 
 ## Documentation Map
 
+- `README_FOR_HANDOVER.md`: first-read guide for someone taking over from zero.
 - `CURRENT_STATE.md`: authoritative current snapshot and warnings about stale historical records.
 - `RUNBOOK.md`: commands and procedures to continue training/eval.
 - `SERVER_PATHS.md`: important paths on the new 8-card NPU, 8x3090 CUDA server, and old 2-card NPU.

@@ -1,5 +1,16 @@
 # GigaTok Text-HR Stage-1 Pilot
 
+> 2026-05-19 handover note:
+> This README is historical and describes the earlier Text-HR pilot direction.
+> It is **not** the source of truth for the current realworld40_5k OCR-box gate + proxy-confidence experiment.
+> For current handover, start with:
+>
+> - `docs/handover/README_FOR_HANDOVER.md`
+> - `docs/handover/CURRENT_STATE.md`
+> - `docs/handover/HANDOVER.md`
+>
+> The current main experiment disables HR/local/OCR visual-alignment and uses OCR-box gate + DeepSeek-OCR token-logprob proxy confidence.
+
 本仓库当前用于在 GigaTok stage-1 tokenizer 上验证 Text-HR 方法。开发主线是：
 
 ```text
